@@ -1,0 +1,19 @@
+# Factory Monitoring MVP Configuration
+
+system:
+  project_name: "Industrial CV Factory Monitoring"
+  version: "0.1.0"
+  debug: true
+
+hardware:
+  device: "cuda:0"  # Will fallback to 'cpu' if cuda is unavailable
+
+# Placeholders for future phases
+detection:
+  model_path: "yolov11s.pt"
+  confidence_threshold: 0.4
+  classes: [0] # 0 = person in COCO dataset
+
+tracking:
+  tracker_type: "bytetrack"
+  track_buffer: 45

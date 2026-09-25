@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# IDEs
+.vscode/
+.idea/
+
+# Project specific
+logs/
+data/
+models/*.pt
+!models/.keep
