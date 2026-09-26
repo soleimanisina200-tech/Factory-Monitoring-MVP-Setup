@@ -5,14 +5,17 @@ import time
 from datetime import datetime
 from app.streams.video_reader import LocalVideoReader
 from app.detection.detector import PersonDetector
+from app.zones.manager import ZoneManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def main():
-    logger.info("Starting Phase 3: Multi-Object Tracking with ByteTrack")
+    logger.info("Starting Phase 4: Manual Zones Integration")
     
     video_path = "data/input/test_video.mp4"
+    config_path = "configs/settings.yaml"
+    
     if not os.path.exists(video_path):
         logger.error(f"Test video not found at {video_path}.")
         return
@@ -24,28 +27,31 @@ def main():
         
         detector = PersonDetector(model_path="yolo11s.pt", conf_threshold=0.4)
         
+        # Initialize Zone Manager
+        zone_manager = ZoneManager(config_path)
+        
         for frame, timestamp, frame_id in reader.read_frames():
             start_time = time.time()
             
-            # Use .track() instead of .detect()
+            # Run tracking
             result = detector.track(frame)
-            
             inference_time_ms = result.speed['inference']
             
-            # Check if boxes exist in the result
+            # Draw Zones on the frame (Blue color)
+            zone_manager.draw_zones(frame)
+            
             if result.boxes is not None:
                 for box in result.boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     conf = float(box.conf[0])
                     
-                    # Extract Track ID (it might be None if the tracker hasn't assigned one yet)
                     if box.id is not None:
                         track_id = int(box.id[0])
                         label = f"ID: {track_id} | Conf: {conf:.2f}"
-                        color = (255, 165, 0) # Orange for tracked objects
+                        color = (255, 165, 0)
                     else:
                         label = f"Detecting... | Conf: {conf:.2f}"
-                        color = (0, 255, 0) # Green for untracked/initial detections
+                        color = (0, 255, 0)
                     
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)

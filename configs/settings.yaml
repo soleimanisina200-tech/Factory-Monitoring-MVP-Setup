@@ -17,3 +17,14 @@ detection:
 tracking:
   tracker_type: "bytetrack"
   track_buffer: 45
+
+zones:
+  - id: "machine_01"
+    name: "Machine 01"
+    polygon:
+      - [672, 291]
+      - [1649, 751]
+      - [337, 962]
+      - [119, 483]
+
+fuse_score: True
