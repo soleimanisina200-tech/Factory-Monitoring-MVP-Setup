@@ -14,21 +14,30 @@ class ZoneManager:
             
         self.zones = config.get('zones', [])
         
-        # Convert polygon lists to numpy arrays for OpenCV processing
         for zone in self.zones:
             zone['polygon'] = np.array(zone['polygon'], np.int32)
             
         logger.info(f"Successfully loaded {len(self.zones)} zones.")
 
     def draw_zones(self, frame):
-        # Draw each zone on the frame
         for zone in self.zones:
-            # Reshape for OpenCV polylines function requirement
             pts = zone['polygon'].reshape((-1, 1, 2))
-            
-            # Draw the polygon boundaries
             cv2.polylines(frame, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
             
-            # Put the zone name near the first point of the polygon
             x, y = pts[0][0]
             cv2.putText(frame, zone['name'], (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+    def get_zone_for_point(self, point: tuple) -> str:
+        # Check if the given (x, y) point is inside any defined zone
+        for zone in self.zones:
+            # cv2.pointPolygonTest returns:
+            # +1 if point is inside
+            #  0 if point is exactly on the boundary
+            # -1 if point is outside
+            dist = cv2.pointPolygonTest(zone['polygon'], point, measureDist=False)
+            
+            # If inside or exactly on the boundary, we consider it assigned to this zone
+            if dist >= 0:
+                return zone['name']
+                
+        return "OUTSIDE"
