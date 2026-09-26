@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def main():
-    logger.info("Starting Phase 2: Person Detection with YOLO11s")
+    logger.info("Starting Phase 3: Multi-Object Tracking with ByteTrack")
     
     video_path = "data/input/test_video.mp4"
     if not os.path.exists(video_path):
@@ -22,43 +22,40 @@ def main():
         reader = LocalVideoReader(video_path)
         frame_delay = max(1, int(1000 / reader.fps))
         
-        # Initialize detector
         detector = PersonDetector(model_path="yolo11s.pt", conf_threshold=0.4)
-        logger.info(f"Original Video FPS: {reader.fps}")
+        
         for frame, timestamp, frame_id in reader.read_frames():
-            
-            # 1. Pipeline Start Time (for overall FPS calculation)
             start_time = time.time()
             
-            # 2. Run Person Detection
-            result = detector.detect(frame)
+            # Use .track() instead of .detect()
+            result = detector.track(frame)
             
-            # 3. Extract Inference Time directly from YOLO results
-            # The speed dictionary contains 'preprocess', 'inference', and 'postprocess' times in ms
             inference_time_ms = result.speed['inference']
             
-            # 4. Draw Bounding Boxes
-            for box in result.boxes:
-                # Get coordinates, confidence, and class
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                conf = float(box.conf[0])
-                
-                # Draw Box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                # Draw Label (Person + Confidence)
-                label = f"Person: {conf:.2f}"
-                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # Check if boxes exist in the result
+            if result.boxes is not None:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    conf = float(box.conf[0])
+                    
+                    # Extract Track ID (it might be None if the tracker hasn't assigned one yet)
+                    if box.id is not None:
+                        track_id = int(box.id[0])
+                        label = f"ID: {track_id} | Conf: {conf:.2f}"
+                        color = (255, 165, 0) # Orange for tracked objects
+                    else:
+                        label = f"Detecting... | Conf: {conf:.2f}"
+                        color = (0, 255, 0) # Green for untracked/initial detections
+                    
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
-            # 5. Pipeline End Time & Calculate FPS
             processing_time = time.time() - start_time
             pipeline_fps = 1.0 / processing_time if processing_time > 0 else 0
             
-            # 6. UI Visualization for Metrics
             dt_object = datetime.fromtimestamp(timestamp)
             readable_time = dt_object.strftime('%H:%M:%S.%f')[:-3]
             
-            # Display System Metrics
             metrics_text = f"Frame: {frame_id} | Time: {readable_time} | FPS: {pipeline_fps:.1f} | Inference: {inference_time_ms:.1f}ms"
             cv2.putText(frame, metrics_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
