@@ -27,4 +27,10 @@ zones:
       - [337, 962]
       - [119, 483]
 
+events:
+  # How many consecutive frames an object must be inside to trigger a confirmed ENTRY
+  entry_confirmation_frames: 10
+  # How many consecutive frames an object must be outside to trigger a confirmed EXIT
+  exit_confirmation_frames: 15
+
 fuse_score: True
