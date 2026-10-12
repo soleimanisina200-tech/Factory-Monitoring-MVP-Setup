@@ -18,3 +18,17 @@ models/*.pt
 
 #models
 yolo11s.pt
+
+# AI Model Weights
+weights/
+*.pt
+
+# External Repositories
+deep-person-reid/
+
+# Output Videos
+data/output/
+
+# Python Cache
+__pycache__/
+*.pyc
