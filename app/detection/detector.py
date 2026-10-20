@@ -1,26 +1,29 @@
 import logging
+import torch
 from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
 
 class PersonDetector:
-    def __init__(self, model_path: str = "yolo11s.pt", conf_threshold: float = 0.4):
-        logger.info(f"Initializing YOLO model from {model_path}...")
-        self.model = YOLO(model_path)
+    def __init__(self, model_path="yolo11m.pt", conf_threshold=0.40, imgsz=1280):
         self.conf_threshold = conf_threshold
+        self.imgsz = imgsz
+        self.use_half = torch.cuda.is_available()
         
-        # Path to our custom tracker configuration
-        self.tracker_config = "configs/custom_bytetrack.yaml"
-        logger.info(f"Using custom tracker configuration from {self.tracker_config}")
+        logger.info(f"Loading YOLO11 model ({model_path}) at imgsz={imgsz}, FP16={self.use_half}...")
+        self.model = YOLO(model_path)
+        logger.info("YOLO11 Model loaded successfully.")
 
     def track(self, frame):
-        # Pass the custom tracker file instead of the default string
         results = self.model.track(
-            source=frame, 
-            classes=[0], 
-            conf=self.conf_threshold,
-            tracker=self.tracker_config, 
+            frame,
             persist=True,
+            classes=[0],
+            conf=self.conf_threshold,
+            iou=0.55,
+            imgsz=self.imgsz,
+            half=self.use_half,
+            tracker="configs/custom_botsort.yaml",
             verbose=False
         )
         return results[0]
