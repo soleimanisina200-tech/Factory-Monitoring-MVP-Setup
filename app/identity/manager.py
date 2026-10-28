@@ -1,58 +1,109 @@
 import logging
+import math
 import numpy as np
-from scipy.spatial.distance import cosine
 
 logger = logging.getLogger(__name__)
 
-class IdentityManager:
-    # کاهش سخت‌گیری به 60 درصد برای پذیرش تغییرات زاویه بدن
-    def __init__(self, similarity_threshold=0.60, update_rate=0.15):
+class SpatioTemporalIdentityManager:
+    def __init__(self, similarity_threshold=0.65, max_speed_px_sec=400, max_gallery_size=8):
         self.similarity_threshold = similarity_threshold
-        # نرخ آپدیت: 15% از ظاهر فریم جدید را با 85% از ظاهر قبلی ترکیب کن
-        self.update_rate = update_rate 
+        self.max_speed_px_sec = max_speed_px_sec 
+        self.max_gallery_size = max_gallery_size
+
+        self.worker_database = {}  
+        self.track_to_worker = {}
+        self.spatial_memory_pos = {}   
+        self.spatial_memory_time = {}  
         
-        self.known_persons = {}
-        self.track_to_person = {}
+        # قفل ضد کلون: جلوگیری از تخصیص یک کارگر به دو کادر مختلف در یک فریم
+        self.active_workers_in_frame = set()
+        self.last_frame_time = 0
 
-    def identify_and_update(self, track_id: int, feature_vector) -> str:
-        if feature_vector is None:
-            return self.track_to_person.get(track_id, f"Track_{track_id}")
+    def start_new_frame(self, current_time):
+        """باید در ابتدای پردازش هر فریم صدا زده شود تا لیست کارگران حاضر صفر شود"""
+        if current_time != self.last_frame_time:
+            self.active_workers_in_frame = set()
+            self.last_frame_time = current_time
+
+    def _physics_allows(self, worker_id: str, current_pos: tuple, current_time: float) -> bool:
+        if worker_id not in self.spatial_memory_pos: return True
+        last_pos = self.spatial_memory_pos[worker_id]
+        dt = current_time - self.spatial_memory_time[worker_id]
+        if dt <= 0: return True
+        dist = math.hypot(current_pos[0] - last_pos[0], current_pos[1] - last_pos[1])
+        if (dist / dt) > self.max_speed_px_sec: return False
+        return True
+
+    def identify(self, track_id: int, feature_vector: np.ndarray, current_pos: tuple, current_time: float) -> str:
+        # ۱. ردیابی مستمر و سالم
+        if track_id in self.track_to_worker:
+            worker_id = self.track_to_worker[track_id]
+            self.spatial_memory_pos[worker_id] = current_pos
+            self.spatial_memory_time[worker_id] = current_time
+            self.active_workers_in_frame.add(worker_id) # قفل کردن این کارگر برای این فریم
             
-        # حالت اول: ردیاب هنوز شخص را گم نکرده است -> فقط حافظه را با ظاهر جدید آپدیت کن
-        if track_id in self.track_to_person:
-            person_id = self.track_to_person[track_id]
-            
-            # ترکیب بردار قدیمی با جدید (Continuous Learning)
-            updated_vector = (1.0 - self.update_rate) * self.known_persons[person_id] + self.update_rate * feature_vector
-            # نرمال‌سازی مجدد ریاضی
-            norm = np.linalg.norm(updated_vector)
-            if norm > 0:
-                updated_vector = updated_vector / norm
+            # فقط زوایای تمیز و منطقی را یاد بگیر (جلوگیری از مسمومیت)
+            if feature_vector is not None:
+                gallery = self.worker_database[worker_id]
+                max_sim = max([float(np.dot(feature_vector, g)) for g in gallery])
+                if 0.50 < max_sim < 0.85: 
+                    if len(gallery) >= self.max_gallery_size: gallery.pop(1)
+                    gallery.append(feature_vector.copy())
+            return worker_id
+
+        # ۲. بازیابی مکانی (Spatial Recovery) - سریعترین روش برای ویدیوی 7 فریم
+        # آیا کسی اخیراً در همین شعاع گم شده بود که در این فریم لیبل نگرفته باشد؟
+        best_spatial_match = None
+        min_dist = float('inf')
+        
+        for w_id, last_pos in self.spatial_memory_pos.items():
+            if w_id in self.active_workers_in_frame: continue # قبلاً در این فریم پیدا شده!
                 
-            self.known_persons[person_id] = updated_vector
-            return person_id
+            dt = current_time - self.spatial_memory_time.get(w_id, 0)
+            if 0 < dt < 2.0: # اگر کمتر از 2 ثانیه پیش گمش کردیم
+                dist = math.hypot(current_pos[0] - last_pos[0], current_pos[1] - last_pos[1])
+                if dist < 80 and dist < min_dist: # شعاع 80 پیکسلی
+                    min_dist = dist
+                    best_spatial_match = w_id
+                    
+        if best_spatial_match:
+            self.track_to_worker[track_id] = best_spatial_match
+            self.spatial_memory_pos[best_spatial_match] = current_pos
+            self.spatial_memory_time[best_spatial_match] = current_time
+            self.active_workers_in_frame.add(best_spatial_match)
+            return best_spatial_match
+
+        # ۳. کارگر کاملاً از کادر خارج شده بود و دوباره برگشته است (تشخیص با ترانسفورمر)
+        if feature_vector is None: return f"Detecting_{track_id}..."
+
+        best_match = None
+        best_sim = -1.0
+
+        for worker_id, gallery in self.worker_database.items():
+            if worker_id in self.active_workers_in_frame: continue # قفل ضد کلون
+                
+            sim = max([float(np.dot(feature_vector, g)) for g in gallery])
+            if sim > best_sim and sim >= self.similarity_threshold:
+                if self._physics_allows(worker_id, current_pos, current_time):
+                    best_sim = sim
+                    best_match = worker_id
+
+        if best_match is not None:
+            gallery = self.worker_database[best_match]
+            if len(gallery) >= self.max_gallery_size: gallery.pop(1)
+            gallery.append(feature_vector.copy())
             
-        # حالت دوم: شخص جدید است (یا پس از گم شدن برگشته است) -> جستجو در دیتابیس
-        best_match_id = None
-        best_similarity = -1.0
-
-        for person_id, known_vector in self.known_persons.items():
-            sim = 1 - cosine(feature_vector, known_vector)
-            if sim > best_similarity:
-                best_similarity = sim
-                best_match_id = person_id
-
-        # اگر شباهت کافی بود -> بازیابی هویت قدیمی
-        if best_match_id is not None and best_similarity >= self.similarity_threshold:
-            logger.info(f"Re-ID Match: Track {track_id} is {best_match_id} (Sim: {best_similarity:.2f})")
-            self.track_to_person[track_id] = best_match_id
-            return best_match_id
+            self.track_to_worker[track_id] = best_match
+            self.spatial_memory_pos[best_match] = current_pos
+            self.spatial_memory_time[best_match] = current_time
+            self.active_workers_in_frame.add(best_match)
+            return best_match
+            
         else:
-            # شخص کاملا جدید است -> ایجاد پروفایل جدید
-            new_person_id = f"Worker_{len(self.known_persons) + 1}"
-            self.known_persons[new_person_id] = feature_vector
-            self.track_to_person[track_id] = new_person_id
-            
-            sim_log = f" (Closest sim was {best_similarity:.2f})" if best_match_id else ""
-            logger.info(f"Re-ID New: Created {new_person_id} for Track {track_id}{sim_log}")
-            return new_person_id
+            new_worker_id = f"Worker_{len(self.worker_database) + 1}"
+            self.worker_database[new_worker_id] = [feature_vector.copy()]
+            self.track_to_worker[track_id] = new_worker_id
+            self.spatial_memory_pos[new_worker_id] = current_pos
+            self.spatial_memory_time[new_worker_id] = current_time
+            self.active_workers_in_frame.add(new_worker_id)
+            return new_worker_id
