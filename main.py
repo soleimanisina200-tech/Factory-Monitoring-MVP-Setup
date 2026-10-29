@@ -1,226 +1,254 @@
+# main.py
+from __future__ import annotations
+import argparse
 import logging
-import cv2
-import os
 import time
+from pathlib import Path
+from typing import Dict, Tuple
+import cv2
+import numpy as np
 import yaml
-import csv
-from datetime import datetime
 
-from app.streams.video_reader import LocalVideoReader
-from app.detection.detector import PersonDetector
-from app.zones.manager import ZoneManager
-from app.logic.geometry import get_foot_point
-from app.logic.state_machine import ZoneStateMachine
-from app.identity.reid_model import AdvancedReIDExtractor
-from app.identity.manager import SpatioTemporalIdentityManager
+from app.detection.detector import IndustrialPoseDetector, PoseDetection
+from app.identity.manager import EnterpriseIdentityManager
+from app.identity.reid_model import PoseGuidedOSNetExtractor, SKELETON_LIMBS
+from app.logic.geometry import MetricBEVProjector
+from app.streams.video_reader import VariableFPSVideoReader
+from app.zones.manager import MultiZoneManager
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
-def load_settings(config_path):
-    with open(config_path, 'r', encoding='utf-8') as f:
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | [%(levelname)s] | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("FactoryReID")
+
+
+def load_config(config_path: str = "configs/settings.yaml") -> Dict:
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-class DynamicCameraConfig:
+
+def draw_industrial_hud(
+    frame: np.ndarray,
+    detections: list[PoseDetection],
+    track_to_global: Dict[int, int],
+    identity_manager: EnterpriseIdentityManager,
+    fps_instant: float,
+    kpt_thresh: float = 0.45,
+) -> None:
     """
-    موتور کالیبراسیون پویا: تبدیل پارامترهای مطلق به نسبی بر اساس مشخصات هر دوربین
+    Renders skeletal pose, extrapolated ground contact point, BEV metric coordinates,
+    and intersection gallery-lock indicators onto the frame.
     """
-    @staticmethod
-    def calibrate(fps: float, frame_width: int, frame_height: int):
-        actual_fps = fps if fps > 0 else 30.0 
-        
-        # زمان‌بندی عکس‌برداری (هر 1.5 ثانیه یک بار)
-        reid_interval_frames = max(1, int(actual_fps * 1.5))
-        
-        # زمان‌بندی ماشین حالت برای ورود و خروج
-        entry_frames = max(1, int(actual_fps * 1.5))
-        exit_frames = max(1, int(actual_fps * 2.0))
-        
-        # حاشیه امن برای کیفیت عکس (2% عرض تصویر)
-        margin = max(5, int(frame_width * 0.02))
-        
-        # حداقل سایز کراپ برای OSNet
-        min_crop_h = int(frame_height * 0.07)
-        min_crop_w = int(frame_width * 0.02)
-        
-        # نگهبان فیزیک: سرعت مجاز بر اساس عرض تصویر (35% در ثانیه)
-        max_speed_px_sec = int(frame_width * 0.35)
+    for det in detections:
+        tid = det.track_id
+        gid = track_to_global.get(tid, -1)
+        x1, y1, x2, y2 = det.bbox_xyxy.astype(int)
 
-        logger.info(f"Camera Calibrated -> FPS: {actual_fps:.1f} | Res: {frame_width}x{frame_height}")
-        logger.info(f"Dyn Config -> ReID Interval: {reid_interval_frames} frames | Speed Limit: {max_speed_px_sec} px/s")
+        # Color coding:
+        #   Green  = Verified Global ID, Gallery Active
+        #   Orange = Verified Global ID, Gallery LOCKED due to Intersection
+        #   Gray   = Unverified / Pending Quality Gate
+        if gid == -1:
+            box_color = (160, 160, 160)
+            status_tag = f"T:{tid} [PENDING GATE]"
+        elif det.is_intersecting:
+            box_color = (0, 140, 255)  # Orange warning: Gallery locked
+            status_tag = f"ID:{gid} [GALLERY LOCKED]"
+        else:
+            box_color = (0, 220, 0)
+            status_tag = f"ID:{gid}"
 
-        return {
-            'reid_interval_frames': reid_interval_frames,
-            'entry_frames': entry_frames,
-            'exit_frames': exit_frames,
-            'margin': margin,
-            'min_crop_h': min_crop_h,
-            'min_crop_w': min_crop_w,
-            'max_speed_px_sec': max_speed_px_sec
-        }
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2, cv2.LINE_AA)
 
-def is_safe_to_extract(x1, y1, x2, y2, all_boxes, frame_w, frame_h, dynamic_margin):
-    # چک کردن حاشیه کادر دوربین
-    if not (dynamic_margin < x1 and dynamic_margin < y1 and x2 < frame_w - dynamic_margin and y2 < frame_h - dynamic_margin): 
-        return False
-        
-    # چک کردن همپوشانی (Occlusion) با کارگران دیگر
-    for other_box in all_boxes:
-        if other_box == [x1, y1, x2, y2]: continue
-        ox1, oy1, ox2, oy2 = other_box
-        if max(0, min(x2, ox2) - max(x1, ox1)) * max(0, min(y2, oy2) - max(y1, oy1)) > 0: 
-            return False
-            
-    return True
+        # Draw visible skeleton limbs
+        for p1, p2 in SKELETON_LIMBS:
+            if det.keypoints_conf[p1] >= kpt_thresh and det.keypoints_conf[p2] >= kpt_thresh:
+                pt1 = tuple(det.keypoints_xy[p1].astype(int))
+                pt2 = tuple(det.keypoints_xy[p2].astype(int))
+                cv2.line(frame, pt1, pt2, (255, 220, 0), 2, cv2.LINE_AA)
 
-def main():
-    logger.info("Starting Enterprise Architecture: Dynamic Pipeline + OSNet + Physics Guard")
+        # Draw True Ground Contact Point (solves machinery leg occlusion)
+        ug, vg = int(det.ground_uv[0]), int(det.ground_uv[1])
+        cv2.circle(frame, (ug, vg), 6, (255, 255, 0), -1, cv2.LINE_AA)
+        cv2.circle(frame, (ug, vg), 9, (0, 0, 0), 2, cv2.LINE_AA)
 
-    video_path = "data/input/test_video.mp4"
-    config_path = "configs/settings.yaml"
+        # Render BEV Metric Coordinates & Gallery size
+        bev_str = ""
+        if det.bev_xy is not None:
+            bev_str = f" | BEV:({det.bev_xy[0]:.1f}m, {det.bev_xy[1]:.1f}m)"
 
-    if not os.path.exists(video_path): 
-        logger.error(f"Video file not found at {video_path}")
-        return
+        header_text = f"{status_tag}{bev_str}"
+        (tw, th_text), _ = cv2.getTextSize(header_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+        cv2.rectangle(frame, (x1, max(0, y1 - th_text - 10)), (x1 + tw + 8, y1), box_color, -1)
+        cv2.putText(
+            frame,
+            header_text,
+            (x1 + 4, max(15, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (0, 0, 0) if box_color != (160, 160, 160) else (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
-    reader = LocalVideoReader(video_path)
-    frame_delay = max(1, int(1000 / reader.fps)) if reader.fps > 0 else 30
-    
-    # کالیبراسیون پویا بر اساس متادیتا دوربین
-    cam_config = DynamicCameraConfig.calibrate(reader.fps, reader.width, reader.height)
+    # Top-left telemetry banner
+    banner = f"Stream FPS: {fps_instant:.1f} | Active Identities: {len(identity_manager.identities)}"
+    cv2.rectangle(frame, (10, 10), (480, 46), (20, 20, 20), -1)
+    cv2.putText(frame, banner, (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 180), 2, cv2.LINE_AA)
 
-    os.makedirs("data/output", exist_ok=True)
-    writer = cv2.VideoWriter("data/output/processed_video.mp4", cv2.VideoWriter_fourcc(*'mp4v'), reader.fps, (reader.width, reader.height))
 
-    # ایجاد فایل CSV برای دمو
-    csv_file_path = os.path.join("data/output", f"Factory_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-    csv_file = open(csv_file_path, 'w', newline='', encoding='utf-8')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['Time', 'Worker_ID', 'Event_Type', 'Zone', 'Duration_Sec'])
+def main(config_path: str) -> None:
+    cfg = load_config(config_path)
+    sys_cfg = cfg["system"]
+    stream_cfg = cfg["stream"]
+    det_cfg = cfg["detection"]
+    reid_cfg = cfg["reid"]
+    bev_cfg = cfg["physics_bev"]
+    zones_cfg = cfg["zones"]
 
-    # لود کردن ماژول‌ها
-    detector = PersonDetector(model_path="yolo11m.pt", conf_threshold=0.45)
-    zone_manager = ZoneManager(config_path)
-    reid_extractor = AdvancedReIDExtractor(device='cuda')
-    
-    # تزریق سرعت کالیبره شده به منیجر
-    identity_manager = SpatioTemporalIdentityManager(
-        similarity_threshold=0.72, 
-        max_speed_px_sec=cam_config['max_speed_px_sec'], 
-        max_gallery_size=8
+    # 1. Initialize Variable-FPS Stream Reader
+    logger.info(f"Opening video stream: {stream_cfg['source']}")
+    reader = VariableFPSVideoReader(
+        source=stream_cfg["source"],
+        drop_frames_on_lag=stream_cfg.get("drop_frames_on_lag", True),
+        reconnect_delay_sec=stream_cfg.get("reconnect_delay_sec", 3.0),
     )
 
-    # تزریق فریم‌های ورود و خروج داینامیک به ماشین حالت
-    state_machine = ZoneStateMachine(
-        entry_frames=cam_config['entry_frames'],
-        exit_frames=cam_config['exit_frames'],
-        timeout_sec=4.0
+    # Dynamic Resolution Auto-Scaling for Laplacian Sharpness Threshold
+    res_scale = (reader.width * reader.height) / (1280.0 * 720.0)
+    scaled_laplacian_var = max(20.0, reid_cfg["min_laplacian_var"] * np.sqrt(res_scale))
+    logger.info(
+        f"Stream Resolution: {reader.width}x{reader.height} @ {reader.nominal_fps:.1f} nominal FPS | "
+        f"Scaled Blur Gate: {scaled_laplacian_var:.1f}"
     )
 
-    recent_events = []
-    REID_INTERVAL = cam_config['reid_interval_frames']
-    last_reid_frame = {}
+    # 2. Initialize Single-Pass YOLO11-Pose + ByteTrack Detector
+    detector = IndustrialPoseDetector(
+        model_weights=det_cfg["model_weights"],
+        tracker_config=det_cfg["tracker_config"],
+        device=sys_cfg["device"],
+        conf_thres=det_cfg["conf_thres"],
+        iou_thres=det_cfg["iou_thres"],
+        imgsz=det_cfg["imgsz"],
+        half=sys_cfg.get("half_precision", True),
+    )
 
-    for frame, timestamp, frame_id in reader.read_frames():
-        start_time = time.time()
-        
-        # قفل ضد کلون: ریست کردن حافظه برای فریم جدید
-        identity_manager.start_new_frame(timestamp)
-        
-        frame_h, frame_w = frame.shape[:2]
+    # 3. Initialize Homography BEV Metric Projector
+    bev_projector = MetricBEVProjector(
+        src_image_pts=bev_cfg.get("src_image_pts"),
+        dst_meter_pts=bev_cfg.get("dst_meter_pts"),
+        default_px_per_meter=bev_cfg.get("default_px_per_meter", 110.0),
+    )
 
-        result = detector.track(frame)
-        inference_time_ms = result.speed['inference']
-        zone_manager.draw_zones(frame)
+    # 4. Initialize Pose-Guided OSNet Re-ID Engine
+    reid_extractor = PoseGuidedOSNetExtractor(
+        model_name=reid_cfg["model_name"],
+        weights_path=reid_cfg.get("weights_path") or None,
+        device=sys_cfg["device"],
+        kpt_conf_thresh=reid_cfg["kpt_conf_thresh"],
+        min_laplacian_var=scaled_laplacian_var,
+        head_branch_weight=reid_cfg["head_branch_weight"],
+    )
 
-        if result.boxes is not None and len(result.boxes) > 0:
-            all_boxes = [list(map(int, b.xyxy[0])) for b in result.boxes]
-            all_confs = [float(b.conf[0]) for b in result.boxes]
-            all_tids = [int(b.id[0]) if b.id is not None else None for b in result.boxes]
+    # 5. Initialize Enterprise Identity Manager
+    identity_manager = EnterpriseIdentityManager(
+        reid_extractor=reid_extractor,
+        bev_projector=bev_projector,
+        cos_sim_thresh=reid_cfg["cos_sim_thresh"],
+        spatial_recovery_sim_thresh=reid_cfg["spatial_recovery_sim_thresh"],
+        max_worker_speed_mps=bev_cfg["max_worker_speed_mps"],
+        lag_diffusion_coeff=bev_cfg["lag_diffusion_coeff"],
+        base_pose_jitter_m=bev_cfg["base_pose_jitter_m"],
+        reid_interval_sec=reid_cfg["reid_interval_sec"],
+    )
 
-            for box, conf, tid in zip(all_boxes, all_confs, all_tids):
-                if tid is None: continue
-                x1, y1, x2, y2 = box
-                foot_point = get_foot_point(x1, y1, x2, y2)
+    # 6. Initialize Time-Based Multi-Zone Manager
+    zone_manager = MultiZoneManager(
+        zone_definitions=zones_cfg.get("definitions", {}),
+        entry_confirm_sec=zones_cfg.get("entry_confirm_sec", 0.60),
+        exit_confirm_sec=zones_cfg.get("exit_confirm_sec", 1.20),
+        force_exit_timeout_sec=zones_cfg.get("force_exit_timeout_sec", 15.0),
+    )
 
-                feature_vector = None
-                time_to_update = (frame_id - last_reid_frame.get(tid, 0)) >= REID_INTERVAL
-                is_unknown = tid not in identity_manager.track_to_worker
+    # Optional Video Writer
+    writer = None
+    out_path = sys_cfg.get("output_video_path")
+    if out_path:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_path, fourcc, reader.nominal_fps, (reader.width, reader.height))
 
-                # شرط عکس‌برداری با حاشیه داینامیک
-                if (is_unknown or time_to_update) and is_safe_to_extract(x1, y1, x2, y2, all_boxes, frame_w, frame_h, cam_config['margin']):
-                    crop = frame[max(0, y1):min(frame_h, y2), max(0, x1):min(frame_w, x2)]
-                    
-                    # بررسی سایز حداقلی قبل از ارسال به اکسترکتور
-                    if crop.shape[0] >= cam_config['min_crop_h'] and crop.shape[1] >= cam_config['min_crop_w']:
-                        feature_vector = reid_extractor.extract(crop)
-                        if feature_vector is not None:
-                            last_reid_frame[tid] = frame_id
+    prev_ts = time.monotonic()
+    fps_ema = reader.nominal_fps
 
-                person_id = identity_manager.identify(tid, feature_vector, foot_point, timestamp)
-                momentary_zone = zone_manager.get_zone_for_point(foot_point)
+    logger.info("Pipeline initialized. Starting real-time inference loop...")
+    try:
+        while True:
+            ok, frame, frame_ts = reader.read()
+            if not ok or frame is None:
+                logger.info("End of stream reached.")
+                break
 
-                if person_id.startswith("Worker_"):
-                    event, event_data, confirmed_state, active_dwell = state_machine.update(person_id, momentary_zone, timestamp)
+            # Track instantaneous FPS for telemetry
+            dt_wall = max(1e-3, frame_ts - prev_ts)
+            fps_ema = 0.9 * fps_ema + 0.1 * (1.0 / dt_wall)
+            prev_ts = frame_ts
 
-                    if event == "ZONE_ENTER":
-                        dt_str = datetime.fromtimestamp(event_data['timestamp']).strftime('%H:%M:%S')
-                        recent_events.append(f"[{dt_str}] {person_id} ENTER {event_data['zone']}")
-                        csv_writer.writerow([dt_str, person_id, "ENTER", event_data['zone'], 0.0])
+            # Step A: YOLO11-Pose + ByteTrack Forward Pass
+            detections = detector.track_frame(frame)
 
-                    elif event == "ZONE_EXIT":
-                        dt_str = datetime.fromtimestamp(event_data['timestamp']).strftime('%H:%M:%S')
-                        dur = event_data['duration']
-                        recent_events.append(f"[{dt_str}] {person_id} EXIT {event_data['zone']} ({dur:.1f}s)")
-                        csv_writer.writerow([dt_str, person_id, "EXIT", event_data['zone'], round(dur, 1)])
-                    
-                    if len(recent_events) > 5: recent_events.pop(0)
+            # Step B: Pose-Guided Re-ID, BEV Physics Guard & Anti-Cloning Assignment
+            track_to_global = identity_manager.process_frame(frame, detections, frame_ts)
 
-                    color = (200, 0, 200) if confirmed_state == 'INSIDE' else (255, 165, 0)
-                    label = f"{person_id} [{active_dwell:.1f}s]" if confirmed_state == 'INSIDE' else f"{person_id} [OUT]"
-                else:
-                    state_machine.update(f"Temp_{tid}", None, timestamp)
-                    color = (0, 255, 255)
-                    label = person_id
+            # Step C: Map verified Global IDs to their Pose-Extrapolated Ground Contact Points for Zone Monitoring
+            active_ground_points: Dict[int, Tuple[float, float]] = {}
+            for det in detections:
+                gid = track_to_global.get(det.track_id)
+                if gid is not None:
+                    active_ground_points[gid] = det.ground_uv
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-                cv2.circle(frame, foot_point, 5, (0, 0, 255), -1)
+            # Step D: Update Time-Based Zone State Machines
+            zone_events = zone_manager.update_all(active_ground_points, frame_ts)
+            for ev in zone_events:
+                logger.info(f"ZONE EVENT: {ev}")
 
-        # رفتگر خروج اجباری (FORCE_EXIT)
-        timeout_events = state_machine.process_missing_workers(timestamp)
-        for t_event in timeout_events:
-            if t_event['person_id'].startswith("Worker_"):
-                pid = t_event['person_id']
-                dur = t_event['event_data']['duration']
-                z = t_event['event_data']['zone']
-                dt_str = datetime.fromtimestamp(t_event['event_data']['timestamp']).strftime('%H:%M:%S')
-                
-                recent_events.append(f"[{dt_str}] {pid} FORCE_EXIT {z} ({dur:.1f}s)")
-                csv_writer.writerow([dt_str, pid, "FORCE_EXIT", z, round(dur, 1)])
-                if len(recent_events) > 5: recent_events.pop(0)
+            # Step E: Render Zones & Diagnostic HUD
+            if sys_cfg.get("display_gui", True) or writer is not None:
+                zone_manager.draw_zones(frame)
+                draw_industrial_hud(
+                    frame=frame,
+                    detections=detections,
+                    track_to_global=track_to_global,
+                    identity_manager=identity_manager,
+                    fps_instant=fps_ema,
+                    kpt_thresh=reid_cfg["kpt_conf_thresh"],
+                )
 
-        # رسم لاگ رویدادها روی ویدیو
-        y_offset = 80
-        cv2.putText(frame, "--- EVENT LOG ---", (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        for ev_text in recent_events:
-            y_offset += 20
-            cv2.putText(frame, ev_text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            if writer is not None:
+                writer.write(frame)
 
-        # محاسبه FPS و رندر نهایی
-        processing_time = time.time() - start_time
-        fps = 1.0 / processing_time if processing_time > 0 else 0
-        cv2.putText(frame, f"Frame: {frame_id} | FPS: {fps:.1f} | Infer: {inference_time_ms:.1f}ms", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            if sys_cfg.get("display_gui", True):
+                cv2.imshow("Enterprise Factory Re-ID & Zone Monitoring", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    logger.info("User requested exit ('q').")
+                    break
 
-        writer.write(frame)
-        cv2.imshow("Factory Enterprise Pipeline", frame)
-        if cv2.waitKey(frame_delay) & 0xFF == ord('q'): break
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user. Shutting down...")
+    finally:
+        reader.release()
+        if writer is not None:
+            writer.release()
+        cv2.destroyAllWindows()
 
-    # آزادسازی منابع
-    csv_file.close()
-    reader.release()
-    writer.release()
-    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Enterprise Pose-Guided Re-ID & Zone Monitoring")
+    parser.add_argument("--config", type=str, default="configs/settings.yaml", help="Path to settings.yaml")
+    args = parser.parse_args()
+    main(args.config)

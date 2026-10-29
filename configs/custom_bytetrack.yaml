@@ -1,23 +1,12 @@
-# Custom ByteTrack Configuration for Industrial Monitoring
+# configs/custom_bytetrack.yaml
 tracker_type: bytetrack
 
-# Track Buffer: How many frames to keep a lost track in memory.
-# Default is 30. Increased to 90 (approx 3 seconds at 30fps) for temporary occlusions.
-track_buffer: 90
+# Confidence thresholds for two-stage association
+track_high_thresh: 0.45   # First-stage high-confidence detections
+track_low_thresh: 0.15    # Second-stage low-confidence recovery (occluded workers)
+new_track_thresh: 0.55    # Strict threshold to prevent spawning ghost tracks during intersections
 
-# High threshold for initial matching (default: 0.6)
-# Lowering this helps when YOLO detection confidence drops slightly
-track_high_thresh: 0.5
-
-# Low threshold for the second phase of ByteTrack matching (default: 0.1)
-track_low_thresh: 0.1
-
-# New track initialization threshold (default: 0.7)
-# Prevents creating new tracks for noisy detections
-new_track_thresh: 0.6
-
-# Matching threshold (IoU threshold) (default: 0.8)
-# Increasing this makes the tracker more tolerant to fast movements or crossing paths
-match_thresh: 0.9
-
-fuse_score: True
+# Temporal & IoU association parameters
+track_buffer: 90          # Number of frames to retain lost tracks
+match_thresh: 0.75        # Stricter IoU gate to reduce ID swaps when workers cross paths
+fuse_score: true          # Fuse detection confidence with IoU distance

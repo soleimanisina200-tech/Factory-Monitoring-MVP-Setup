@@ -1,36 +1,47 @@
-# Factory Monitoring MVP Configuration
-
+# configs/settings.yaml
 system:
-  project_name: "Industrial CV Factory Monitoring"
-  version: "0.1.0"
-  debug: true
+  device: "cuda:0"
+  half_precision: true
+  display_gui: true
+  output_video_path: "output_industrial_reid.mp4"
 
-hardware:
-  device: "cuda:0"  # Will fallback to 'cpu' if cuda is unavailable
+stream:
+  source: D:/AI/EsfahanMoghadam/Factory Monitoring MVP Setup/data/input/test_video.mp4     #"0"  # RTSP URL (e.g., "rtsp://admin:pass@192.168.1.50:554/stream1") or video file path
+  reconnect_delay_sec: 3.0
+  drop_frames_on_lag: true  # Always process the latest RTSP frame to prevent buffer drift
 
-# Placeholders for future phases
 detection:
-  model_path: "yolov11s.pt"
-  confidence_threshold: 0.4
-  classes: [0] # 0 = person in COCO dataset
+  model_weights: "yolo11m-pose.pt"
+  tracker_config: "configs/custom_bytetrack.yaml"
+  conf_thres: 0.35
+  iou_thres: 0.50
+  imgsz: 640
 
-tracking:
-  tracker_type: "bytetrack"
-  track_buffer: 45
+reid:
+  model_name: "osnet_x1_0"
+  weights_path: "weights/osnet_x1_0_msmt17.pt"
+  kpt_conf_thresh: 0.45
+  min_laplacian_var: 45.0
+  head_branch_weight: 0.45
+  cos_sim_thresh: 0.68
+  spatial_recovery_sim_thresh: 0.58
+  reid_interval_sec: 0.40
+
+physics_bev:
+  max_worker_speed_mps: 2.8
+  lag_diffusion_coeff: 0.75
+  base_pose_jitter_m: 0.65
+  default_px_per_meter: 110.0
+  # 4 floor calibration points in pixel coordinates [u, v] and real-world floor meters [X_m, Y_m]
+  src_image_pts: [[320, 280], [960, 280], [1180, 680], [100, 680]]
+  dst_meter_pts: [[0.0, 0.0], [6.0, 0.0], [6.0, 8.0], [0.0, 8.0]]
 
 zones:
-  - id: "machine_01"
-    name: "Machine 01"
-    polygon:
-      - [672, 291]
-      - [1649, 751]
-      - [337, 962]
-      - [119, 483]
-
-events:
-  # How many consecutive frames an object must be inside to trigger a confirmed ENTRY
-  entry_confirmation_frames: 10
-  # How many consecutive frames an object must be outside to trigger a confirmed EXIT
-  exit_confirmation_frames: 15
-
-fuse_score: True
+  entry_confirm_sec: 0.60
+  exit_confirm_sec: 1.20
+  force_exit_timeout_sec: 15.0
+  definitions:
+    Zone_A_Assembly:
+      polygon: [[150, 300], [600, 300], [650, 680], [100, 680]]
+    Zone_B_CNC_Press:
+      polygon: [[680, 300], [1150, 300], [1220, 680], [680, 680]]
