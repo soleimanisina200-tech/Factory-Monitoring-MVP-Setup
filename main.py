@@ -5,6 +5,7 @@ import time
 import yaml
 import csv
 from datetime import datetime
+
 from app.streams.video_reader import LocalVideoReader
 from app.detection.detector import PersonDetector
 from app.zones.manager import ZoneManager
@@ -20,52 +21,104 @@ def load_settings(config_path):
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
-def is_safe_to_extract(x1, y1, x2, y2, all_boxes, frame_w, frame_h):
-    margin = 15  # بازگشت به کراپ سخت‌گیرانه برای جلوگیری از مسمومیت
-    if not (margin < x1 and margin < y1 and x2 < frame_w - margin and y2 < frame_h - margin): return False
+class DynamicCameraConfig:
+    """
+    موتور کالیبراسیون پویا: تبدیل پارامترهای مطلق به نسبی بر اساس مشخصات هر دوربین
+    """
+    @staticmethod
+    def calibrate(fps: float, frame_width: int, frame_height: int):
+        actual_fps = fps if fps > 0 else 30.0 
+        
+        # زمان‌بندی عکس‌برداری (هر 1.5 ثانیه یک بار)
+        reid_interval_frames = max(1, int(actual_fps * 1.5))
+        
+        # زمان‌بندی ماشین حالت برای ورود و خروج
+        entry_frames = max(1, int(actual_fps * 1.5))
+        exit_frames = max(1, int(actual_fps * 2.0))
+        
+        # حاشیه امن برای کیفیت عکس (2% عرض تصویر)
+        margin = max(5, int(frame_width * 0.02))
+        
+        # حداقل سایز کراپ برای OSNet
+        min_crop_h = int(frame_height * 0.07)
+        min_crop_w = int(frame_width * 0.02)
+        
+        # نگهبان فیزیک: سرعت مجاز بر اساس عرض تصویر (35% در ثانیه)
+        max_speed_px_sec = int(frame_width * 0.35)
+
+        logger.info(f"Camera Calibrated -> FPS: {actual_fps:.1f} | Res: {frame_width}x{frame_height}")
+        logger.info(f"Dyn Config -> ReID Interval: {reid_interval_frames} frames | Speed Limit: {max_speed_px_sec} px/s")
+
+        return {
+            'reid_interval_frames': reid_interval_frames,
+            'entry_frames': entry_frames,
+            'exit_frames': exit_frames,
+            'margin': margin,
+            'min_crop_h': min_crop_h,
+            'min_crop_w': min_crop_w,
+            'max_speed_px_sec': max_speed_px_sec
+        }
+
+def is_safe_to_extract(x1, y1, x2, y2, all_boxes, frame_w, frame_h, dynamic_margin):
+    # چک کردن حاشیه کادر دوربین
+    if not (dynamic_margin < x1 and dynamic_margin < y1 and x2 < frame_w - dynamic_margin and y2 < frame_h - dynamic_margin): 
+        return False
+        
+    # چک کردن همپوشانی (Occlusion) با کارگران دیگر
     for other_box in all_boxes:
         if other_box == [x1, y1, x2, y2]: continue
         ox1, oy1, ox2, oy2 = other_box
-        if max(0, min(x2, ox2) - max(x1, ox1)) * max(0, min(y2, oy2) - max(y1, oy1)) > 0: return False # عدم اجازه به هیچ همپوشانی
+        if max(0, min(x2, ox2) - max(x1, ox1)) * max(0, min(y2, oy2) - max(y1, oy1)) > 0: 
+            return False
+            
     return True
 
 def main():
-    logger.info("Starting Enterprise Architecture: OSNet-AIN + Smart Gallery + Physics Guard")
+    logger.info("Starting Enterprise Architecture: Dynamic Pipeline + OSNet + Physics Guard")
 
     video_path = "data/input/test_video.mp4"
     config_path = "configs/settings.yaml"
 
-    if not os.path.exists(video_path): return
+    if not os.path.exists(video_path): 
+        logger.error(f"Video file not found at {video_path}")
+        return
 
     reader = LocalVideoReader(video_path)
-    frame_delay = max(1, int(1000 / reader.fps))
-    settings = load_settings(config_path)
+    frame_delay = max(1, int(1000 / reader.fps)) if reader.fps > 0 else 30
+    
+    # کالیبراسیون پویا بر اساس متادیتا دوربین
+    cam_config = DynamicCameraConfig.calibrate(reader.fps, reader.width, reader.height)
 
     os.makedirs("data/output", exist_ok=True)
     writer = cv2.VideoWriter("data/output/processed_video.mp4", cv2.VideoWriter_fourcc(*'mp4v'), reader.fps, (reader.width, reader.height))
 
-    # ایجاد فایل CSV
+    # ایجاد فایل CSV برای دمو
     csv_file_path = os.path.join("data/output", f"Factory_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     csv_file = open(csv_file_path, 'w', newline='', encoding='utf-8')
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow(['Time', 'Worker_ID', 'Event_Type', 'Zone', 'Duration_Sec'])
 
+    # لود کردن ماژول‌ها
     detector = PersonDetector(model_path="yolo11m.pt", conf_threshold=0.45)
     zone_manager = ZoneManager(config_path)
-    
-    # لود کردن مدل OSNet-AIN
     reid_extractor = AdvancedReIDExtractor(device='cuda')
-    identity_manager = SpatioTemporalIdentityManager(similarity_threshold=0.65, max_speed_px_sec=400, max_gallery_size=8)
+    
+    # تزریق سرعت کالیبره شده به منیجر
+    identity_manager = SpatioTemporalIdentityManager(
+        similarity_threshold=0.72, 
+        max_speed_px_sec=cam_config['max_speed_px_sec'], 
+        max_gallery_size=8
+    )
 
-    events_config = settings.get('events', {})
+    # تزریق فریم‌های ورود و خروج داینامیک به ماشین حالت
     state_machine = ZoneStateMachine(
-        entry_frames=events_config.get('entry_confirmation_frames', 10),
-        exit_frames=events_config.get('exit_confirmation_frames', 15),
+        entry_frames=cam_config['entry_frames'],
+        exit_frames=cam_config['exit_frames'],
         timeout_sec=4.0
     )
 
     recent_events = []
-    REID_INTERVAL = 7  # 7 فریم معادل 1 ثانیه کامل در ویدیوی شماست
+    REID_INTERVAL = cam_config['reid_interval_frames']
     last_reid_frame = {}
 
     for frame, timestamp, frame_id in reader.read_frames():
@@ -74,7 +127,6 @@ def main():
         # قفل ضد کلون: ریست کردن حافظه برای فریم جدید
         identity_manager.start_new_frame(timestamp)
         
-        frame_h, frame_w = frame.shape[:2]
         frame_h, frame_w = frame.shape[:2]
 
         result = detector.track(frame)
@@ -95,19 +147,21 @@ def main():
                 time_to_update = (frame_id - last_reid_frame.get(tid, 0)) >= REID_INTERVAL
                 is_unknown = tid not in identity_manager.track_to_worker
 
-                if (is_unknown or time_to_update) and is_safe_to_extract(x1, y1, x2, y2, all_boxes, frame_w, frame_h):
+                # شرط عکس‌برداری با حاشیه داینامیک
+                if (is_unknown or time_to_update) and is_safe_to_extract(x1, y1, x2, y2, all_boxes, frame_w, frame_h, cam_config['margin']):
                     crop = frame[max(0, y1):min(frame_h, y2), max(0, x1):min(frame_w, x2)]
-                    feature_vector = reid_extractor.extract(crop)
-                    if feature_vector is not None:
-                        last_reid_frame[tid] = frame_id
+                    
+                    # بررسی سایز حداقلی قبل از ارسال به اکسترکتور
+                    if crop.shape[0] >= cam_config['min_crop_h'] and crop.shape[1] >= cam_config['min_crop_w']:
+                        feature_vector = reid_extractor.extract(crop)
+                        if feature_vector is not None:
+                            last_reid_frame[tid] = frame_id
 
                 person_id = identity_manager.identify(tid, feature_vector, foot_point, timestamp)
                 momentary_zone = zone_manager.get_zone_for_point(foot_point)
 
                 if person_id.startswith("Worker_"):
-                    event, event_data, confirmed_state, active_dwell = state_machine.update(
-                        person_id, momentary_zone, timestamp
-                    )
+                    event, event_data, confirmed_state, active_dwell = state_machine.update(person_id, momentary_zone, timestamp)
 
                     if event == "ZONE_ENTER":
                         dt_str = datetime.fromtimestamp(event_data['timestamp']).strftime('%H:%M:%S')
@@ -133,6 +187,7 @@ def main():
                 cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
                 cv2.circle(frame, foot_point, 5, (0, 0, 255), -1)
 
+        # رفتگر خروج اجباری (FORCE_EXIT)
         timeout_events = state_machine.process_missing_workers(timestamp)
         for t_event in timeout_events:
             if t_event['person_id'].startswith("Worker_"):
@@ -145,12 +200,14 @@ def main():
                 csv_writer.writerow([dt_str, pid, "FORCE_EXIT", z, round(dur, 1)])
                 if len(recent_events) > 5: recent_events.pop(0)
 
+        # رسم لاگ رویدادها روی ویدیو
         y_offset = 80
         cv2.putText(frame, "--- EVENT LOG ---", (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         for ev_text in recent_events:
             y_offset += 20
             cv2.putText(frame, ev_text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+        # محاسبه FPS و رندر نهایی
         processing_time = time.time() - start_time
         fps = 1.0 / processing_time if processing_time > 0 else 0
         cv2.putText(frame, f"Frame: {frame_id} | FPS: {fps:.1f} | Infer: {inference_time_ms:.1f}ms", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
@@ -159,6 +216,7 @@ def main():
         cv2.imshow("Factory Enterprise Pipeline", frame)
         if cv2.waitKey(frame_delay) & 0xFF == ord('q'): break
 
+    # آزادسازی منابع
     csv_file.close()
     reader.release()
     writer.release()
