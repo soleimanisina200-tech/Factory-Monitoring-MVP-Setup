@@ -1,12 +1,12 @@
 # configs/custom_bytetrack.yaml
 tracker_type: bytetrack
 
-# Confidence thresholds for two-stage association
-track_high_thresh: 0.45   # First-stage high-confidence detections
-track_low_thresh: 0.15    # Second-stage low-confidence recovery (occluded workers)
-new_track_thresh: 0.55    # Strict threshold to prevent spawning ghost tracks during intersections
+# Balanced thresholds: high recall for distant workers without spawning ghost boxes on limbs
+track_high_thresh: 0.28   # Primary association stage
+track_low_thresh: 0.10    # Secondary recovery stage for occluded/bending workers
+new_track_thresh: 0.32    # Prevents low-confidence partial-body ghost boxes from spawning tracks
 
-# Temporal & IoU association parameters
-track_buffer: 90          # Number of frames to retain lost tracks
-match_thresh: 0.75        # Stricter IoU gate to reduce ID swaps when workers cross paths
-fuse_score: true          # Fuse detection confidence with IoU distance
+# Long-horizon Kalman buffer so ByteTrack bridges brief crouches and box-lifting occlusions natively
+track_buffer: 150         # 7.5 seconds @ 20 FPS
+match_thresh: 0.82        # Generous IoU association to prevent tracklet splitting during rapid bending
+fuse_score: true

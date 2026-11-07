@@ -39,26 +39,18 @@ def draw_industrial_hud(
     track_to_global: Dict[int, int],
     identity_manager: EnterpriseIdentityManager,
     fps_instant: float,
-    kpt_thresh: float = 0.45,
+    kpt_thresh: float = 0.30,
 ) -> None:
-    """
-    Renders skeletal pose, extrapolated ground contact point, BEV metric coordinates,
-    and intersection gallery-lock indicators onto the frame.
-    """
     for det in detections:
         tid = det.track_id
         gid = track_to_global.get(tid, -1)
         x1, y1, x2, y2 = det.bbox_xyxy.astype(int)
 
-        # Color coding:
-        #   Green  = Verified Global ID, Gallery Active
-        #   Orange = Verified Global ID, Gallery LOCKED due to Intersection
-        #   Gray   = Unverified / Pending Quality Gate
         if gid == -1:
             box_color = (160, 160, 160)
-            status_tag = f"T:{tid} [PENDING GATE]"
+            status_tag = f"T:{tid} [INIT]"
         elif det.is_intersecting:
-            box_color = (0, 140, 255)  # Orange warning: Gallery locked
+            box_color = (0, 140, 255)
             status_tag = f"ID:{gid} [GALLERY LOCKED]"
         else:
             box_color = (0, 220, 0)
@@ -66,41 +58,40 @@ def draw_industrial_hud(
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2, cv2.LINE_AA)
 
-        # Draw visible skeleton limbs
         for p1, p2 in SKELETON_LIMBS:
             if det.keypoints_conf[p1] >= kpt_thresh and det.keypoints_conf[p2] >= kpt_thresh:
                 pt1 = tuple(det.keypoints_xy[p1].astype(int))
                 pt2 = tuple(det.keypoints_xy[p2].astype(int))
                 cv2.line(frame, pt1, pt2, (255, 220, 0), 2, cv2.LINE_AA)
 
-        # Draw True Ground Contact Point (solves machinery leg occlusion)
         ug, vg = int(det.ground_uv[0]), int(det.ground_uv[1])
         cv2.circle(frame, (ug, vg), 6, (255, 255, 0), -1, cv2.LINE_AA)
         cv2.circle(frame, (ug, vg), 9, (0, 0, 0), 2, cv2.LINE_AA)
 
-        # Render BEV Metric Coordinates & Gallery size
         bev_str = ""
         if det.bev_xy is not None:
             bev_str = f" | BEV:({det.bev_xy[0]:.1f}m, {det.bev_xy[1]:.1f}m)"
 
         header_text = f"{status_tag}{bev_str}"
-        (tw, th_text), _ = cv2.getTextSize(header_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+        (tw, th_text), _ = cv2.getTextSize(header_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         cv2.rectangle(frame, (x1, max(0, y1 - th_text - 10)), (x1 + tw + 8, y1), box_color, -1)
         cv2.putText(
             frame,
             header_text,
             (x1 + 4, max(15, y1 - 5)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            0.55,
             (0, 0, 0) if box_color != (160, 160, 160) else (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
 
-    # Top-left telemetry banner
-    banner = f"Stream FPS: {fps_instant:.1f} | Active Identities: {len(identity_manager.identities)}"
-    cv2.rectangle(frame, (10, 10), (480, 46), (20, 20, 20), -1)
-    cv2.putText(frame, banner, (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 180), 2, cv2.LINE_AA)
+    banner = (
+        f"Stream FPS: {fps_instant:.1f} | Active Frame Tracks: {len(detections)} | "
+        f"Total Registered IDs: {len(identity_manager.identities)}"
+    )
+    cv2.rectangle(frame, (10, 10), (760, 48), (20, 20, 20), -1)
+    cv2.putText(frame, banner, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 180), 2, cv2.LINE_AA)
 
 
 def main(config_path: str) -> None:
@@ -112,7 +103,6 @@ def main(config_path: str) -> None:
     bev_cfg = cfg["physics_bev"]
     zones_cfg = cfg["zones"]
 
-    # 1. Initialize Variable-FPS Stream Reader
     logger.info(f"Opening video stream: {stream_cfg['source']}")
     reader = VariableFPSVideoReader(
         source=stream_cfg["source"],
@@ -120,68 +110,71 @@ def main(config_path: str) -> None:
         reconnect_delay_sec=stream_cfg.get("reconnect_delay_sec", 3.0),
     )
 
-    # Dynamic Resolution Auto-Scaling for Laplacian Sharpness Threshold
-    res_scale = (reader.width * reader.height) / (1280.0 * 720.0)
-    scaled_laplacian_var = max(20.0, reid_cfg["min_laplacian_var"] * np.sqrt(res_scale))
+    laplacian_var = float(reid_cfg.get("min_laplacian_var", 18.0))
     logger.info(
         f"Stream Resolution: {reader.width}x{reader.height} @ {reader.nominal_fps:.1f} nominal FPS | "
-        f"Scaled Blur Gate: {scaled_laplacian_var:.1f}"
+        f"Native Blur Gate: {laplacian_var:.1f}"
     )
 
-    # 2. Initialize Single-Pass YOLO11-Pose + ByteTrack Detector
     detector = IndustrialPoseDetector(
         model_weights=det_cfg["model_weights"],
         tracker_config=det_cfg["tracker_config"],
         device=sys_cfg["device"],
-        conf_thres=det_cfg["conf_thres"],
-        iou_thres=det_cfg["iou_thres"],
-        imgsz=det_cfg["imgsz"],
+        conf_thres=det_cfg.get("conf_thres", 0.15),
+        iou_thres=det_cfg.get("iou_thres", 0.55),
+        imgsz=det_cfg.get("imgsz", 1280),
         half=sys_cfg.get("half_precision", True),
     )
 
-    # 3. Initialize Homography BEV Metric Projector
+    ref_wh = tuple(bev_cfg.get("calibration_ref_wh", [1280, 720]))
     bev_projector = MetricBEVProjector(
         src_image_pts=bev_cfg.get("src_image_pts"),
         dst_meter_pts=bev_cfg.get("dst_meter_pts"),
         default_px_per_meter=bev_cfg.get("default_px_per_meter", 110.0),
+        stream_wh=(reader.width, reader.height),
+        calib_ref_wh=(int(ref_wh[0]), int(ref_wh[1])),
     )
 
-    # 4. Initialize Pose-Guided OSNet Re-ID Engine
     reid_extractor = PoseGuidedOSNetExtractor(
         model_name=reid_cfg["model_name"],
         weights_path=reid_cfg.get("weights_path") or None,
         device=sys_cfg["device"],
-        kpt_conf_thresh=reid_cfg["kpt_conf_thresh"],
-        min_laplacian_var=scaled_laplacian_var,
-        head_branch_weight=reid_cfg["head_branch_weight"],
+        kpt_conf_thresh=reid_cfg.get("kpt_conf_thresh", 0.30),
+        min_laplacian_var=laplacian_var,
+        head_branch_weight=reid_cfg.get("head_branch_weight", 0.35),
+        color_branch_weight=reid_cfg.get("color_branch_weight", 0.20),
     )
 
-    # 5. Initialize Enterprise Identity Manager
     identity_manager = EnterpriseIdentityManager(
         reid_extractor=reid_extractor,
         bev_projector=bev_projector,
-        cos_sim_thresh=reid_cfg["cos_sim_thresh"],
-        spatial_recovery_sim_thresh=reid_cfg["spatial_recovery_sim_thresh"],
-        max_worker_speed_mps=bev_cfg["max_worker_speed_mps"],
-        lag_diffusion_coeff=bev_cfg["lag_diffusion_coeff"],
-        base_pose_jitter_m=bev_cfg["base_pose_jitter_m"],
-        reid_interval_sec=reid_cfg["reid_interval_sec"],
+        cos_sim_thresh=reid_cfg.get("cos_sim_thresh", 0.64),
+        spatial_recovery_sim_thresh=reid_cfg.get("spatial_recovery_sim_thresh", 0.56),
+        reentry_sim_thresh=reid_cfg.get("reentry_sim_thresh", 0.78),
+        max_worker_speed_mps=bev_cfg.get("max_worker_speed_mps", 2.6),
+        max_internal_occlusion_m=bev_cfg.get("max_internal_occlusion_m", 3.5),
+        lag_diffusion_coeff=bev_cfg.get("lag_diffusion_coeff", 0.50),
+        base_pose_jitter_m=bev_cfg.get("base_pose_jitter_m", 0.55),
+        reid_interval_sec=reid_cfg.get("reid_interval_sec", 0.35),
     )
 
-    # 6. Initialize Time-Based Multi-Zone Manager
     zone_manager = MultiZoneManager(
         zone_definitions=zones_cfg.get("definitions", {}),
-        entry_confirm_sec=zones_cfg.get("entry_confirm_sec", 0.60),
-        exit_confirm_sec=zones_cfg.get("exit_confirm_sec", 1.20),
+        entry_confirm_sec=zones_cfg.get("entry_confirm_sec", 0.50),
+        exit_confirm_sec=zones_cfg.get("exit_confirm_sec", 1.00),
         force_exit_timeout_sec=zones_cfg.get("force_exit_timeout_sec", 15.0),
     )
 
-    # Optional Video Writer
     writer = None
     out_path = sys_cfg.get("output_video_path")
     if out_path:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(out_path, fourcc, reader.nominal_fps, (reader.width, reader.height))
+
+    win_title = "Enterprise Factory Re-ID & Zone Monitoring"
+    if sys_cfg.get("display_gui", True):
+        cv2.namedWindow(win_title, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win_title, min(1440, reader.width), min(900, reader.height))
 
     prev_ts = time.monotonic()
     fps_ema = reader.nominal_fps
@@ -194,30 +187,24 @@ def main(config_path: str) -> None:
                 logger.info("End of stream reached.")
                 break
 
-            # Track instantaneous FPS for telemetry
             dt_wall = max(1e-3, frame_ts - prev_ts)
             fps_ema = 0.9 * fps_ema + 0.1 * (1.0 / dt_wall)
             prev_ts = frame_ts
 
-            # Step A: YOLO11-Pose + ByteTrack Forward Pass
-            detections = detector.track_frame(frame)
-
-            # Step B: Pose-Guided Re-ID, BEV Physics Guard & Anti-Cloning Assignment
+            active_tids = set(identity_manager.track_to_global.keys())
+            detections = detector.track_frame(frame, active_track_ids=active_tids)
             track_to_global = identity_manager.process_frame(frame, detections, frame_ts)
 
-            # Step C: Map verified Global IDs to their Pose-Extrapolated Ground Contact Points for Zone Monitoring
             active_ground_points: Dict[int, Tuple[float, float]] = {}
             for det in detections:
                 gid = track_to_global.get(det.track_id)
                 if gid is not None:
                     active_ground_points[gid] = det.ground_uv
 
-            # Step D: Update Time-Based Zone State Machines
             zone_events = zone_manager.update_all(active_ground_points, frame_ts)
             for ev in zone_events:
                 logger.info(f"ZONE EVENT: {ev}")
 
-            # Step E: Render Zones & Diagnostic HUD
             if sys_cfg.get("display_gui", True) or writer is not None:
                 zone_manager.draw_zones(frame)
                 draw_industrial_hud(
@@ -226,14 +213,14 @@ def main(config_path: str) -> None:
                     track_to_global=track_to_global,
                     identity_manager=identity_manager,
                     fps_instant=fps_ema,
-                    kpt_thresh=reid_cfg["kpt_conf_thresh"],
+                    kpt_thresh=reid_cfg.get("kpt_conf_thresh", 0.30),
                 )
 
             if writer is not None:
                 writer.write(frame)
 
             if sys_cfg.get("display_gui", True):
-                cv2.imshow("Enterprise Factory Re-ID & Zone Monitoring", frame)
+                cv2.imshow(win_title, frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     logger.info("User requested exit ('q').")
                     break
