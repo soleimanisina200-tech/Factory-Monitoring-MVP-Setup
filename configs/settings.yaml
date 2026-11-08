@@ -6,39 +6,43 @@ system:
   output_video_path: "output_industrial_reid.mp4"
 
 stream:
-  source: D:/AI/EsfahanMoghadam/Factory Monitoring MVP Setup/data/input/test_video.mp4     #"0"  # RTSP URL (e.g., "rtsp://admin:pass@192.168.1.50:554/stream1") or video file path
+  source: "D:/AI/EsfahanMoghadam/Factory Monitoring MVP Setup/data/input/test_video.mp4"
   reconnect_delay_sec: 3.0
-  drop_frames_on_lag: true  # Always process the latest RTSP frame to prevent buffer drift
+  drop_frames_on_lag: true
 
 detection:
   model_weights: "yolo11m-pose.pt"
   tracker_config: "configs/custom_bytetrack.yaml"
-  conf_thres: 0.35
-  iou_thres: 0.50
-  imgsz: 640
+  conf_thres: 0.15        # Low pre-filter so ByteTrack sees all mid-ground & distant humans
+  iou_thres: 0.55
+  imgsz: 1280             # High-res 1280 inference required for 2560x1920 wide-angle scenes
 
 reid:
   model_name: "osnet_x1_0"
   weights_path: "weights/osnet_x1_0_msmt17.pt"
-  kpt_conf_thresh: 0.45
-  min_laplacian_var: 45.0
-  head_branch_weight: 0.45
-  cos_sim_thresh: 0.68
-  spatial_recovery_sim_thresh: 0.58
-  reid_interval_sec: 0.40
+  kpt_conf_thresh: 0.30   # Tolerates profile views and distant skeletons
+  min_laplacian_var: 18.0 # Evaluated at native crop resolution (no upscaling blur)
+  head_branch_weight: 0.35
+  color_branch_weight: 0.20
+  cos_sim_thresh: 0.64
+  spatial_recovery_sim_thresh: 0.56
+  reentry_sim_thresh: 0.78 # Strict threshold required to resurrect an exited Global ID
+  reid_interval_sec: 0.35
 
 physics_bev:
-  max_worker_speed_mps: 2.8
-  lag_diffusion_coeff: 0.75
-  base_pose_jitter_m: 0.65
+  max_worker_speed_mps: 2.6
+  max_internal_occlusion_m: 3.5 # Caps in-scene occlusion jump radius so exited IDs cannot teleport
+  lag_diffusion_coeff: 0.50
+  base_pose_jitter_m: 0.55
   default_px_per_meter: 110.0
-  # 4 floor calibration points in pixel coordinates [u, v] and real-world floor meters [X_m, Y_m]
+  # Reference resolution for calibration points (auto-scales to 2560x1920 if calibrated on 1280x720)
+  calibration_ref_wh: [1280, 720]
   src_image_pts: [[320, 280], [960, 280], [1180, 680], [100, 680]]
   dst_meter_pts: [[0.0, 0.0], [6.0, 0.0], [6.0, 8.0], [0.0, 8.0]]
 
 zones:
-  entry_confirm_sec: 0.60
-  exit_confirm_sec: 1.20
+  entry_confirm_sec: 0.50
+  exit_confirm_sec: 1.00
   force_exit_timeout_sec: 15.0
   definitions:
     Zone_A_Assembly:
