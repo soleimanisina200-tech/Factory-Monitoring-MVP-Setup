@@ -4,7 +4,7 @@ import argparse
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import yaml
@@ -15,6 +15,7 @@ from app.identity.reid_model import PoseGuidedOSNetExtractor, SKELETON_LIMBS
 from app.logic.geometry import MetricBEVProjector
 from app.streams.video_reader import VariableFPSVideoReader
 from app.zones.manager import MultiZoneManager
+from app.vehicle_monitoring.pipeline import VehicleMonitoringPipeline
 
 
 logging.basicConfig(
@@ -31,6 +32,38 @@ def load_config(config_path: str = "configs/settings.yaml") -> Dict:
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def build_pose_persons_for_vehicle_monitor(
+    detections: List[PoseDetection],
+    track_to_global: Dict[int, int],
+) -> List[Dict]:
+    """
+    Packages IndustrialPoseDetector + EnterpriseIdentityManager outputs
+    (global ID, bbox, 17x3 YOLO-Pose keypoints, ankle ground_uv, and metric bev_xy)
+    for the Vehicle & Driver Monitoring Pipeline.
+    """
+    pose_persons: List[Dict] = []
+    for det in detections:
+        gid = track_to_global.get(det.track_id, -1)
+        # Use verified global_id when available, or fallback to temporary track ID
+        person_id = str(gid) if gid != -1 else f"T{det.track_id}"
+
+        # Combine (17, 2) xy and (17,) conf into (17, 3) array [x, y, conf]
+        kpts_17x3 = np.column_stack([det.keypoints_xy, det.keypoints_conf])
+        ug, vg = int(det.ground_uv[0]), int(det.ground_uv[1])
+
+        pose_persons.append(
+            {
+                "id": person_id,
+                "global_id": gid,
+                "bbox": det.bbox_xyxy.astype(float).tolist(),
+                "keypoints": kpts_17x3,
+                "foot_px": (ug, vg),
+                "bev_xy": det.bev_xy,
+            }
+        )
+    return pose_persons
 
 
 def draw_industrial_hud(
@@ -94,7 +127,10 @@ def draw_industrial_hud(
     cv2.putText(frame, banner, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 180), 2, cv2.LINE_AA)
 
 
-def main(config_path: str) -> None:
+def main(
+    config_path: str,
+    vehicle_config_path: str = "configs/vehicle_monitoring.yaml",
+) -> None:
     cfg = load_config(config_path)
     sys_cfg = cfg["system"]
     stream_cfg = cfg["stream"]
@@ -165,6 +201,27 @@ def main(config_path: str) -> None:
         force_exit_timeout_sec=zones_cfg.get("force_exit_timeout_sec", 15.0),
     )
 
+    # Initialize the modular Vehicle & Driver Monitoring Pipeline
+    vehicle_pipeline: Optional[VehicleMonitoringPipeline] = None
+    if Path(vehicle_config_path).exists():
+        logger.info(f"Initializing Vehicle & Driver Monitoring Module from: {vehicle_config_path}")
+        vehicle_pipeline = VehicleMonitoringPipeline(
+            config_path=vehicle_config_path,
+            reid_extractor=reid_extractor,
+        )
+        # Share the calibrated homography from settings.yaml if available
+        if bev_cfg.get("src_image_pts") and bev_cfg.get("dst_meter_pts"):
+            src_pts = np.array(bev_cfg["src_image_pts"], dtype=np.float32)
+            dst_pts = np.array(bev_cfg["dst_meter_pts"], dtype=np.float32)
+            if len(src_pts) >= 4 and len(dst_pts) >= 4:
+                H, _ = cv2.findHomography(src_pts, dst_pts, method=cv2.RANSAC)
+                if H is not None:
+                    vehicle_pipeline.estimator.homography_matrix = H
+                    try:
+                        vehicle_pipeline.estimator.inv_homography_matrix = np.linalg.inv(H)
+                    except np.linalg.LinAlgError:
+                        pass
+
     writer = None
     out_path = sys_cfg.get("output_video_path")
     if out_path:
@@ -205,6 +262,18 @@ def main(config_path: str) -> None:
             for ev in zone_events:
                 logger.info(f"ZONE EVENT: {ev}")
 
+            # Run Vehicle & Driver Monitoring using YOLO-Pose detections
+            if vehicle_pipeline is not None:
+                pose_persons = build_pose_persons_for_vehicle_monitor(
+                    detections=detections,
+                    track_to_global=track_to_global,
+                )
+                frame = vehicle_pipeline.process_frame(
+                    frame=frame,
+                    external_persons=pose_persons,
+                    tracker_config=det_cfg["tracker_config"],
+                )
+
             if sys_cfg.get("display_gui", True) or writer is not None:
                 zone_manager.draw_zones(frame)
                 draw_industrial_hud(
@@ -237,5 +306,11 @@ def main(config_path: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Enterprise Pose-Guided Re-ID & Zone Monitoring")
     parser.add_argument("--config", type=str, default="configs/settings.yaml", help="Path to settings.yaml")
+    parser.add_argument(
+        "--vehicle-config",
+        type=str,
+        default="configs/vehicle_monitoring.yaml",
+        help="Path to vehicle_monitoring.yaml",
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.vehicle_config)

@@ -1,0 +1,69 @@
+# Vehicle and Driver Safety Monitoring Configuration
+vehicle_monitoring:
+  enabled: true
+  
+  # Detection Settings
+  vehicle_detector_weights: "yolo11m.pt"   # Can point to custom forklift weights (e.g., forklift_yolo11.pt)
+  person_class_id: 0
+  # Standard COCO classes (e.g., 2: car, 7: truck) or custom model forklift class ID (e.g., 0 or 80)
+  vehicle_class_ids: [7]
+  vehicle_conf_threshold: 0.45
+  person_conf_threshold: 0.45
+
+# Driver-Vehicle Pairing & Exit Parameters
+  pairing:
+    entry_iou_threshold: 0.30                  # Core cabin overlap required
+    entry_confirmation_frames: 25              # Stationary vehicle: must dwell stopped inside cab for 25 frames
+    moving_entry_confirmation_frames: 5        # Moving vehicle: pair within 5 frames
+    exit_confirmation_frames: 6                # Consecutive frames outside cab to confirm Driver Exit
+    reid_similarity_threshold: 0.68            # OSNet Re-ID cosine similarity threshold
+    vehicle_motion_threshold_m: 0.40           # Minimum displacement (m) to mark vehicle as actively moving
+    max_boarding_walk_speed_mps: 0.45          # Rejects pedestrians walking past parked cars (> 0.45 m/s)
+    dismount_spawn_radius_m: 1.35              # Auto-detects driver emerging from occluded forklift cab (< 1.35m)
+    require_vehicle_activity_for_spawn: false  # Set true to only allow emergence on vehicles that moved in-stream
+    unassigned_ghost_timeout_sec: 1.5          # Immediately clears disappearing unassigned vehicles (e.g. Forklift #9)
+    assigned_ghost_timeout_sec: 15.0
+
+  # Real-World Distance Estimation & Safety Thresholds (in Meters)
+  distance:
+    safe_distance_threshold_m: 3.0         # Trigger alarm if driver moves > 3.0 meters from forklift
+    warning_distance_threshold_m: 2.0      # Visual warning zone (yellow) between 2.0m and 3.0m
+    ema_smoothing_alpha: 0.35              # Temporal stabilization factor (0.1 = heavy smoothing, 1.0 = raw)
+    max_step_jump_m: 1.8                   # Outlier rejection threshold per frame in meters
+    min_bbox_aspect_ratio: 1.15            # Below this height/width ratio, feet are likely occluded
+    border_margin_px: 12                   # Margin from frame edges to flag clipped feet as uncertain
+
+  # Ground-Plane Calibration (Generated via scripts/calibrate_ground_plane.py)
+  calibration:
+    # 4 Reference points in pixel coordinates [[u1,v1], [u2,v2], [u3,v3], [u4,v4]]
+    image_points_px:
+      - [320, 380]
+      - [960, 380]
+      - [1180, 680]
+      - [100, 680]
+    # Corresponding physical floor coordinates in meters [[X1,Y1], [X2,Y2], [X3,Y3], [X4,Y4]]
+    world_points_m:
+      - [0.0, 0.0]
+      - [6.0, 0.0]
+      - [6.0, 8.0]
+      - [0.0, 8.0]
+    # Fallback scale if homography is uncalibrated (meters per pixel at reference depth)
+    fallback_meters_per_pixel: 0.012
+
+  # Alarm & Event Logging
+  alarms:
+    enable_audio_alarm: true
+    enable_visual_alarm: true
+    alarm_cooldown_sec: 5.0                # Minimum seconds between consecutive audio alerts/snapshots
+    audio_frequency_hz: 2200
+    audio_duration_ms: 400
+
+  logging:
+    db_path: "data/vehicle_safety_events.db"
+    csv_log_path: "data/vehicle_safety_events.csv"
+    snapshot_dir: "data/snapshots/vehicle_safety"
+
+  dashboard:
+    enable_web_dashboard: true
+    host: "0.0.0.0"
+    port: 8050
