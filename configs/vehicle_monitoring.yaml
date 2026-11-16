@@ -7,12 +7,12 @@ vehicle_monitoring:
   person_class_id: 0
   # Standard COCO classes (e.g., 2: car, 7: truck) or custom model forklift class ID (e.g., 0 or 80)
   vehicle_class_ids: [7]
-  vehicle_conf_threshold: 0.45
+  vehicle_conf_threshold: 0.40
   person_conf_threshold: 0.45
 
 # Driver-Vehicle Pairing & Exit Parameters
   pairing:
-    entry_iou_threshold: 0.30                  # Core cabin overlap required
+    entry_iou_threshold: 0.60                  # Core cabin overlap required
     entry_confirmation_frames: 25              # Stationary vehicle: must dwell stopped inside cab for 25 frames
     moving_entry_confirmation_frames: 5        # Moving vehicle: pair within 5 frames
     exit_confirmation_frames: 6                # Consecutive frames outside cab to confirm Driver Exit

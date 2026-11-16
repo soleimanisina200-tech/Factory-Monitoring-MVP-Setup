@@ -1,12 +1,21 @@
-# configs/custom_bytetrack.yaml
+# # configs/custom_bytetrack.yaml
+# tracker_type: bytetrack
+
+# # Balanced thresholds: high recall for distant workers without spawning ghost boxes on limbs
+# track_high_thresh: 0.28   # Primary association stage
+# track_low_thresh: 0.10    # Secondary recovery stage for occluded/bending workers
+# new_track_thresh: 0.32    # Prevents low-confidence partial-body ghost boxes from spawning tracks
+
+# # Long-horizon Kalman buffer so ByteTrack bridges brief crouches and box-lifting occlusions natively
+# track_buffer: 150         # 7.5 seconds @ 20 FPS
+# match_thresh: 0.82        # Generous IoU association to prevent tracklet splitting during rapid bending
+# fuse_score: true
+
+
 tracker_type: bytetrack
-
-# Balanced thresholds: high recall for distant workers without spawning ghost boxes on limbs
-track_high_thresh: 0.28   # Primary association stage
-track_low_thresh: 0.10    # Secondary recovery stage for occluded/bending workers
-new_track_thresh: 0.32    # Prevents low-confidence partial-body ghost boxes from spawning tracks
-
-# Long-horizon Kalman buffer so ByteTrack bridges brief crouches and box-lifting occlusions natively
-track_buffer: 150         # 7.5 seconds @ 20 FPS
-match_thresh: 0.82        # Generous IoU association to prevent tracklet splitting during rapid bending
-fuse_score: true
+track_high_thresh: 0.15   # Catches distant 40px humans at the top of the 2560x1920 yard
+track_low_thresh: 0.05    # Keeps tracks alive during partial occlusion behind pallets/forklift
+new_track_thresh: 0.16    # Immediately initializes tracks for far-away workers
+track_buffer: 120         # 6.0 seconds buffer (@ 20 FPS) so workers hiding for seconds keep their ID
+match_thresh: 0.82
+fuse_score: True
