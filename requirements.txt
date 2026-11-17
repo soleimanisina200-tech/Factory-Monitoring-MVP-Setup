@@ -1,5 +1,10 @@
-# PyTorch is installed manually via pip with index-url for CUDA support
+# PyTorch is installed manually via pip with the CUDA index-url (see setup notes)
 ultralytics>=8.1.0
 opencv-python>=4.8.0
 pyyaml>=6.0
 numpy>=1.23.0
+scipy>=1.9.0          # Hungarian assignment in the identity manager
+torchreid             # OSNet Re-ID (install from the torchreid GitHub repo if the PyPI build fails)
+gdown                 # automatic download of the MSMT17 OSNet weights
+fastapi               # optional: live dashboard
+uvicorn               # optional: live dashboard
