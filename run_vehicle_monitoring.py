@@ -24,7 +24,9 @@ def main():
 
     # Standalone mode has no pose/Re-ID stack: persons carry no embeddings, so the driver Re-ID
     # fallback is simply disabled (a colour-histogram stand-in used to make it match wrong people).
-    pipeline = VehicleMonitoringPipeline(config_path=args.config, reid_extractor=None)
+    pipeline = VehicleMonitoringPipeline(
+        config_path=args.config, reid_extractor=None, calibration_path="configs/calibration.yaml"
+    )
 
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():

@@ -1,20 +1,36 @@
-import cv2
-import yaml
+"""
+Ground-plane calibration: click 4 floor points whose real-world rectangle you measured.
+
+Writes configs/calibration.yaml, which BOTH main.py (worker + vehicle distances) and
+run_vehicle_monitoring.py read. The click resolution is stored, so the points are rescaled
+exactly to whatever resolution the live stream has.
+
+Example:
+    python scripts/calibrate_ground_plane.py --source data/input/cam1.mp4 --width-m 6.0 --length-m 8.0
+"""
 import argparse
-import numpy as np
+import sys
 from pathlib import Path
 
+import cv2
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app.logic.calibration import DEFAULT_CALIBRATION_PATH, GroundCalibration, save_calibration  # noqa: E402
+
 clicked_points = []
+
 
 def mouse_callback(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN and len(clicked_points) < 4:
         clicked_points.append([int(x), int(y)])
         print(f"[Calibration] Point {len(clicked_points)} recorded at pixel: ({x}, {y})")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Calibrate Ground Plane for Real-World Distance (Meters)")
     parser.add_argument("--source", type=str, required=True, help="Video file or RTSP URL")
-    parser.add_argument("--config", type=str, default="configs/vehicle_monitoring.yaml", help="Config path")
+    parser.add_argument("--out", type=str, default=DEFAULT_CALIBRATION_PATH, help="Calibration file to write")
     parser.add_argument("--width-m", type=float, required=True, help="Real-world width (meters) between Pt1-Pt2")
     parser.add_argument("--length-m", type=float, required=True, help="Real-world length (meters) between Pt2-Pt3")
     args = parser.parse_args()
@@ -24,6 +40,7 @@ def main():
     cap.release()
     if not ret:
         raise RuntimeError(f"Failed to read frame from source: {args.source}")
+    frame_h, frame_w = frame.shape[:2]
 
     window_name = "Ground Plane Calibration - Click 4 Floor Corners (Clockwise: Top-Left, Top-Right, Bottom-Right, Bottom-Left)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -57,20 +74,13 @@ def main():
         [0.0, 0.0],
         [float(args.width_m), 0.0],
         [float(args.width_m), float(args.length_m)],
-        [0.0, float(args.length_m)]
+        [0.0, float(args.length_m)],
     ]
+    # Mouse coordinates are in the frame's native pixel space (cv2 scales the window, not the callback).
+    save_calibration(GroundCalibration(clicked_points, world_points, (frame_w, frame_h)), args.out)
+    print(f"[Calibration] Saved 4-point metric homography ({frame_w}x{frame_h}) to {args.out}")
+    print("[Calibration] Validate it: measure a known distance on the floor and compare with the HUD.")
 
-    config_path = Path(args.config)
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    cfg["vehicle_monitoring"]["calibration"]["image_points_px"] = clicked_points
-    cfg["vehicle_monitoring"]["calibration"]["world_points_m"] = world_points
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
-
-    print(f"[Calibration] Successfully saved 4-point metric homography to {config_path}")
 
 if __name__ == "__main__":
     main()

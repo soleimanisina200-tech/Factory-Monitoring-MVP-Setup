@@ -11,6 +11,7 @@ import yaml
 from app.detection.detector import IndustrialPoseDetector, PoseDetection
 from app.identity.manager import EnterpriseIdentityManager
 from app.identity.reid_model import PoseGuidedOSNetExtractor, SKELETON_LIMBS
+from app.logic.calibration import DEFAULT_CALIBRATION_PATH, load_calibration
 from app.logic.geometry import MetricBEVProjector
 from app.streams.video_reader import VariableFPSVideoReader
 from app.zones.manager import MultiZoneManager
@@ -177,6 +178,7 @@ def main(
     config_path: str,
     vehicle_config_path: str = "configs/vehicle_monitoring.yaml",
     source_override: Optional[str] = None,
+    calibration_path: str = DEFAULT_CALIBRATION_PATH,
 ) -> None:
     cfg = load_config(config_path)
     if source_override:
@@ -211,10 +213,22 @@ def main(
         half=sys_cfg.get("half_precision", True),
     )
 
-    ref_wh = tuple(bev_cfg.get("calibration_ref_wh", [1280, 720]))
+    # Ground calibration: configs/calibration.yaml (written by scripts/calibrate_ground_plane.py) wins;
+    # the physics_bev points in settings.yaml are only a fallback. ONE homography serves persons and vehicles.
+    calibration = load_calibration(calibration_path)
+    if calibration is not None:
+        logger.info(f"Ground calibration loaded from {calibration_path} (clicked at {calibration.image_wh})")
+        src_pts, dst_pts, ref_wh = calibration.image_points_px, calibration.world_points_m, calibration.image_wh
+    else:
+        logger.warning(
+            f"No {calibration_path}: using the physics_bev points of settings.yaml. Metric distances are only "
+            "as good as that calibration - run scripts/calibrate_ground_plane.py on this camera."
+        )
+        src_pts, dst_pts = bev_cfg.get("src_image_pts"), bev_cfg.get("dst_meter_pts")
+        ref_wh = tuple(bev_cfg.get("calibration_ref_wh", [reader.width, reader.height]))
     bev_projector = MetricBEVProjector(
-        src_image_pts=bev_cfg.get("src_image_pts"),
-        dst_meter_pts=bev_cfg.get("dst_meter_pts"),
+        src_image_pts=src_pts,
+        dst_meter_pts=dst_pts,
         default_px_per_meter=bev_cfg.get("default_px_per_meter", 110.0),
         stream_wh=(reader.width, reader.height),
         calib_ref_wh=(int(ref_wh[0]), int(ref_wh[1])),
@@ -228,6 +242,8 @@ def main(
         min_laplacian_var=laplacian_var,
         head_branch_weight=reid_cfg.get("head_branch_weight", 0.35),
         color_branch_weight=reid_cfg.get("color_branch_weight", 0.20),
+        min_gallery_height_px=reid_cfg.get("min_gallery_height_px", 72),
+        min_visible_kpts=reid_cfg.get("min_visible_kpts", 5),
     )
 
     identity_manager = EnterpriseIdentityManager(
@@ -246,10 +262,16 @@ def main(
         reentry_min_gap_sec=reid_cfg.get("reentry_min_gap_sec", 2.0),
         reentry_margin=reid_cfg.get("reentry_margin", 0.08),
         reentry_min_samples=reid_cfg.get("reentry_min_samples", 3),
-        exit_confirm_sec=reid_cfg.get("exit_confirm_sec", 0.5),
         occlusion_max_sec=reid_cfg.get("occlusion_max_sec", 20.0),
         border_margin_ratio=reid_cfg.get("border_margin_ratio", 0.06),
         track_gap_reset_sec=reid_cfg.get("track_gap_reset_sec", 1.5),
+        exit_edges=reid_cfg.get("exit_edges", ["left", "right", "top", "bottom"]),
+        exit_confirm_sec=reid_cfg.get("exit_confirm_sec", 0.8),
+        mismatch_min_span_sec=reid_cfg.get("mismatch_min_span_sec", 1.0),
+        anchor_min_height_px=reid_cfg.get("anchor_min_height_px", 110),
+        track_state_ttl_sec=reid_cfg.get("track_state_ttl_sec", 10.0),
+        identity_retention_sec=reid_cfg.get("identity_retention_sec", 3600.0),
+        max_exited_identities=reid_cfg.get("max_exited_identities", 300),
         decision_log_path=reid_cfg.get("decision_log_path") or None,
     )
 
@@ -298,9 +320,10 @@ def main(
                 logger.info("End of stream reached.")
                 break
 
-            dt_wall = max(1e-3, frame_ts - prev_ts)
+            now_wall = time.monotonic()
+            dt_wall = max(1e-3, now_wall - prev_ts)  # real processing rate, not the video's nominal FPS
             fps_ema = 0.9 * fps_ema + 0.1 * (1.0 / dt_wall)
-            prev_ts = frame_ts
+            prev_ts = now_wall
 
             active_tids = set(identity_manager.track_to_global.keys())
             detections = detector.track_frame(frame, active_track_ids=active_tids)
@@ -329,6 +352,12 @@ def main(
 
             # Workers who just LEFT the camera (reported once by the identity manager, which also unbinds
             # their tracks so a newcomer can never inherit the departed worker's ID).
+            # Identities merged by the self-healing consolidation: move zone/direction state to the survivor
+            # so the same worker is not counted twice.
+            for old_gid, new_gid in identity_manager.pop_merged():
+                zone_manager.rename_identity(old_gid, new_gid)
+                dir_tracker.rename_entity(old_gid, new_gid)
+
             for gid_left in identity_manager.pop_newly_exited():
                 dir_tracker.exited_camera_ids.add(gid_left)
                 logger.info(f"ID:{gid_left} left the camera view")
@@ -396,5 +425,7 @@ if __name__ == "__main__":
         help="Path to vehicle_monitoring.yaml",
     )
     parser.add_argument("--source", type=str, default=None, help="Video file / RTSP URL (overrides settings.yaml)")
+    parser.add_argument("--calibration", type=str, default=DEFAULT_CALIBRATION_PATH,
+                        help="Ground calibration file written by scripts/calibrate_ground_plane.py")
     args = parser.parse_args()
-    main(args.config, args.vehicle_config, args.source)
+    main(args.config, args.vehicle_config, args.source, args.calibration)

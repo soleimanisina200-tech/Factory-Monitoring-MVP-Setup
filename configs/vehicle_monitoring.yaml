@@ -6,6 +6,9 @@ vehicle_monitoring:
   vehicle_detector_weights: "yolo11m.pt"   # Can point to custom forklift weights (e.g., forklift_yolo11.pt)
   person_class_id: 0
   vehicle_tracker_config: "bytetrack.yaml"   # vehicles get their own tracker (NOT the person tracker)
+  vehicle_imgsz: 1280                        # detector input size for vehicles (default 640 loses far forklifts)
+  vehicle_half: true                         # FP16 on GPU
+  vehicle_detect_every_n_frames: 1           # 2-3 halves/thirds the vehicle-model cost (boxes reused in between)
   # Standard COCO classes (e.g., 2: car, 7: truck) or custom model forklift class ID (e.g., 0 or 80)
   vehicle_class_ids: [7]
   vehicle_conf_threshold: 0.40
@@ -46,7 +49,8 @@ vehicle_monitoring:
     min_bbox_aspect_ratio: 1.15            # Below this height/width ratio, feet are likely occluded
     border_margin_px: 12                   # Margin from frame edges to flag clipped feet as uncertain
 
-  # Ground-Plane Calibration (Generated via scripts/calibrate_ground_plane.py)
+  # Ground-Plane Calibration fallback for the standalone runner only. scripts/calibrate_ground_plane.py now writes
+  # configs/calibration.yaml, which main.py AND run_vehicle_monitoring.py use when it exists.
   calibration:
     # 4 Reference points in pixel coordinates [[u1,v1], [u2,v2], [u3,v3], [u4,v4]]
     image_points_px:
@@ -80,3 +84,5 @@ vehicle_monitoring:
     enable_web_dashboard: true
     host: "127.0.0.1"   # localhost only; set 0.0.0.0 deliberately (and put auth/HTTPS in front) to expose it
     port: 8050
+    stream_max_fps: 10        # web video stream rate (JPEG encoding of full frames is expensive)
+    stream_width: 1280        # web stream is downscaled to this width

@@ -4,8 +4,10 @@ import yaml
 import numpy as np
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import torch
 from ultralytics import YOLO
 
+from app.logic.calibration import load_calibration
 from app.vehicle_monitoring.distance_estimator import RealWorldDistanceEstimator
 from app.vehicle_monitoring.driver_vehicle_fsm import DriverVehicleMonitorFSM
 from app.vehicle_monitoring.alarm_and_logger import SafetyAlarmAndLogger
@@ -21,7 +23,12 @@ class VehicleMonitoringPipeline:
     pose keypoints, global IDs, and Re-ID embeddings.
     """
 
-    def __init__(self, config_path: str = "configs/vehicle_monitoring.yaml", reid_extractor=None):
+    def __init__(
+        self,
+        config_path: str = "configs/vehicle_monitoring.yaml",
+        reid_extractor=None,
+        calibration_path: Optional[str] = None,
+    ):
         with open(Path(config_path), "r", encoding="utf-8") as f:
             full_cfg = yaml.safe_load(f)
         self.cfg = full_cfg.get("vehicle_monitoring", {})
@@ -36,12 +43,25 @@ class VehicleMonitoringPipeline:
         # Vehicles have their own ByteTrack settings: the person tracker is tuned for tiny, partially
         # occluded humans (very low thresholds) and is wrong for large rigid vehicles.
         self.vehicle_tracker_cfg: str = str(self.cfg.get("vehicle_tracker_config", "bytetrack.yaml"))
+        # Vehicles are detected on large frames: the default 640 px input shrinks a 2560 px frame 4x and
+        # loses distant forklifts / makes their boxes jittery (which hurts the cab-overlap tests).
+        self.vehicle_imgsz: int = int(self.cfg.get("vehicle_imgsz", 1280))
+        self.vehicle_half: bool = bool(self.cfg.get("vehicle_half", True)) and torch.cuda.is_available()
+        # Vehicles move slowly compared with the frame rate: optionally detect them every N frames only.
+        self.detect_every_n: int = max(1, int(self.cfg.get("vehicle_detect_every_n_frames", 1)))
+        self._frame_idx = 0
+        self._last_vehicles: List[Dict] = []
 
         self.reid_extractor = reid_extractor
         self.estimator = RealWorldDistanceEstimator(self.cfg)
         self.fsm = DriverVehicleMonitorFSM(self.cfg, self.estimator)
         self.logger = SafetyAlarmAndLogger(self.cfg)
         self.dashboard = VehicleSafetyDashboard(self.cfg)
+
+        # Standalone mode reads the shared ground calibration lazily (it needs the stream resolution).
+        # main.py does NOT pass a path: it hands its own (already scaled) homography to the estimator.
+        self._calibration = load_calibration(calibration_path) if calibration_path else None
+        self._calibration_applied = False
 
     def _extract_embedding(self, frame: np.ndarray, bbox: List[float]) -> Optional[np.ndarray]:
         """
@@ -165,6 +185,11 @@ class VehicleMonitoringPipeline:
         If external_persons (from main.py's YOLO-Pose detector) is provided, only runs
         vehicle detection and fuses with the YOLO-Pose human tracks.
         """
+        if self._calibration is not None and not self._calibration_applied:
+            h, w = frame.shape[:2]
+            self.estimator.set_homography(self._calibration.homography((w, h)))
+            self._calibration_applied = True
+
         # Only detect vehicles if main.py already provides YOLO-Pose human detections
         target_classes = (
             self.vehicle_cls_ids
@@ -172,16 +197,22 @@ class VehicleMonitoringPipeline:
             else list(set([self.person_cls_id] + self.vehicle_cls_ids))
         )
 
-        results = self.model.track(
-            frame,
-            persist=True,
-            classes=target_classes,
-            conf=self.v_conf if external_persons is not None else min(self.v_conf, self.p_conf),
-            tracker=self._resolve_tracker(tracker_config),
-            verbose=False,
-        )
+        run_detector = external_persons is None or (self._frame_idx % self.detect_every_n == 0)
+        self._frame_idx += 1
+        results = None
+        if run_detector:
+            results = self.model.track(
+                frame,
+                persist=True,
+                classes=target_classes,
+                conf=self.v_conf if external_persons is not None else min(self.v_conf, self.p_conf),
+                tracker=self._resolve_tracker(tracker_config),
+                imgsz=self.vehicle_imgsz,
+                half=self.vehicle_half,
+                verbose=False,
+            )
 
-        detected_vehicles: List[Dict] = []
+        detected_vehicles: List[Dict] = [] if run_detector else list(self._last_vehicles)
         detected_persons: List[Dict] = []
 
         if results and len(results) > 0 and results[0].boxes is not None and results[0].boxes.id is not None:
@@ -206,6 +237,9 @@ class VehicleMonitoringPipeline:
                         "foot_px": None,
                         "embedding": self._extract_embedding(frame, bbox.tolist()),
                     })
+
+        if run_detector:
+            self._last_vehicles = detected_vehicles
 
         if external_persons is not None:
             detected_persons = self.normalize_pose_persons(frame, external_persons)

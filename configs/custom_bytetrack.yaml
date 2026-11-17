@@ -15,7 +15,10 @@
 tracker_type: bytetrack
 track_high_thresh: 0.15   # Catches distant 40px humans at the top of the 2560x1920 yard
 track_low_thresh: 0.05    # Keeps tracks alive during partial occlusion behind pallets/forklift
-new_track_thresh: 0.16    # Immediately initializes tracks for far-away workers
-track_buffer: 120         # 6.0 seconds buffer (@ 20 FPS) so workers hiding for seconds keep their ID
+new_track_thresh: 0.18    # = the detector's minimum for new (non-tracked) people; lower only creates orphan tracks
+# track_buffer is counted in PROCESSED frames, not seconds: 120 frames = 6 s at 20 FPS but 12-24 s at 5-10 FPS.
+# Long-lost tracks are re-verified by the identity manager (gap > 1.5 s => treated as a new track), so a long
+# buffer can no longer hand an old ID to a newcomer; shorten it if the effective processing FPS is low.
+track_buffer: 120
 match_thresh: 0.82
 fuse_score: True

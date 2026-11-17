@@ -27,6 +27,9 @@ class DirectionalTracker:
         self.entrance_zones: Dict[str, Dict[str, Any]] = dir_cfg.get("entrance_zones", {}) or {}
         self.draw_trails: bool = bool(dir_cfg.get("draw_trails", True))
         self.border_margin_px: int = int(dir_cfg.get("border_exit_margin_px", 120))
+        # Forget people not seen for this long (bounds memory and the per-frame trail-drawing loop).
+        self.state_ttl_sec: float = float(dir_cfg.get("state_ttl_sec", 120.0))
+        self._last_prune_ts: float = -1e18
 
         # Per-person trajectory & state keyed by entity_key (gid if verified, else "T_<tid>")
         self.trajectories: Dict[Any, deque] = {}
@@ -114,6 +117,42 @@ class DirectionalTracker:
             if t_key in self.last_event_label and global_id not in self.last_event_label:
                 self.last_event_label[global_id] = self.last_event_label.pop(t_key)
 
+    def rename_entity(self, old_key: Any, new_key: Any) -> None:
+        """Identity `old_key` was merged into `new_key` (identity manager consolidation)."""
+        if old_key in self.trajectories and new_key not in self.trajectories:
+            self.trajectories[new_key] = self.trajectories[old_key]
+            self.active_gate_zones[new_key] = self.active_gate_zones.get(old_key, set())
+        if old_key in self.last_event_label and new_key not in self.last_event_label:
+            self.last_event_label[new_key] = self.last_event_label[old_key]
+        if old_key in self.last_seen_ts:
+            self.last_seen_ts[new_key] = max(self.last_seen_ts[old_key], self.last_seen_ts.get(new_key, -1e18))
+        for (pid, lname) in [k for k in self.last_line_cross_ts if k[0] == old_key]:
+            ts = self.last_line_cross_ts.pop((pid, lname))
+            self.last_line_cross_ts[(new_key, lname)] = max(ts, self.last_line_cross_ts.get((new_key, lname), -1e9))
+        for (pid, zname) in [k for k in self.gate_entry_point if k[0] == old_key]:
+            pt = self.gate_entry_point.pop((pid, zname))
+            self.gate_entry_point.setdefault((new_key, zname), pt)
+        self._forget(old_key)
+        self.exited_camera_ids.discard(old_key)
+
+    def _forget(self, key: Any) -> None:
+        self.trajectories.pop(key, None)
+        self.active_gate_zones.pop(key, None)
+        self.last_event_label.pop(key, None)
+        self.last_seen_ts.pop(key, None)
+        for k in [k for k in self.last_line_cross_ts if k[0] == key]:
+            del self.last_line_cross_ts[k]
+        for k in [k for k in self.gate_entry_point if k[0] == key]:
+            del self.gate_entry_point[k]
+
+    def _prune(self, now: float) -> None:
+        if now - self._last_prune_ts < 5.0:
+            return
+        self._last_prune_ts = now
+        for key in [k for k, ts in self.last_seen_ts.items() if now - ts > self.state_ttl_sec]:
+            self._forget(key)
+            self.exited_camera_ids.discard(key)
+
     def update_all(
         self,
         active_ground_points: Dict[Any, Tuple[float, float]],
@@ -133,6 +172,7 @@ class DirectionalTracker:
             person_events = self._update_point(entity_id, foot_pt, now)
             events.extend(person_events)
 
+        self._prune(now)
         return events
 
     def update_person(
@@ -215,15 +255,27 @@ class DirectionalTracker:
     ) -> np.ndarray:
         """Draws entrance gate zones, Point A -> Point B tripwires, direction arrows, and active trails."""
         if self.entrance_zones:
-            overlay = frame.copy()
+            # Blend only the bounding box of the gate polygons, not the whole frame.
+            h_img, w_img = frame.shape[:2]
+            polys = [np.array(z.get("polygon", []), dtype=np.int32) for z in self.entrance_zones.values()]
+            polys = [p for p in polys if len(p) >= 3]
+            if polys:
+                allp = np.vstack(polys)
+                rx1, ry1 = int(max(0, allp[:, 0].min())), int(max(0, allp[:, 1].min()))
+                rx2, ry2 = int(min(w_img, allp[:, 0].max() + 1)), int(min(h_img, allp[:, 1].max() + 1))
+            else:
+                rx1 = ry1 = 0
+                rx2, ry2 = w_img, h_img
+            roi = frame[ry1:ry2, rx1:rx2]
+            overlay = roi.copy()
             for zname, zcfg in self.entrance_zones.items():
                 poly = zcfg.get("polygon", [])
                 if len(poly) < 3:
                     continue
                 pts = np.array(poly, dtype=np.int32)
                 color = tuple(zcfg.get("color", [255, 165, 0]))
+                cv2.fillPoly(overlay, [pts - np.array([rx1, ry1], dtype=np.int32)], color)
                 cv2.polylines(frame, [pts], True, color, 2, cv2.LINE_AA)
-                cv2.fillPoly(overlay, [pts], color)
 
                 c = self.zone_counts[zname]
                 label = f"{zname} | ENTRY: {c['ENTRY']} EXIT: {c['EXIT']}"
@@ -237,7 +289,8 @@ class DirectionalTracker:
                     2,
                     cv2.LINE_AA,
                 )
-            cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+            if roi.size:
+                cv2.addWeighted(overlay, 0.15, roi, 0.85, 0, roi)
 
         for lname, lcfg in self.lines.items():
             pt_a = (int(lcfg["point_a"][0]), int(lcfg["point_a"][1]))

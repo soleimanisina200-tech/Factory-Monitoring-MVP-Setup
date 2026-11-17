@@ -1,8 +1,21 @@
 import threading
+import time
 from typing import Dict, List
 import cv2
 import numpy as np
 from app.vehicle_monitoring.driver_vehicle_fsm import VehicleSafetyState, VehicleSessionRecord
+
+
+def blend_rect(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, color, alpha: float) -> None:
+    """Semi-transparent filled rectangle, blended on the rectangle ROI only (not the whole frame)."""
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return
+    roi = img[y1:y2, x1:x2]
+    fill = np.empty_like(roi)
+    fill[:] = color
+    cv2.addWeighted(fill, alpha, roi, 1.0 - alpha, 0, roi)
 
 
 class VehicleSafetyDashboard:
@@ -29,7 +42,13 @@ class VehicleSafetyDashboard:
         self._lock = threading.Lock()
 
         dash_cfg = config.get("dashboard", {})
-        if dash_cfg.get("enable_web_dashboard", False):
+        # The JPEG for the web stream is only produced when the web dashboard is on, at most
+        # `stream_max_fps` times per second and downscaled: encoding a 5 MP frame costs ~10-17 ms.
+        self.web_enabled = bool(dash_cfg.get("enable_web_dashboard", False))
+        self.stream_max_fps = float(dash_cfg.get("stream_max_fps", 10.0))
+        self.stream_width = int(dash_cfg.get("stream_width", 1280))
+        self._last_jpeg_ts = 0.0
+        if self.web_enabled:
             self._start_web_server(
                 host=dash_cfg.get("host", "127.0.0.1"),
                 port=int(dash_cfg.get("port", 8050))
@@ -41,7 +60,8 @@ class VehicleSafetyDashboard:
         vehicles: Dict[str, VehicleSessionRecord],
         recent_events: List[Dict]
     ) -> np.ndarray:
-        canvas = frame.copy()
+        """Draws the HUD IN PLACE on `frame` (no full-frame copy) and returns it."""
+        canvas = frame
         h, w = canvas.shape[:2]
         any_alarm_active = False
 
@@ -101,9 +121,7 @@ class VehicleSafetyDashboard:
         )[:10]
 
         panel_h = 45 + 26 * max(1, len(sorted_vehicles))
-        overlay = canvas.copy()
-        cv2.rectangle(overlay, (10, 10), (560, min(h - 10, panel_h)), (20, 20, 20), -1)
-        cv2.addWeighted(overlay, 0.75, canvas, 0.25, 0, canvas)
+        blend_rect(canvas, 10, 10, 560, min(h - 10, panel_h), (20, 20, 20), 0.75)
 
         cv2.putText(canvas, "VEHICLE & DRIVER SAFETY MONITOR (METRIC)", (20, 34),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2)
@@ -140,10 +158,20 @@ class VehicleSafetyDashboard:
             cv2.putText(canvas, "ALARM: DRIVER SAFETY VIOLATION!",
                         (w // 2 - 275, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
 
+        jpeg = None
+        now = time.monotonic()
+        if self.web_enabled and (now - self._last_jpeg_ts) >= 1.0 / max(self.stream_max_fps, 0.1):
+            self._last_jpeg_ts = now
+            small = canvas
+            if self.stream_width > 0 and w > self.stream_width:
+                small = cv2.resize(canvas, (self.stream_width, int(h * self.stream_width / w)),
+                                   interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            jpeg = buf.tobytes() if ok else None
+
         with self._lock:
-            ok, buf = cv2.imencode(".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            if ok:
-                self._latest_frame_jpeg = buf.tobytes()
+            if jpeg is not None:
+                self._latest_frame_jpeg = jpeg
             self._latest_telemetry = {
                 "vehicles": [
                     {

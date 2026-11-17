@@ -170,12 +170,18 @@ def test_person_who_walked_in_from_the_image_border_cannot_become_a_driver():
 # ----------------------------------------------------------------------------------------------
 # Fail-safe: driver vanished next to a stationary vehicle
 # ----------------------------------------------------------------------------------------------
-def _board_then_vanish(fsm, seconds, step=0.5):
+def _board_then_vanish(fsm, seconds, step=0.5, step_out_first=False):
     veh = [vehicle(101)]
     inside = person(5, 120, 170, 180, 290)
     fsm.update(veh, [inside], SHAPE, now=0.0)
     fsm.update(veh, [inside], SHAPE, now=0.1)
-    events, t, rec = [], 0.1, None
+    t = 0.1
+    if step_out_first:  # driver climbs out and stands next to the forklift, then disappears
+        outside = person(5, 270, 180, 330, 300)
+        for _ in range(3):
+            t += 0.1
+            fsm.update(veh, [outside], SHAPE, now=t)
+    events, rec = [], None
     while t < seconds:
         t += step
         recs, ev = fsm.update(veh, [], SHAPE, now=t)
@@ -189,8 +195,14 @@ def test_driver_lost_alarm_is_disabled_by_default():
     assert not any(e["event_type"] == "DRIVER_NOT_VISIBLE_ALARM" for e in events)
 
 
+def test_driver_hidden_inside_the_cab_does_not_raise_the_lost_alarm():
+    rec, events = _board_then_vanish(make_fsm(driver_lost_alarm_sec=2.0), seconds=10)
+    assert rec.state != VehicleSafetyState.DRIVER_NOT_VISIBLE_ALARM
+    assert not any(e["event_type"] == "DRIVER_NOT_VISIBLE_ALARM" for e in events)
+
+
 def test_driver_lost_alarm_fires_once_after_the_configured_time():
-    rec, events = _board_then_vanish(make_fsm(driver_lost_alarm_sec=2.0), seconds=6)
+    rec, events = _board_then_vanish(make_fsm(driver_lost_alarm_sec=2.0), seconds=6, step_out_first=True)
     assert rec.state == VehicleSafetyState.DRIVER_NOT_VISIBLE_ALARM
     assert rec.alarm_active is True
     assert sum(e["event_type"] == "DRIVER_NOT_VISIBLE_ALARM" for e in events) == 1
@@ -217,3 +229,17 @@ def test_idle_person_histories_are_forgotten():
     fsm.update([], [person(43, 500)], SHAPE, now=100.0)  # 100 s later (> 60 s TTL)
     assert "42" not in fsm.person_histories
     assert "43" in fsm.person_histories
+
+
+def test_forklift_driving_toward_the_camera_still_gets_its_operator():
+    """Motion mostly in depth: the ground point moves even when the box centre barely does."""
+    fsm = make_fsm()
+    rec = None
+    for k in range(30):
+        y2 = 300.0 + 6.0 * k            # bottom edge comes toward the camera
+        y1 = 150.0 + 2.0 * k
+        veh = [vehicle(1, 100.0 - k, y1, 200.0 + k, y2)]
+        drv = person(5, 125.0 - 0.5 * k, y1 + 20.0, 175.0 + 0.5 * k, y2 - 10.0)
+        recs, _ = fsm.update(veh, [drv], SHAPE, now=k * DT)
+        rec = recs["1"]
+    assert rec.associated_driver_id == "5"

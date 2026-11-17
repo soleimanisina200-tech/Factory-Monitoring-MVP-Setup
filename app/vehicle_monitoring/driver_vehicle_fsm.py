@@ -99,6 +99,9 @@ class VehicleSessionRecord:
     )
     driver_last_seen_ts: float = 0.0
     driver_lost_since: Optional[float] = None
+    # Where was the driver when last seen? A driver who vanished while INSIDE the cab is most likely just
+    # hidden by the cab/mast, not gone - the "driver not visible" timer must not run in that case.
+    driver_last_seen_in_cab: bool = False
 
 
 class DriverVehicleMonitorFSM:
@@ -298,7 +301,7 @@ class DriverVehicleMonitorFSM:
         base_px = (0.5 * (vx1 + vx2), vy2)
         world_xy = self.estimator.pixel_to_world(base_px)
         rec.world_pos_history.append((world_xy[0], world_xy[1], now))
-        rec.px_history.append((0.5 * (vx1 + vx2), 0.5 * (vy1 + vy2), now))
+        rec.px_history.append((0.5 * (vx1 + vx2), float(vy2), now))  # ground contact point
 
         if len(rec.world_pos_history) >= 6:
             x0, y0, _ = rec.world_pos_history[0]
@@ -381,7 +384,7 @@ class DriverVehicleMonitorFSM:
         if v is None or p is None:
             return None
         v_len, p_len = float(np.linalg.norm(v)), float(np.linalg.norm(p))
-        if v_len < 4.0:  # the vehicle barely moved in image space: cannot judge
+        if v_len < 3.0:  # the vehicle barely moved in image space: cannot judge
             return None
         cos = float(np.dot(v, p) / (v_len * p_len + 1e-8)) if p_len > 1e-6 else 0.0
         ratio = p_len / v_len
@@ -470,6 +473,7 @@ class DriverVehicleMonitorFSM:
                 (float(bev[0]), float(bev[1])) if bev is not None else self.estimator.pixel_to_world(foot_px)
             )
             center_px = (0.5 * (px1 + px2), 0.5 * (py1 + py2))
+            ground_px = (0.5 * (px1 + px2), float(py2))
             hist = self.person_histories.get(pid)
             if hist is None:
                 hist = PersonTrackHistory(
@@ -480,7 +484,7 @@ class DriverVehicleMonitorFSM:
                     spawn_px=center_px,
                 )
                 self.person_histories[pid] = hist
-            hist.update_position(foot_world, now, center_px)
+            hist.update_position(foot_world, now, ground_px)
 
         for rec in self.vehicles.values():
             rec.is_visible_in_current_frame = False
@@ -558,6 +562,7 @@ class DriverVehicleMonitorFSM:
                         if person_map[best_cab_pid].get("embedding") is not None:
                             rec.driver_reid_embedding = person_map[best_cab_pid]["embedding"]
                         rec.state = VehicleSafetyState.DRIVER_ONBOARD
+                        rec.driver_last_seen_in_cab = True
                         rec.frames_outside_cab = 0
                         rec.alarm_active = False
                         rec.last_measurement = None
@@ -612,6 +617,7 @@ class DriverVehicleMonitorFSM:
                                 if pdata.get("embedding") is not None:
                                     rec.driver_reid_embedding = pdata["embedding"]
                                 rec.state = VehicleSafetyState.DRIVER_EXITED_SAFE
+                                rec.driver_last_seen_in_cab = False
                                 rec.frames_outside_cab = self.exit_confirm_frames
                                 rec.exit_timestamp = now
                                 rec.last_measurement = meas
@@ -695,6 +701,7 @@ class DriverVehicleMonitorFSM:
                     keypoints=matched_person.get("keypoints"),
                     foot_px=matched_person.get("foot_px"),
                 )
+                rec.driver_last_seen_in_cab = bool(in_cab)
                 if in_cab:
                     rec.frames_outside_cab = 0
                     rec.state = VehicleSafetyState.DRIVER_ONBOARD
@@ -760,7 +767,11 @@ class DriverVehicleMonitorFSM:
                             rec.state = VehicleSafetyState.DRIVER_EXITED_SAFE
                             rec.alarm_active = False
             else:
-                if rec.driver_lost_since is None:
+                # The "driver not visible" timer only runs for a driver last seen OUTSIDE the cab, next to a
+                # STATIONARY vehicle. Hidden in a (moving) cab -> no timer; vehicle starts moving -> reset.
+                if rec.is_currently_moving or rec.driver_last_seen_in_cab:
+                    rec.driver_lost_since = None
+                elif rec.driver_lost_since is None:
                     rec.driver_lost_since = now
                 if (
                     rec.is_currently_moving
@@ -784,10 +795,10 @@ class DriverVehicleMonitorFSM:
                     )
 
                 # Fail-safe: a driver who is not visible near a STATIONARY vehicle must not stay silent forever.
-                lost_for = now - rec.driver_lost_since
+                lost_for = (now - rec.driver_lost_since) if rec.driver_lost_since is not None else 0.0
                 if (
                     self.driver_lost_alarm_sec > 0
-                    and not rec.is_currently_moving
+                    and rec.driver_lost_since is not None
                     and lost_for >= self.driver_lost_alarm_sec
                     and rec.state != VehicleSafetyState.DRIVER_NOT_VISIBLE_ALARM
                 ):

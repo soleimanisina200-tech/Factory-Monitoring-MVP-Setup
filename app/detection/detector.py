@@ -55,8 +55,9 @@ class IndustrialPoseDetector:
         self.model = YOLO(model_weights)
         self.model.to(self.device)
 
-        if half and "cuda" in str(self.device) and torch.cuda.is_available():
-            self.model.model.half()
+        # FP16 must be requested per call: Ultralytics' predictor re-casts the network with `.float()` when
+        # `half` is not passed to predict/track, which silently undid the old `self.model.model.half()`.
+        self.half = bool(half and "cuda" in str(self.device) and torch.cuda.is_available())
 
     @staticmethod
     def _filter_duplicate_and_ghost_detections(
@@ -145,6 +146,7 @@ class IndustrialPoseDetector:
             imgsz=effective_imgsz,
             device=self.device,
             max_det=80,
+            half=self.half,
             verbose=False,
         )
 

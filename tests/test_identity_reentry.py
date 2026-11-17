@@ -155,3 +155,94 @@ def test_exit_is_reported_once_to_caller():
     sc.idle(1.0)
     assert sc.mgr.pop_newly_exited() == [gid_a]
     assert sc.mgr.pop_newly_exited() == []
+
+
+# ----------------------------------------------------------------------------------------------
+# Regressions found in the second review
+# ----------------------------------------------------------------------------------------------
+def test_lookalike_entering_right_after_a_departure_cannot_inherit_via_new_id_plus_merge():
+    """The strict gate rejected the lookalike, but 'mint a new ID -> merge it back' used to bypass it."""
+    sc = Scenario()
+    gid_a = sc.walk_out_right(1, unit(0))
+    sc.idle(1.0)
+    out = [sc.step(5, W - 70.0 - 5 * k, with_similarity(unit(0), 1, 0.86)).get(5) for k in range(15)]
+    assert gid_a not in out
+    assert out[-1] is not None
+
+
+def test_worker_standing_at_the_image_edge_keeps_id_after_short_occlusion():
+    """Being at the border is not leaving: no outward motion -> not EXITED after a 1 s occlusion."""
+    sc = Scenario()
+    gid = None
+    for _ in range(15):
+        gid = sc.step(1, 5.0, unit(0)).get(1, gid)
+    sc.idle(1.0)
+    got = [sc.step(1, 5.0, with_similarity(unit(0), 3, 0.85)).get(1) for _ in range(5)]
+    assert got[-1] == gid
+    assert sc.mgr.pop_newly_exited() == []
+
+
+def test_a_few_bad_crops_on_a_young_track_do_not_flip_the_id():
+    sc = Scenario()
+    out = []
+    for k in range(25):
+        e = with_similarity(unit(0), 4, 0.45) if 5 <= k <= 7 else unit(0)
+        out.append(sc.step(1, 200.0 + 2 * k, e).get(1))
+    assert len({g for g in out if g is not None}) == 1
+
+
+def test_persistent_mismatch_still_breaks_a_hijacked_binding():
+    sc = Scenario()
+    gid_a = None
+    for k in range(10):
+        gid_a = sc.step(1, 200.0 + 2 * k, unit(0)).get(1, gid_a)
+    # The tracker silently moved track 1 onto a clearly different person.
+    out = [sc.step(1, 220.0 + 2 * k, unit(5)).get(1) for k in range(30)]
+    assert out[-1] is not None and out[-1] != gid_a
+
+
+def test_reid_runs_once_per_frame_for_all_people():
+    class CountingReid(FakeReid):
+        def __init__(self):
+            super().__init__()
+            self.batch_calls = 0
+
+        def evaluate_and_extract_batch(self, frame, items):
+            self.batch_calls += 1
+            return [self.evaluate_and_extract(frame, *it) for it in items]
+
+    sc = Scenario()
+    sc.reid = CountingReid()
+    sc.mgr.reid = sc.reid
+    dets = [
+        PoseDetection(track_id=t, bbox_xyxy=np.array([x, 200.0, x + 60.0, 360.0], dtype=np.float32), conf=0.9,
+                      keypoints_xy=np.zeros((17, 2), np.float32), keypoints_conf=np.zeros(17, np.float32))
+        for t, x in ((1, 100.0), (2, 300.0), (3, 500.0))
+    ]
+    sc.mgr.process_frame(sc.frame, dets, 100.0)
+    assert sc.reid.batch_calls == 1
+
+
+def test_dead_tracks_and_old_exited_identities_are_pruned():
+    sc = Scenario(track_state_ttl_sec=5.0, max_exited_identities=1)
+    for i, tid in enumerate((1, 2, 3)):
+        sc.walk_out_right(tid, unit(i))
+        sc.idle(1.0)
+    sc.idle(6.0)
+    assert set(sc.mgr.track_last_seen_ts) == set()          # all three tracks are long dead
+    assert sc.mgr.track_emb_buffer == {} and sc.mgr.track_best_emb == {}
+    exited = [g for g, i in sc.mgr.identities.items() if i.status == "EXITED"]
+    assert len(exited) == 1                                  # capped; the most recent exit is kept
+    assert exited == [max(sc.mgr.identities)]
+
+
+def test_merge_is_reported_so_callers_can_rename_state():
+    """Returning worker first seen away from the border -> fresh ID, later merged back and REPORTED."""
+    sc = Scenario()
+    gid_a = sc.walk_out_right(1, unit(0))
+    sc.idle(3.0)
+    out = [sc.step(4, 400.0, unit(0)).get(4) for _ in range(10)]
+    assert out[-1] == gid_a
+    merges = sc.mgr.pop_merged()
+    assert len(merges) == 1 and merges[0][1] == gid_a and merges[0][0] != gid_a
+    assert sc.mgr.pop_merged() == []

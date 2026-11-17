@@ -27,10 +27,13 @@ class MetricBEVProjector:
             src = np.array(src_image_pts, dtype=np.float32)
             dst = np.array(dst_meter_pts, dtype=np.float32)
 
+            # Explicit rescaling: `calib_ref_wh` is the resolution the points were picked at. (The old code
+            # guessed from the point values and could wrongly double native-resolution points that happened
+            # to lie in the left part of a large frame.)
             if stream_wh is not None and calib_ref_wh is not None:
                 sw, sh = stream_wh
                 rw, rh = calib_ref_wh
-                if np.max(src[:, 0]) <= rw and sw > rw * 1.2:
+                if (rw, rh) != (sw, sh) and rw > 0 and rh > 0:
                     src[:, 0] *= float(sw) / float(rw)
                     src[:, 1] *= float(sh) / float(rh)
 

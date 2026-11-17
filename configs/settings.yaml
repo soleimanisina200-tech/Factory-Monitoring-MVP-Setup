@@ -12,11 +12,21 @@ reid: {model_name: osnet_x1_0, weights_path: weights/osnet_x1_0_msmt17.pt, kpt_c
   reentry_min_gap_sec: 2.0,     # a worker who just left needs +0.08 extra similarity to return sooner
   reentry_margin: 0.08,         # best-vs-runner-up gap required to give an EXITED identity back
   reentry_min_samples: 3,       # clean multi-frame samples required before an EXITED identity is reused
-  exit_confirm_sec: 0.5,        # absence near the frame border before a worker counts as EXITED
+  exit_confirm_sec: 0.8,        # absence before a worker who walked OUT through a border counts as EXITED
+  exit_edges: [left, right, top, bottom],   # image edges that are real ways out (drop e.g. 'top' for a far wall)
+  mismatch_min_span_sec: 1.0,   # appearance mismatch must persist this long before a binding is broken
+  min_gallery_height_px: 72,    # smaller crops are matched but never stored in a worker's appearance memory
+  min_visible_kpts: 5,          # ... same for crops with fewer visible joints
+  anchor_min_height_px: 110,    # permanent anchors need an even larger crop
+  track_state_ttl_sec: 10.0,    # memory bound: forget dead tracker ids after this long
+  identity_retention_sec: 3600, # memory bound: forget workers who left more than 1 h ago ...
+  max_exited_identities: 300,   # ... and keep at most this many departed workers
   occlusion_max_sec: 20.0,      # longest in-scene occlusion before the identity is treated as EXITED
   border_margin_ratio: 0.06,
   track_gap_reset_sec: 1.5,     # a track id missing this long and then reappearing is treated as brand new
   decision_log_path: logs/identity_decisions.jsonl}   # one JSON line per identity decision (empty = off)
+# Ground calibration: configs/calibration.yaml (scripts/calibrate_ground_plane.py) takes precedence.
+# The src_image_pts below are only a placeholder fallback; calibration_ref_wh = resolution they were picked at.
 physics_bev:
   max_worker_speed_mps: 3.5
   max_internal_occlusion_m: 5.5

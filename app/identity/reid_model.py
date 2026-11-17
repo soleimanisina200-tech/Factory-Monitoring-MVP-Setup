@@ -4,7 +4,7 @@ import logging
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
@@ -73,10 +73,16 @@ class PoseGuidedOSNetExtractor:
         min_laplacian_var: float = 15.0,
         head_branch_weight: float = 0.32,
         color_branch_weight: float = 0.18,
+        min_gallery_height_px: float = 72.0,
+        min_visible_kpts: int = 5,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.kpt_conf_thresh = kpt_conf_thresh
         self.min_laplacian_var = min_laplacian_var
+        # Gallery quality gate: tiny far-away crops or crops with few visible joints produce unreliable
+        # embeddings; they may still be MATCHED, but must never be stored as a person's appearance memory.
+        self.min_gallery_height_px = float(min_gallery_height_px)
+        self.min_visible_kpts = int(min_visible_kpts)
 
         self.head_w = float(head_branch_weight)
         self.color_w = float(color_branch_weight)
@@ -280,6 +286,47 @@ class PoseGuidedOSNetExtractor:
         keypoints_conf: np.ndarray,
         is_intersecting: bool,
     ) -> Tuple[Optional[np.ndarray], CropQualityReport]:
+        return self.evaluate_and_extract_batch(
+            frame, [(bbox_xyxy, keypoints_xy, keypoints_conf, is_intersecting)]
+        )[0]
+
+    def evaluate_and_extract_batch(
+        self,
+        frame: np.ndarray,
+        items: List[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]],
+    ) -> List[Tuple[Optional[np.ndarray], CropQualityReport]]:
+        """
+        Same as `evaluate_and_extract` for many people at once: all crops of a frame go through OSNet in ONE
+        forward pass instead of one GPU round-trip per person (the previous per-person calls dominated the
+        Re-ID cost in crowded scenes).
+        """
+        results: List[Optional[Tuple[Optional[np.ndarray], CropQualityReport]]] = [None] * len(items)
+        preps: List[Tuple[int, dict]] = []
+        images: List[np.ndarray] = []
+        for i, (bbox, kxy, kconf, inter) in enumerate(items):
+            prep = self._prepare_crop(frame, bbox, kxy, kconf, inter)
+            if isinstance(prep, tuple):  # rejected crop: (None, report)
+                results[i] = prep
+                continue
+            preps.append((i, prep))
+            images.extend([prep["rgb_body"], prep["rgb_upper"]])
+
+        if preps:
+            with torch.no_grad():
+                feats = self.extractor(images)
+                feats = F.normalize(feats, p=2, dim=1).cpu().numpy().astype(np.float32)
+            for k, (i, prep) in enumerate(preps):
+                results[i] = self._compose(prep, feats[2 * k], feats[2 * k + 1])
+        return results  # type: ignore[return-value]
+
+    def _prepare_crop(
+        self,
+        frame: np.ndarray,
+        bbox_xyxy: np.ndarray,
+        keypoints_xy: np.ndarray,
+        keypoints_conf: np.ndarray,
+        is_intersecting: bool,
+    ):
         H_img, W_img = frame.shape[:2]
         x1, y1, x2, y2 = np.clip(bbox_xyxy.astype(np.int32), [0, 0, 0, 0], [W_img, H_img, W_img, H_img])
         bw, bh = int(x2 - x1), int(y2 - y1)
@@ -316,29 +363,44 @@ class PoseGuidedOSNetExtractor:
         rgb_body = cv2.cvtColor(body_input, cv2.COLOR_BGR2RGB)
         rgb_upper = cv2.cvtColor(upper_input, cv2.COLOR_BGR2RGB)
 
-        with torch.no_grad():
-            feats = self.extractor([rgb_body, rgb_upper])
-            feats = F.normalize(feats, p=2, dim=1).cpu().numpy().astype(np.float32)
-
         color_feat = self.extract_chromatic_part_descriptor(norm_crop, alpha_mask, local_kpts, keypoints_conf)
+        view_bin = self.classify_pose_view(keypoints_xy, keypoints_conf, float(bw), self.kpt_conf_thresh)
 
+        n_visible = int(np.sum(keypoints_conf >= self.kpt_conf_thresh))
+        if is_intersecting:
+            reason = "Intersecting"
+        elif sharpness < effective_blur_thresh:
+            reason = "Blurry"
+        elif bh < self.min_gallery_height_px:
+            reason = "TooSmallForGallery"
+        elif n_visible < self.min_visible_kpts:
+            reason = "TooFewKeypoints"
+        else:
+            reason = "OK"
+
+        return {
+            "rgb_body": rgb_body,
+            "rgb_upper": rgb_upper,
+            "color_feat": color_feat,
+            "report": CropQualityReport(
+                is_valid_for_reid=True,
+                is_valid_for_gallery=(reason == "OK"),
+                sharpness_score=sharpness,
+                visible_ratio=vis_ratio,
+                pose_view_bin=view_bin,
+                reject_reason=reason,
+            ),
+        }
+
+    def _compose(
+        self, prep: dict, body_feat: np.ndarray, upper_feat: np.ndarray
+    ) -> Tuple[np.ndarray, CropQualityReport]:
         composite = np.concatenate(
             [
-                np.sqrt(self.body_w) * feats[0],
-                np.sqrt(self.head_w) * feats[1],
-                np.sqrt(self.color_w) * color_feat,
+                np.sqrt(self.body_w) * body_feat,
+                np.sqrt(self.head_w) * upper_feat,
+                np.sqrt(self.color_w) * prep["color_feat"],
             ]
         ).astype(np.float32)
         composite /= np.linalg.norm(composite) + 1e-8
-
-        view_bin = self.classify_pose_view(keypoints_xy, keypoints_conf, float(bw), self.kpt_conf_thresh)
-        valid_for_gallery = (not is_intersecting) and (sharpness >= effective_blur_thresh)
-
-        return composite, CropQualityReport(
-            is_valid_for_reid=True,
-            is_valid_for_gallery=valid_for_gallery,
-            sharpness_score=sharpness,
-            visible_ratio=vis_ratio,
-            pose_view_bin=view_bin,
-            reject_reason="Intersecting" if is_intersecting else "OK",
-        )
+        return composite, prep["report"]
