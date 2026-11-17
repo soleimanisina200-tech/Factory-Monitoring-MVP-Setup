@@ -30,3 +30,7 @@ deep-person-reid/
 
 # Pytest
 .pytest_cache/
+
+# Model/tracker comparison runs (README section 11)
+runs/
+configs/exp_*.yaml

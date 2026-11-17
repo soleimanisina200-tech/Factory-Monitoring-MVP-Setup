@@ -327,6 +327,7 @@ def main(
     writer = None
     out_path = sys_cfg.get("output_video_path")
     if out_path:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)  # cv2.VideoWriter fails silently otherwise
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(out_path, fourcc, reader.nominal_fps, (reader.width, reader.height))
 
