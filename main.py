@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import yaml
 
+import torch
+
 from app.detection.detector import IndustrialPoseDetector, PoseDetection
 from app.identity.manager import EnterpriseIdentityManager
 from app.identity.reid_model import PoseGuidedOSNetExtractor, SKELETON_LIMBS
@@ -25,6 +27,25 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("FactoryReID")
+
+
+def resolve_device(requested: str, half: bool) -> Tuple[str, bool]:
+    """
+    Fail-soft device selection with an explicit message. A CPU-only PyTorch build (the default
+    `pip install torch` on Windows) used to crash deep inside YOLO with "Torch not compiled with CUDA".
+    """
+    if "cuda" in str(requested) and not torch.cuda.is_available():
+        build = f"torch {torch.__version__} (CUDA build: {torch.version.cuda})"
+        logger.error(
+            "CUDA requested (%s) but not available in %s. Falling back to CPU: expect ~1 FPS. "
+            "Install the CUDA build of PyTorch from https://pytorch.org/get-started/locally/ "
+            "and check `python -c \"import torch; print(torch.cuda.is_available())\"` prints True.",
+            requested, build,
+        )
+        return "cpu", False
+    if "cuda" in str(requested):
+        logger.info("Using %s: %s", requested, torch.cuda.get_device_name(torch.device(requested)))
+    return str(requested), half
 
 
 def load_config(config_path: str = "configs/settings.yaml") -> Dict:
@@ -184,6 +205,9 @@ def main(
     if source_override:
         cfg["stream"]["source"] = source_override
     sys_cfg = cfg["system"]
+    sys_cfg["device"], sys_cfg["half_precision"] = resolve_device(
+        sys_cfg.get("device", "cuda:0"), bool(sys_cfg.get("half_precision", True))
+    )
     stream_cfg = cfg["stream"]
     det_cfg = cfg["detection"]
     reid_cfg = cfg["reid"]
