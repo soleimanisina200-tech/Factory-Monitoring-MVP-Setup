@@ -22,10 +22,43 @@ def test_match_ratio_detects_wrong_architecture_and_ignores_classifier():
     assert rm.weights_match_ratio(a, {"state_dict": sd}) == 1.0
 
 
-def test_ain_without_its_own_weights_is_refused(tmp_path, monkeypatch):
+def _offline(*_a, **_k):
+    raise OSError("no network in tests")
+
+
+def test_missing_weights_that_cannot_be_downloaded_stop_with_instructions(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(FileNotFoundError, match="osnet_ain_x1_0"):
+    monkeypatch.setattr(rm, "_download_gdrive", _offline)
+    monkeypatch.setattr(rm, "_download_http", _offline)
+    with pytest.raises(RuntimeError, match="osnet_ain_x1_0"):
         rm.resolve_reid_weights("osnet_ain_x1_0", None)
+    with pytest.raises(RuntimeError, match="Failed to acquire MSMT17 weights"):
+        rm.resolve_reid_weights("osnet_x1_0", None)
+
+
+def test_mirror_is_used_when_google_drive_refuses(tmp_path, monkeypatch):
+    """Google Drive often answers 'too many accesses': the first start must not depend on it."""
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    def fake_http(url, path, timeout=60.0):
+        calls.append(url)
+        path.write_bytes(b"0" * (rm.MIN_WEIGHT_BYTES + 1))
+
+    monkeypatch.setattr(rm, "_download_gdrive", _offline)
+    monkeypatch.setattr(rm, "_download_http", fake_http)
+    got = rm.resolve_reid_weights("osnet_x1_0", None)
+    assert got.replace("\\", "/") == "weights/osnet_x1_0_msmt17.pt"
+    assert len(calls) == 1 and calls[0].startswith(rm.HF_MIRROR_BASE) and "osnet_x1_0_msmt17" in calls[0]
+
+
+def test_truncated_download_is_not_accepted(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(rm, "_download_gdrive", _offline)
+    monkeypatch.setattr(rm, "_download_http", lambda url, path, timeout=60.0: path.write_bytes(b"<html>error"))
+    with pytest.raises(RuntimeError):
+        rm.resolve_reid_weights("osnet_x1_0", None)
+    assert not (tmp_path / "weights" / "osnet_x1_0_msmt17.pt").exists()
 
 
 def test_explicit_existing_weights_path_is_used(tmp_path):

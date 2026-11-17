@@ -34,3 +34,11 @@ deep-person-reid/
 # Model/tracker comparison runs (README section 11)
 runs/
 configs/exp_*.yaml
+
+# Site data: worker registry (personal data), camera list (RTSP passwords), per-camera files, reports, markers
+configs/workers.yaml
+configs/cameras.yaml
+configs/cameras/
+reports/
+markers/
+recordings/

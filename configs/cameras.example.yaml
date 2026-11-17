@@ -1,0 +1,37 @@
+# Multi-camera setup. Copy to configs/cameras.yaml and adapt, then:
+#     python run_multi_camera.py                       (all cameras, one process each)
+#     python main.py --cameras configs/cameras.yaml --camera-id cam1     (a single camera of the list)
+#
+# Every camera needs its OWN calibration and scene files (drawn on that camera's image):
+#     python scripts/calibrate_ground_plane.py --source <cam1 source> --width-m 6 --length-m 8 --out configs/cameras/cam1/calibration.yaml
+#     python scripts/draw_zone.py --source <cam1 source> --scene configs/cameras/cam1/scene.yaml --calibration configs/cameras/cam1/calibration.yaml
+#     python scripts/draw_line.py --source <cam1 source> --scene configs/cameras/cam1/scene.yaml --mode line --name gate
+base_settings: configs/settings.yaml           # shared settings; cameras override single keys below
+vehicle_config: configs/vehicle_monitoring.yaml
+
+cross_camera:                                  # same worker = same person id (P#) in every camera
+  enabled: true
+  registry_path: data/cross_camera.db
+  link_threshold: 0.80                         # minimum gallery similarity (raised automatically for uniforms)
+  margin: 0.06                                 # must beat the runner-up person by this much
+  min_obs: 5                                   # clean observations before a local ID is linked
+  decide_after_sec: 20                         # no confident match after this long -> new person
+  late_merge_sec: 120                          # a new person can still be merged into a known one this long
+  retention_sec: 43200
+  topology:
+    overlaps: []                               # camera pairs that see a common area, e.g. [[cam1, cam2]]
+    transitions: []                            # walking times, e.g. [{from: cam1, to: cam2, min_sec: 5, max_sec: 900}]
+    only_listed_transitions: false             # true: only the listed camera pairs are connected
+
+cameras:
+  cam1:
+    source: rtsp://user:password@192.168.1.11:554/Streaming/Channels/101
+    scene: configs/cameras/cam1/scene.yaml
+    calibration: configs/cameras/cam1/calibration.yaml
+    settings:                                  # any key of settings.yaml, only for this camera
+      reid: {exit_edges: [left, right, bottom]}
+  cam2:
+    source: rtsp://user:password@192.168.1.12:554/Streaming/Channels/101
+    scene: configs/cameras/cam2/scene.yaml
+    calibration: configs/cameras/cam2/calibration.yaml
+    vehicle_config: ""                         # no forklifts in this view -> forklift module off

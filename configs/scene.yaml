@@ -1,0 +1,14 @@
+# Scene geometry written by scripts/draw_zone.py and scripts/draw_line.py.
+# image_wh = resolution the shapes were drawn at; they are rescaled to the live stream.
+#
+# zones:        {name: {polygon: [[x,y],...], type: presence|restricted, max_dwell_sec: 0, max_occupancy: 0}}
+# lines:        {name: {a: [x,y], b: [x,y], invert: false, labels: [IN, OUT], dead_band_px: 18, cooldown_sec: 1.0,
+#                       allowed_direction: null}}
+# regions:      {name: {polygon: [...], entry_vector: [vx, vy], min_displacement_px: 40, labels: [IN, OUT],
+#                       allowed_direction: null}}
+# exit_regions: {name: {polygon: [...]}}      # doors INSIDE the image (workers leave the camera there)
+image_wh: null
+zones: {}
+lines: {}
+regions: {}
+exit_regions: {}

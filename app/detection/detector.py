@@ -20,6 +20,7 @@ class PoseDetection:
     is_intersecting: bool = False
     is_isolated: bool = True
     ground_uv: Tuple[float, float] = (0.0, 0.0)
+    ground_extrapolated: bool = False   # feet not visible: ground point estimated from the torso
     bev_xy: Optional[np.ndarray] = None
     apparent_height_px: float = 100.0
 

@@ -1,88 +1,81 @@
-# Vehicle and Driver Safety Monitoring Configuration
+# =====================================================================================================================
+# Forklift & driver safety module. All times are SECONDS (independent of the processing frame rate).
+# =====================================================================================================================
 vehicle_monitoring:
   enabled: true
-  
-  # Detection Settings
-  vehicle_detector_weights: "yolo11m.pt"   # Can point to custom forklift weights (e.g., forklift_yolo11.pt)
-  person_class_id: 0
-  vehicle_tracker_config: "bytetrack.yaml"   # vehicles get their own tracker (NOT the person tracker)
-  vehicle_imgsz: 1280                        # detector input size for vehicles (default 640 loses far forklifts)
-  vehicle_half: true                         # FP16 on GPU
-  vehicle_detect_every_n_frames: 1           # 2-3 halves/thirds the vehicle-model cost (boxes reused in between)
-  # Standard COCO classes (e.g., 2: car, 7: truck) or custom model forklift class ID (e.g., 0 or 80)
-  vehicle_class_ids: [7]
+
+  # ---- detection ----------------------------------------------------------------------------------------------------
+  # A COCO model has NO forklift class (truck = 7 is only a stand-in). For production, fine-tune a model on images of
+  # THIS site's forklifts (a -seg model is used automatically: its mask gives the chassis edge on the floor) and set:
+  #   vehicle_detector_weights: weights/forklift_yolo11m-seg.pt
+  #   vehicle_class_names: [forklift]
+  vehicle_detector_weights: yolo11m.pt
+  vehicle_class_names: []            # selected by name from the model (preferred)
+  vehicle_class_ids: [7]             # ... or by id
+  person_class_id: 0                 # standalone runner only
   vehicle_conf_threshold: 0.40
   person_conf_threshold: 0.45
+  vehicle_tracker_config: bytetrack.yaml
+  vehicle_imgsz: 1280
+  vehicle_half: true
+  vehicle_detect_every_n_frames: 1   # 2-3 halves/thirds the cost (boxes reused in between)
 
-# Driver-Vehicle Pairing & Exit Parameters
+  # ---- who is the driver --------------------------------------------------------------------------------------------
   pairing:
-    entry_iou_threshold: 0.60                  # Core cabin overlap required
-    entry_confirmation_frames: 25              # Stationary vehicle: must dwell stopped inside cab for 25 frames
-    moving_entry_confirmation_frames: 5        # Moving vehicle: pair within 5 frames
-    exit_confirmation_frames: 6                # Consecutive frames outside cab to confirm Driver Exit
-    reid_similarity_threshold: 0.68            # OSNet Re-ID cosine similarity threshold
-    vehicle_motion_threshold_m: 0.40           # Minimum displacement (m) to mark vehicle as actively moving
-    max_boarding_walk_speed_mps: 0.45          # Rejects pedestrians walking past parked cars (> 0.45 m/s)
-    dismount_spawn_radius_m: 1.35              # Auto-detects driver emerging from occluded forklift cab (< 1.35m)
-    require_vehicle_activity_for_spawn: false  # Set true to only allow emergence on vehicles that moved in-stream
-    unassigned_ghost_timeout_sec: 1.5          # Immediately clears disappearing unassigned vehicles (e.g. Forklift #9)
-    assigned_ghost_timeout_sec: 15.0
-    # --- driver-identity robustness ---
-    allow_provisional_ids_for_spawn: false     # unverified 'T<id>' persons can never be auto-bound as driver
-    spawn_border_margin_px: 40                 # people first seen at the image border walked in from outside
-    driver_handover_iou: 0.5                   # same body, new track/global id -> keep the driver binding
-    driver_handover_max_gap_sec: 1.0
-    comotion_min_cosine: 0.6                   # moving vehicle: operator must travel WITH it (direction)
-    comotion_min_speed_ratio: 0.4              # ... and at a similar speed
+    cab_shrink: 0.08                 # cab region = vehicle box shrunk by this fraction left/right
+    cab_score_threshold: 0.5
+    board_confirm_sec: 1.5           # parked vehicle: person in the cab this long -> driver
+    seated_board_confirm_sec: 0.6    # ... clearly seated pose (legs visible and folded)
+    moving_board_confirm_sec: 0.4    # moving vehicle: person travelling WITH it this long -> driver
+    dismount_confirm_sec: 0.6        # driver out of the cab this long -> DRIVER_EXITED
+    max_boarding_walk_speed_mps: 0.6 # faster people are passing by, not boarding
+    vehicle_motion_threshold_m: 0.40 # displacement within motion_window_sec that means "moving"
+    motion_window_sec: 1.0
+    stop_confirm_sec: 1.5
+    comotion_min_cosine: 0.6
+    comotion_min_speed_ratio: 0.4
     comotion_max_speed_ratio: 2.0
-    person_history_ttl_sec: 60.0               # memory bound for per-person histories
-    # Seconds a driver may be invisible near a STATIONARY vehicle before an alarm fires. 0 = disabled.
-    # Policy decision: confirm the value with the site safety officer before enabling.
-    driver_lost_alarm_sec: 0.0
+    # roofed cabs (driver hidden): see README section "roofed forklifts"
+    board_vanish_radius_m: 1.2       # a person vanishing this close to a forklift may have climbed in
+    vanish_board_window_sec: 30.0    # ... if the forklift starts moving within this time
+    hidden_board_confirm_sec: 2.0    # vanished INSIDE the cab region and stayed hidden this long -> onboard
+    dismount_spawn_radius_m: 1.5     # a NEW person appearing this close to a parked occupied forklift = its driver
+    emergence_window_sec: 1.5
+    require_vehicle_activity_for_spawn: true
+    recent_activity_sec: 120.0
+    allow_provisional_ids_for_spawn: false
+    spawn_border_margin_px: 40
+    unknown_occupancy_timeout_sec: 120.0
+    driver_handover_iou: 0.5         # tracker id switch on the same body keeps the driver
+    driver_handover_max_gap_sec: 1.0
+    unassigned_ghost_timeout_sec: 3.0
+    assigned_ghost_timeout_sec: 30.0
+    person_history_ttl_sec: 60.0
+    session_timeout_sec: 900.0       # driver away this long -> session closed (seat-time report)
+    # alarm POLICY - confirm with the site safety officer:
+    alarm_on_driver_left_view: true  # dismounted driver walked out of the camera = unattended forklift
+    driver_lost_alarm_sec: 0.0       # dismounted driver invisible NEXT to the forklift this long -> alarm (0 = off)
 
-  # Real-World Distance Estimation & Safety Thresholds (in Meters)
+  # ---- distance ----------------------------------------------------------------------------------------------------
   distance:
-    safe_distance_threshold_m: 3.0         # Trigger alarm if driver moves > 3.0 meters from forklift
-    warning_distance_threshold_m: 2.0      # Visual warning zone (yellow) between 2.0m and 3.0m
-    ema_smoothing_alpha: 0.35              # Temporal stabilization factor (0.1 = heavy smoothing, 1.0 = raw)
-    max_step_jump_m: 1.8                   # Outlier rejection threshold per frame in meters
-    min_bbox_aspect_ratio: 1.15            # Below this height/width ratio, feet are likely occluded
-    border_margin_px: 12                   # Margin from frame edges to flag clipped feet as uncertain
+    safe_distance_threshold_m: 3.0   # alarm when the dismounted driver is farther than this from the forklift
+    warning_distance_threshold_m: 2.0
+    alarm_confirm_sec: 1.0           # ... for at least this long (no flicker alarms)
+    alarm_clear_sec: 2.0             # back within (threshold - hysteresis) this long -> alarm cleared
+    clear_hysteresis_m: 0.3
+    uncertain_margin_m: 1.5          # feet hidden: alarm only beyond threshold + this margin; never cleared
+    vehicle_depth_m: 2.5             # ground footprint depth behind the visible bottom edge (forklift + forks)
+    min_ankle_confidence: 0.30
+    ema_smoothing_alpha: 0.35
+    max_step_jump_m: 1.8
+    min_bbox_aspect_ratio: 1.15
+    border_margin_px: 12
 
-  # Ground-Plane Calibration fallback for the standalone runner only. scripts/calibrate_ground_plane.py now writes
-  # configs/calibration.yaml, which main.py AND run_vehicle_monitoring.py use when it exists.
+  # Fallback calibration for the standalone runner only (configs/calibration.yaml is preferred everywhere).
   calibration:
-    # 4 Reference points in pixel coordinates [[u1,v1], [u2,v2], [u3,v3], [u4,v4]]
-    image_points_px:
-      - [320, 380]
-      - [960, 380]
-      - [1180, 680]
-      - [100, 680]
-    # Corresponding physical floor coordinates in meters [[X1,Y1], [X2,Y2], [X3,Y3], [X4,Y4]]
-    world_points_m:
-      - [0.0, 0.0]
-      - [6.0, 0.0]
-      - [6.0, 8.0]
-      - [0.0, 8.0]
-    # Fallback scale if homography is uncalibrated (meters per pixel at reference depth)
+    image_points_px: [[320, 380], [960, 380], [1180, 680], [100, 680]]
+    world_points_m: [[0.0, 0.0], [6.0, 0.0], [6.0, 8.0], [0.0, 8.0]]
     fallback_meters_per_pixel: 0.012
 
-  # Alarm & Event Logging
-  alarms:
-    enable_audio_alarm: true
-    enable_visual_alarm: true
-    alarm_cooldown_sec: 5.0                # Minimum seconds between consecutive audio alerts/snapshots
-    audio_frequency_hz: 2200
-    audio_duration_ms: 400
-
-  logging:
-    db_path: "data/vehicle_safety_events.db"
-    csv_log_path: "data/vehicle_safety_events.csv"
-    snapshot_dir: "data/snapshots/vehicle_safety"
-
   dashboard:
-    enable_web_dashboard: true
-    host: "127.0.0.1"   # localhost only; set 0.0.0.0 deliberately (and put auth/HTTPS in front) to expose it
-    port: 8050
-    stream_max_fps: 10        # web video stream rate (JPEG encoding of full frames is expensive)
-    stream_width: 1280        # web stream is downscaled to this width
+    draw_footprint: true             # draw the estimated floor footprint of each forklift

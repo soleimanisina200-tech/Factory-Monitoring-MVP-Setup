@@ -1,241 +1,157 @@
+# scripts/draw_line.py
+"""
+Draw a directional LINE (tripwire) or a directional REGION (gate polygon + entry arrow) into configs/scene.yaml.
+
+    python scripts/draw_line.py --mode line --name main_gate
+    python scripts/draw_line.py --mode region --name entrance --labels IN OUT --allowed IN
+
+line   : click A then B. The green arrow shows the first label's direction (IN); 'i' flips it.
+region : click 3+ corners, press 'd', then click 2 points (outside -> inside) for the entry arrow.
+Keys: c clear | right-click undo | s save | q quit.  (--mode zone is accepted as an alias of region.)
+"""
+from __future__ import annotations
+
 import argparse
+import sys
+from pathlib import Path
 from typing import List, Tuple
+
 import cv2
 import numpy as np
 import yaml
 
-poly_pts: List[Tuple[int, int]] = []
-dir_pts: List[Tuple[int, int]] = []
-draw_mode: str = "zone"      # "zone" or "line"
-step_mode: str = "shape"     # "shape" (draw points) or "direction" (draw entry arrow)
-invert_line: bool = False
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app.core.scene import DEFAULT_SCENE_PATH, Scene, load_scene, save_scene  # noqa: E402
+
+pts: List[Tuple[int, int]] = []
+arrow: List[Tuple[int, int]] = []
+state = {"mode": "line", "step": "shape", "invert": False}
 
 
-def mouse_cb(event, x, y, flags, param):
-    global poly_pts, dir_pts, step_mode
+def on_mouse(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
-        if draw_mode == "line":
-            if len(poly_pts) >= 2:
-                poly_pts.clear()
-            poly_pts.append((x, y))
-        elif draw_mode == "zone":
-            if step_mode == "shape":
-                poly_pts.append((x, y))
-            elif step_mode == "direction":
-                if len(dir_pts) >= 2:
-                    dir_pts.clear()
-                dir_pts.append((x, y))
-
+        if state["mode"] == "line":
+            if len(pts) >= 2:
+                pts.clear()
+            pts.append((x, y))
+        elif state["step"] == "shape":
+            pts.append((x, y))
+        else:
+            if len(arrow) >= 2:
+                arrow.clear()
+            arrow.append((x, y))
     elif event == cv2.EVENT_RBUTTONDOWN:
-        if draw_mode == "zone" and step_mode == "direction" and dir_pts:
-            dir_pts.pop()
-        elif poly_pts:
-            poly_pts.pop()
+        if state["mode"] == "region" and state["step"] == "direction" and arrow:
+            arrow.pop()
+        elif pts:
+            pts.pop()
 
 
-def compute_unit_vector(pt_start: Tuple[int, int], pt_end: Tuple[int, int]) -> List[float]:
-    dx = float(pt_end[0] - pt_start[0])
-    dy = float(pt_end[1] - pt_start[1])
-    norm = float(np.hypot(dx, dy))
-    if norm < 1e-6:
-        return [0.0, -1.0]
-    return [round(dx / norm, 4), round(dy / norm, 4)]
+def unit(a, b) -> List[float]:
+    d = np.array([b[0] - a[0], b[1] - a[1]], dtype=float)
+    n = float(np.linalg.norm(d))
+    return [0.0, -1.0] if n < 1e-6 else [round(d[0] / n, 4), round(d[1] / n, 4)]
 
 
-def main():
-    global draw_mode, step_mode, invert_line
-    parser = argparse.ArgumentParser(
-        description="Interactive Zone, Tripwire Line & Orientation Configurator"
-    )
-    parser.add_argument("--config", default="configs/settings.yaml", help="Path to settings.yaml")
-    parser.add_argument(
-        "--mode",
-        choices=["zone", "line"],
-        default="zone",
-        help="'zone' for entrance polygon + orientation arrow, 'line' for Point A -> B tripwire",
-    )
-    parser.add_argument(
-        "--name",
-        default="company_entrance_gate",
-        help="Name of the zone or line in settings.yaml",
-    )
-    args = parser.parse_args()
-    draw_mode = args.mode
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Directional line / region editor (configs/scene.yaml)")
+    ap.add_argument("--mode", choices=["line", "region", "zone"], default="line")
+    ap.add_argument("--name", default="main_gate")
+    ap.add_argument("--labels", nargs=2, default=["IN", "OUT"], help="names of the two directions")
+    ap.add_argument("--allowed", default=None, help="only this direction is allowed (other -> WRONG_WAY event)")
+    ap.add_argument("--settings", default="configs/settings.yaml")
+    ap.add_argument("--scene", default=None)
+    ap.add_argument("--source", default=None)
+    args = ap.parse_args()
+    state["mode"] = "region" if args.mode in ("region", "zone") else "line"
 
-    with open(args.config, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    src = cfg["stream"]["source"]
+    settings = {}
+    if Path(args.settings).exists():
+        with open(args.settings, "r", encoding="utf-8") as f:
+            settings = yaml.safe_load(f) or {}
+    scene_path = args.scene or (settings.get("scene") or {}).get("path") or DEFAULT_SCENE_PATH
+    src = args.source or (settings.get("stream") or {}).get("source", "0")
     cap = cv2.VideoCapture(int(src) if str(src).isdigit() else src)
-    ret, frame = cap.read()
+    ok, frame = cap.read()
     cap.release()
-    if not ret or frame is None:
-        raise RuntimeError(f"Could not read frame from stream.source: {src}")
-
+    if not ok or frame is None:
+        raise RuntimeError(f"Could not read a frame from {src}")
     h, w = frame.shape[:2]
-    win = "Directional Configurator"
+    scene = (load_scene(scene_path) if Path(scene_path).exists() else Scene()).scaled((w, h))
+    scene.image_wh = (w, h)
+
+    win = "Directional line / region editor"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, min(1440, w), min(900, h))
-    cv2.setMouseCallback(win, mouse_cb)
-
-    print("\n=== Interactive Directional Configurator ===")
-    if draw_mode == "zone":
-        print("1. [SHAPE MODE] Left-Click 3+ corners to draw the Entrance Zone polygon.")
-        print("2. Press 'd' to switch to [DIRECTION MODE], then Left-Click 2 points")
-        print("   (Start -> End) to draw the ENTRY direction arrow.")
-        print("3. Press 's' to save to configs/settings.yaml, or 'q' to quit.\n")
-    else:
-        print("1. Left-Click Point A and Point B to draw the tripwire line.")
-        print("2. Press 'i' to flip/invert the green ENTRY direction arrow.")
-        print("3. Press 's' to save to configs/settings.yaml, or 'q' to quit.\n")
-
+    cv2.setMouseCallback(win, on_mouse)
     while True:
         vis = frame.copy()
-
-        # Draw instructions banner
-        cv2.rectangle(vis, (10, 10), (1150, 85), (20, 20, 20), -1)
-        if draw_mode == "zone":
-             banner_1 = (
-                 f"MODE: ZONE ({args.name}) | Current Step: {step_mode.upper()} "
-                 f"| Press 'd' to toggle Polygon/Arrow | Press 'c' to clear"
-             )
-             banner_2 = (
-                 "Left-Click: Add Point | Right-Click: Undo | "
-                 "Arrow = 2 clicks (Outside -> Inside) | Press 's' to Save"
-             )
+        for spec in scene.lines.values():
+            cv2.line(vis, tuple(map(int, spec["a"])), tuple(map(int, spec["b"])), (120, 120, 120), 2)
+        for spec in scene.regions.values():
+            cv2.polylines(vis, [np.array(spec["polygon"], np.int32)], True, (120, 120, 120), 2)
+        cv2.rectangle(vis, (10, 10), (1180, 80), (20, 20, 20), -1)
+        if state["mode"] == "line":
+            l1 = f"LINE '{args.name}' | click A then B | i: flip arrow (now {'inverted' if state['invert'] else 'normal'})"
         else:
-            banner_1 = (
-                f"MODE: LINE ({args.name}) | Invert: {invert_line} "
-                f"| Press 'i' to Flip ENTRY Arrow | Press 'c' to clear"
-            )
-            banner_2 = "Left-Click: Point A then Point B | Right-Click: Undo | Press 's' to Save"
-
-        cv2.putText(vis, banner_1, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(vis, banner_2, (20, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (200, 255, 200), 2, cv2.LINE_AA)
-
-        # Render Line Mode
-        if draw_mode == "line":
-            for idx, pt in enumerate(poly_pts):
-                lbl = "A" if idx == 0 else "B"
-                col = (0, 255, 0) if idx == 0 else (0, 0, 255)
-                cv2.circle(vis, pt, 8, col, -1, cv2.LINE_AA)
-                cv2.putText(vis, lbl, (pt[0] + 10, pt[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2, cv2.LINE_AA)
-
-            if len(poly_pts) == 2:
-                pt_a, pt_b = poly_pts[0], poly_pts[1]
-                cv2.line(vis, pt_a, pt_b, (0, 255, 255), 3, cv2.LINE_AA)
-
-                mid_x = int((pt_a[0] + pt_b[0]) / 2)
-                mid_y = int((pt_a[1] + pt_b[1]) / 2)
-                dx, dy = pt_b[0] - pt_a[0], pt_b[1] - pt_a[1]
-                length = max(1.0, float(np.hypot(dx, dy)))
-                sign = -1.0 if invert_line else 1.0
-                nx = int(-sign * (dy / length) * 55)
-                ny = int(sign * (dx / length) * 55)
-                arrow_tip = (mid_x + nx, mid_y + ny)
-                cv2.arrowedLine(vis, (mid_x, mid_y), arrow_tip, (0, 255, 0), 3, cv2.LINE_AA, tipLength=0.3)
-                cv2.putText(vis, "ENTRY", arrow_tip, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-
-        # Render Zone Mode
-        elif draw_mode == "zone":
-            for idx, pt in enumerate(poly_pts):
-                cv2.circle(vis, pt, 6, (0, 165, 255), -1, cv2.LINE_AA)
-                cv2.putText(
-                    vis,
-                    str(idx + 1),
-                    (pt[0] + 8, pt[1] - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 165, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-            if len(poly_pts) >= 2:
-                poly_np = np.array(poly_pts, dtype=np.int32)
-                cv2.polylines(
-                    vis,
-                    [poly_np],
-                    isClosed=(len(poly_pts) >= 3),
-                    color=(255, 165, 0),
-                    thickness=2,
-                    lineType=cv2.LINE_AA,
-                )
-
-            # Draw Orientation Arrow if defined
-            if len(dir_pts) == 1:
-                cv2.circle(vis, dir_pts[0], 7, (0, 255, 0), -1, cv2.LINE_AA)
-                cv2.putText(vis, "START", (dir_pts[0][0] + 10, dir_pts[0][1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            elif len(dir_pts) == 2:
-                cv2.arrowedLine(vis, dir_pts[0], dir_pts[1], (0, 255, 0), 4, cv2.LINE_AA, tipLength=0.25)
-                uvec = compute_unit_vector(dir_pts[0], dir_pts[1])
-                cv2.putText(
-                    vis,
-                    f"ENTRY {uvec}",
-                    (dir_pts[1][0] + 10, dir_pts[1][1]),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-
+            l1 = f"REGION '{args.name}' | step: {state['step']} | d: polygon <-> entry arrow (outside -> inside)"
+        cv2.putText(vis, l1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(vis, f"labels {args.labels}  allowed={args.allowed} | c clear | s save | q quit", (20, 68),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (200, 255, 200), 2, cv2.LINE_AA)
+        if state["mode"] == "line":
+            for i, p in enumerate(pts):
+                cv2.circle(vis, p, 8, (0, 255, 0) if i == 0 else (0, 0, 255), -1)
+                cv2.putText(vis, "AB"[i], (p[0] + 10, p[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            if len(pts) == 2:
+                a, b = pts
+                cv2.line(vis, a, b, (0, 255, 255), 3, cv2.LINE_AA)
+                mid = ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                n = max(1.0, float(np.hypot(dx, dy)))
+                s = -1.0 if state["invert"] else 1.0
+                tip = (int(mid[0] - s * dy / n * 55), int(mid[1] + s * dx / n * 55))
+                cv2.arrowedLine(vis, mid, tip, (0, 255, 0), 3, cv2.LINE_AA, tipLength=0.3)
+                cv2.putText(vis, args.labels[0], tip, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            if len(pts) >= 2:
+                cv2.polylines(vis, [np.array(pts, np.int32)], len(pts) >= 3, (255, 165, 0), 2, cv2.LINE_AA)
+            for p in pts:
+                cv2.circle(vis, p, 6, (255, 165, 0), -1)
+            if len(arrow) == 2:
+                cv2.arrowedLine(vis, arrow[0], arrow[1], (0, 255, 0), 4, cv2.LINE_AA, tipLength=0.25)
+                cv2.putText(vis, args.labels[0], arrow[1], cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            elif len(arrow) == 1:
+                cv2.circle(vis, arrow[0], 7, (0, 255, 0), -1)
         cv2.imshow(win, vis)
         key = cv2.waitKey(20) & 0xFF
-
-        if key == ord("d") and draw_mode == "zone":
-            step_mode = "direction" if step_mode == "shape" else "shape"
-            print(f"Switched to [{step_mode.upper()}] mode.")
-        elif key == ord("i") and draw_mode == "line":
-            invert_line = not invert_line
-            print(f"Line invert_direction set to: {invert_line}")
-        elif key == ord("c"):
-            poly_pts.clear()
-            dir_pts.clear()
-            step_mode = "shape"
-            print("Cleared all points.")
-        elif key == ord("s"):
-            dir_cfg = cfg.setdefault("directional_tracking", {})
-            if draw_mode == "line":
-                if len(poly_pts) != 2:
-                    print("[ERROR] Please click 2 points (A and B) before saving.")
-                    continue
-                dir_cfg.setdefault("lines", {})[args.name] = {
-                    "point_a": [int(poly_pts[0][0]), int(poly_pts[0][1])],
-                    "point_b": [int(poly_pts[1][0]), int(poly_pts[1][1])],
-                    "invert_direction": bool(invert_line),
-                    "cooldown_seconds": 2.0,
-                    "color": [0, 255, 255],
-                }
-                with open(args.config, "w", encoding="utf-8") as f:
-                    yaml.safe_dump(cfg, f, sort_keys=False)
-                print(f"Saved tripwire line '{args.name}' to {args.config}")
-                break
-
-            elif draw_mode == "zone":
-                if len(poly_pts) < 3:
-                    print("[ERROR] Please click at least 3 polygon corners before saving.")
-                    continue
-                entry_vec = (
-                    compute_unit_vector(dir_pts[0], dir_pts[1])
-                    if len(dir_pts) == 2
-                    else [0.0, -1.0]
-                )
-                dir_cfg.setdefault("entrance_zones", {})[args.name] = {
-                    "polygon": [[int(p[0]), int(p[1])] for p in poly_pts],
-                    "entry_direction_vector": entry_vec,
-                    "min_displacement": 20.0,
-                    "color": [255, 165, 0],
-                }
-                with open(args.config, "w", encoding="utf-8") as f:
-                    yaml.safe_dump(cfg, f, sort_keys=False)
-                print(
-                    f"Saved entrance zone '{args.name}' with entry_direction_vector={entry_vec} to {args.config}"
-                )
-                break
-        elif key == ord("q"):
+        if key == ord("q"):
             break
-
+        if key == ord("c"):
+            pts.clear()
+            arrow.clear()
+            state["step"] = "shape"
+        elif key == ord("i") and state["mode"] == "line":
+            state["invert"] = not state["invert"]
+        elif key == ord("d") and state["mode"] == "region":
+            state["step"] = "direction" if state["step"] == "shape" else "shape"
+        elif key == ord("s"):
+            if state["mode"] == "line":
+                if len(pts) != 2:
+                    print("[ERROR] click A and B first")
+                    continue
+                scene.lines[args.name] = {"a": list(pts[0]), "b": list(pts[1]), "invert": state["invert"],
+                                          "labels": list(args.labels), "dead_band_px": 18.0, "cooldown_sec": 1.0,
+                                          "allowed_direction": args.allowed}
+            else:
+                if len(pts) < 3 or len(arrow) != 2:
+                    print("[ERROR] draw >= 3 corners AND the entry arrow (press d) first")
+                    continue
+                scene.regions[args.name] = {"polygon": [list(p) for p in pts], "entry_vector": unit(*arrow),
+                                            "min_displacement_px": 40.0, "labels": list(args.labels),
+                                            "allowed_direction": args.allowed}
+            save_scene(scene, scene_path)
+            print(f"Saved {state['mode']} '{args.name}' to {scene_path}")
+            break
     cv2.destroyAllWindows()
 
 

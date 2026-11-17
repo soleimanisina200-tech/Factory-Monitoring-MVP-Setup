@@ -1,13 +1,15 @@
 # PyTorch MUST be the CUDA build (a plain `pip install torch` on Windows gives the CPU-only build).
 # Install it first with the command from https://pytorch.org/get-started/locally/ (Windows / Pip / CUDA),
 # then check:  python -c "import torch; print(torch.cuda.is_available())"   -> must print True
-ultralytics>=8.1.0
-opencv-python>=4.8.0
+ultralytics>=8.3.0    # YOLO11 pose / detection + trackers (ocsort / deepocsort / tracktrack presets need >= 8.4)
+opencv-python>=4.8.0  # >= 4.7 is required for the optional helmet markers (cv2.aruco.ArucoDetector)
 pyyaml>=6.0
 numpy>=1.23.0
 scipy>=1.9.0          # Hungarian assignment in the identity manager
+lap>=0.5.12           # tracker assignment (Ultralytics tries to auto-install it at run time otherwise)
 torchreid             # OSNet Re-ID (install from the torchreid GitHub repo if the PyPI build fails)
 tensorboard           # imported by torchreid at import time (missing -> `import torchreid` fails)
 gdown                 # automatic download of the MSMT17 OSNet weights
-fastapi               # optional: live dashboard
-uvicorn               # optional: live dashboard
+fastapi               # optional: web API / live view (web.enabled)
+uvicorn               # optional: web API / live view
+# paho-mqtt           # optional: MQTT alarm output (alarms.mqtt.enabled)

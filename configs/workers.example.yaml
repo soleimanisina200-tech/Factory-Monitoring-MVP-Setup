@@ -1,0 +1,7 @@
+# Worker registry for helmet markers (markers.enabled: true in settings.yaml).
+# Copy to configs/workers.yaml (not tracked by git: it contains personal data) and fill in.
+# Print the markers with:  python scripts/make_markers.py --ids 1-40 --size-cm 8
+dictionary: DICT_4X4_50
+workers:
+  - {marker_id: 1, name: "Worker One", employee_id: "E-0001"}
+  - {marker_id: 2, name: "Worker Two", employee_id: "E-0002"}

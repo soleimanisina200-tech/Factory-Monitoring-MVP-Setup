@@ -1,178 +1,169 @@
 # app/vehicle_monitoring/pipeline.py
+"""
+Forklift detection + driver monitoring.
+
+In main.py the persons come from the pose detector + identity manager (stable worker IDs, keypoints, foot points);
+this pipeline only detects/tracks vehicles and runs the driver state machine. Standalone
+(run_vehicle_monitoring.py) it also detects persons with the vehicle model (no pose, tracker IDs only).
+
+Vehicle classes are selected by NAME from the model (`vehicle_class_names: [forklift]`) or by id. A segmentation
+model (e.g. a fine-tuned yolo11m-seg) is used automatically: its mask gives the real chassis edge on the floor.
+"""
+from __future__ import annotations
+
 import logging
-import yaml
-import numpy as np
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-import torch
-from ultralytics import YOLO
+from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
+import yaml
 
 from app.logic.calibration import load_calibration
+from app.vehicle_monitoring.dashboard import VehicleSafetyDashboard
 from app.vehicle_monitoring.distance_estimator import RealWorldDistanceEstimator
 from app.vehicle_monitoring.driver_vehicle_fsm import DriverVehicleMonitorFSM
-from app.vehicle_monitoring.alarm_and_logger import SafetyAlarmAndLogger
-from app.vehicle_monitoring.dashboard import VehicleSafetyDashboard
 
 logger = logging.getLogger("FactoryReID")
 
 
-class VehicleMonitoringPipeline:
-    """
-    Integrates directly with main.py's YOLO-Pose human detector (IndustrialPoseDetector)
-    and IdentityManager. Detects forklifts/vehicles while consuming existing human
-    pose keypoints, global IDs, and Re-ID embeddings.
-    """
+def resolve_class_ids(model_names: Dict[int, str], names: Optional[List[str]], ids: Optional[List[int]]) -> List[int]:
+    """Class ids for the configured vehicle class NAMES (case-insensitive) plus explicit ids."""
+    out = [int(i) for i in (ids or [])]
+    if names:
+        lookup = {str(n).strip().lower(): int(i) for i, n in (model_names or {}).items()}
+        missing = []
+        for n in names:
+            key = str(n).strip().lower()
+            if key in lookup:
+                out.append(lookup[key])
+            else:
+                missing.append(n)
+        if missing:
+            logger.error("Vehicle classes %s not in the vehicle model (available: %s)", missing,
+                         sorted(set((model_names or {}).values())))
+    return sorted(set(out))
 
+
+class VehicleMonitoringPipeline:
     def __init__(
         self,
         config_path: str = "configs/vehicle_monitoring.yaml",
-        reid_extractor=None,
+        reid_extractor: Any = None,  # kept for backwards compatibility (driver Re-ID now comes from main.py)
         calibration_path: Optional[str] = None,
+        event_sink: Optional[Callable[[Dict[str, Any], Optional[np.ndarray]], None]] = None,
+        model: Any = None,
+        device: Optional[str] = None,
     ):
         with open(Path(config_path), "r", encoding="utf-8") as f:
-            full_cfg = yaml.safe_load(f)
-        self.cfg = full_cfg.get("vehicle_monitoring", {})
+            full_cfg = yaml.safe_load(f) or {}
+        self.cfg: Dict[str, Any] = full_cfg.get("vehicle_monitoring", {}) or {}
 
-        weights = self.cfg.get("vehicle_detector_weights", "yolo11m.pt")
-        self.model = YOLO(weights)
-        self.person_cls_id: int = int(self.cfg.get("person_class_id", 0))
-        self.vehicle_cls_ids: List[int] = [int(c) for c in self.cfg.get("vehicle_class_ids", [7])]
-        self.v_conf: float = float(self.cfg.get("vehicle_conf_threshold", 0.45))
-        self.p_conf: float = float(self.cfg.get("person_conf_threshold", 0.45))
+        if model is None:
+            from ultralytics import YOLO
 
-        # Vehicles have their own ByteTrack settings: the person tracker is tuned for tiny, partially
-        # occluded humans (very low thresholds) and is wrong for large rigid vehicles.
-        self.vehicle_tracker_cfg: str = str(self.cfg.get("vehicle_tracker_config", "bytetrack.yaml"))
-        # Vehicles are detected on large frames: the default 640 px input shrinks a 2560 px frame 4x and
-        # loses distant forklifts / makes their boxes jittery (which hurts the cab-overlap tests).
-        self.vehicle_imgsz: int = int(self.cfg.get("vehicle_imgsz", 1280))
-        self.vehicle_half: bool = bool(self.cfg.get("vehicle_half", True)) and torch.cuda.is_available()
-        # Vehicles move slowly compared with the frame rate: optionally detect them every N frames only.
-        self.detect_every_n: int = max(1, int(self.cfg.get("vehicle_detect_every_n_frames", 1)))
+            model = YOLO(self.cfg.get("vehicle_detector_weights", "yolo11m.pt"))
+        self.model = model
+        self.device = device
+        self.person_cls_id = int(self.cfg.get("person_class_id", 0))
+        self.vehicle_cls_ids = resolve_class_ids(
+            getattr(self.model, "names", {}) or {}, self.cfg.get("vehicle_class_names"),
+            self.cfg.get("vehicle_class_ids", [] if self.cfg.get("vehicle_class_names") else [7]),
+        )
+        if not self.vehicle_cls_ids:
+            raise ValueError("No vehicle classes selected: set vehicle_class_names or vehicle_class_ids")
+        names = getattr(self.model, "names", {}) or {}
+        logger.info("Vehicle classes: %s", [f"{i}:{names.get(i, '?')}" for i in self.vehicle_cls_ids])
+        if not any("fork" in str(names.get(i, "")).lower() for i in self.vehicle_cls_ids):
+            logger.warning("The vehicle model has no 'forklift' class selected: a COCO model detects forklifts only "
+                           "by chance (as truck/car). Train/fine-tune a forklift model for production use.")
+        self.v_conf = float(self.cfg.get("vehicle_conf_threshold", 0.40))
+        self.p_conf = float(self.cfg.get("person_conf_threshold", 0.45))
+        self.vehicle_tracker_cfg = str(self.cfg.get("vehicle_tracker_config", "bytetrack.yaml"))
+        self.vehicle_imgsz = int(self.cfg.get("vehicle_imgsz", 1280))
+        try:
+            import torch
+
+            cuda = torch.cuda.is_available()
+        except Exception:
+            cuda = False
+        self.vehicle_half = bool(self.cfg.get("vehicle_half", True)) and cuda
+        self.detect_every_n = max(1, int(self.cfg.get("vehicle_detect_every_n_frames", 1)))
         self._frame_idx = 0
         self._last_vehicles: List[Dict] = []
 
-        self.reid_extractor = reid_extractor
         self.estimator = RealWorldDistanceEstimator(self.cfg)
         self.fsm = DriverVehicleMonitorFSM(self.cfg, self.estimator)
-        self.logger = SafetyAlarmAndLogger(self.cfg)
-        self.dashboard = VehicleSafetyDashboard(self.cfg)
+        self.dashboard = VehicleSafetyDashboard(self.cfg, self.estimator)
+        self.event_sink = event_sink
+        self.last_events: List[Dict[str, Any]] = []
+        self.reid_extractor = None
 
-        # Standalone mode reads the shared ground calibration lazily (it needs the stream resolution).
-        # main.py does NOT pass a path: it hands its own (already scaled) homography to the estimator.
         self._calibration = load_calibration(calibration_path) if calibration_path else None
         self._calibration_applied = False
 
-    def _extract_embedding(self, frame: np.ndarray, bbox: List[float]) -> Optional[np.ndarray]:
-        """
-        Optional Re-ID embedding for persons that arrive WITHOUT one (standalone mode).
-        Returns None when no real Re-ID model is available: the old colour-histogram fallback was removed
-        because histogram cosine similarity is high for almost any two people, which silently made the
-        driver Re-ID fallback match the wrong person.
-        """
-        if self.reid_extractor is None:
-            return None
-        x1, y1, x2, y2 = map(int, bbox)
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 <= x1 or y2 <= y1:
-            return None
-        crop = frame[y1:y2, x1:x2]
-        try:
-            if hasattr(self.reid_extractor, "extract"):
-                return self.reid_extractor.extract(crop)
-            if hasattr(self.reid_extractor, "get_embedding"):
-                return self.reid_extractor.get_embedding(crop)
-            if callable(self.reid_extractor):
-                return self.reid_extractor(crop)
-        except Exception:
-            logger.exception("Re-ID embedding extraction failed")
-        return None
-
-    def normalize_pose_persons(
-        self, frame: np.ndarray, raw_persons: Any
-    ) -> List[Dict]:
-        """
-        Converts human outputs from main.py (either Ultralytics YOLO-Pose Results,
-        a list of track dicts, or custom track objects from IdentityManager) into
-        standardized person dicts with 'id', 'bbox', 'keypoints', 'foot_px', and 'embedding'.
-        """
-        normalized: List[Dict] = []
-        if raw_persons is None:
-            return normalized
-
-        # Case 1: Ultralytics YOLO-Pose Results object passed directly
-        if hasattr(raw_persons, "boxes") or (
-            isinstance(raw_persons, list) and len(raw_persons) > 0 and hasattr(raw_persons[0], "boxes")
-        ):
-            res = raw_persons[0] if isinstance(raw_persons, list) else raw_persons
-            if res.boxes is None or res.boxes.id is None:
-                return normalized
-            boxes = res.boxes.xyxy.cpu().numpy()
-            ids = res.boxes.id.int().cpu().tolist()
-            kpts_all = (
-                res.keypoints.data.cpu().numpy()
-                if (hasattr(res, "keypoints") and res.keypoints is not None)
-                else None
-            )
-            for idx, (bbox, tid) in enumerate(zip(boxes, ids)):
-                kpts = kpts_all[idx] if kpts_all is not None and idx < len(kpts_all) else None
-                b_list = bbox.tolist()
-                normalized.append({
-                    "id": str(tid),
-                    "bbox": b_list,
-                    "keypoints": kpts,
-                    "foot_px": None,
-                    "embedding": self._extract_embedding(frame, b_list),
-                })
-            return normalized
-
-        # Case 2: List of dicts or track objects from main.py / IdentityManager
-        for item in raw_persons:
-            bev_xy = None
-            if isinstance(item, dict):
-                # `id` is authoritative (main.py sends "7" for verified workers, "T12" for provisional ones).
-                # global_id == -1 means "not verified yet" and must NEVER be used as an identifier: the old
-                # code did, so every unverified person collapsed into one record called "-1".
-                pid = item.get("id")
-                if pid is None:
-                    gid = item.get("global_id")
-                    pid = gid if gid not in (None, -1) else item.get("track_id")
-                bev_xy = item.get("bev_xy")
-                bbox = item.get("bbox", item.get("box"))
-                kpts = item.get("keypoints", item.get("pose"))
-                foot_px = item.get("foot_px", item.get("foot_point", item.get("ground_point")))
-                emb = item.get("embedding", item.get("reid_embedding", item.get("feature")))
-            else:
-                pid = getattr(item, "global_id", getattr(item, "id", getattr(item, "track_id", None)))
-                bbox = getattr(item, "bbox", getattr(item, "box", None))
-                kpts = getattr(item, "keypoints", getattr(item, "pose", None))
-                foot_px = getattr(item, "foot_px", getattr(item, "foot_point", None))
-                emb = getattr(item, "embedding", getattr(item, "reid_embedding", None))
-
+    # ------------------------------------------------------------------
+    def normalize_pose_persons(self, frame: np.ndarray, raw_persons: Any) -> List[Dict]:
+        """Person dicts from main.py -> the FSM format (ids stay strings: '7' worker, 'T12' provisional)."""
+        out: List[Dict] = []
+        for item in raw_persons or []:
+            if not isinstance(item, dict):
+                item = {k: getattr(item, k) for k in ("id", "global_id", "track_id", "bbox", "keypoints", "foot_px",
+                                                      "embedding", "bev_xy") if hasattr(item, k)}
+            pid = item.get("id")
+            if pid is None:
+                gid = item.get("global_id")
+                pid = gid if gid not in (None, -1) else (
+                    f"T{item['track_id']}" if item.get("track_id") is not None else None)
+            bbox = item.get("bbox", item.get("box"))
             if pid is None or bbox is None:
                 continue
-
-            b_list = [float(x) for x in bbox]
-            if emb is None:
-                emb = self._extract_embedding(frame, b_list)
-
-            normalized.append({
+            kpts = item.get("keypoints")
+            foot = item.get("foot_px")
+            emb = item.get("embedding")
+            bev = item.get("bev_xy")
+            out.append({
                 "id": str(pid),
-                "bbox": b_list,
+                "bbox": [float(x) for x in bbox],
                 "keypoints": np.asarray(kpts) if kpts is not None else None,
-                "foot_px": tuple(map(int, foot_px)) if foot_px is not None else None,
+                "foot_px": tuple(float(v) for v in foot) if foot is not None else None,
+                "ground_uncertain": item.get("ground_uncertain"),
                 "embedding": np.asarray(emb) if emb is not None else None,
-                "bev_xy": tuple(float(v) for v in bev_xy) if bev_xy is not None else None,
+                "bev_xy": tuple(float(v) for v in bev) if bev is not None else None,
             })
-
-        return normalized
+        return out
 
     def _resolve_tracker(self, override: Optional[str]) -> str:
         cfg = override or self.vehicle_tracker_cfg
-        builtin = cfg in ("bytetrack.yaml", "botsort.yaml")
-        return cfg if (builtin or Path(cfg).exists()) else "bytetrack.yaml"
+        return cfg if (cfg in ("bytetrack.yaml", "botsort.yaml") or Path(cfg).exists()) else "bytetrack.yaml"
+
+    def detect(self, frame: np.ndarray, with_persons: bool = False, tracker_config: Optional[str] = None):
+        """-> (vehicles, persons). Vehicles carry an optional `contour` when the model is a segmentation model."""
+        classes = self.vehicle_cls_ids + ([self.person_cls_id] if with_persons else [])
+        kwargs = dict(persist=True, classes=sorted(set(classes)), conf=min(self.v_conf, self.p_conf) if with_persons
+                      else self.v_conf, tracker=self._resolve_tracker(tracker_config), imgsz=self.vehicle_imgsz,
+                      half=self.vehicle_half, verbose=False)
+        if self.device:
+            kwargs["device"] = self.device
+        results = self.model.track(frame, **kwargs)
+        vehicles: List[Dict] = []
+        persons: List[Dict] = []
+        if not results or results[0].boxes is None or results[0].boxes.id is None:
+            return vehicles, persons
+        r = results[0]
+        boxes = r.boxes.xyxy.cpu().numpy()
+        ids = r.boxes.id.int().cpu().tolist()
+        clss = r.boxes.cls.int().cpu().tolist()
+        confs = r.boxes.conf.cpu().tolist()
+        masks = getattr(r, "masks", None)
+        polys = list(masks.xy) if masks is not None and getattr(masks, "xy", None) is not None else None
+        for i, (bbox, tid, cls_id, conf) in enumerate(zip(boxes, ids, clss, confs)):
+            if cls_id in self.vehicle_cls_ids and conf >= self.v_conf:
+                vehicles.append({"id": str(tid), "bbox": bbox.tolist(), "conf": float(conf), "class_id": cls_id,
+                                 "contour": np.asarray(polys[i]) if polys is not None and i < len(polys) else None})
+            elif with_persons and cls_id == self.person_cls_id and conf >= self.p_conf:
+                persons.append({"id": str(tid), "bbox": bbox.tolist(), "conf": float(conf), "keypoints": None,
+                                "foot_px": None, "embedding": None})
+        return vehicles, persons
 
     def process_frame(
         self,
@@ -180,84 +171,33 @@ class VehicleMonitoringPipeline:
         external_persons: Optional[Any] = None,
         tracker_config: Optional[str] = None,
         frame_ts: Optional[float] = None,
+        left_view_ids: Optional[List[str]] = None,
+        draw: bool = True,
     ) -> np.ndarray:
-        """
-        If external_persons (from main.py's YOLO-Pose detector) is provided, only runs
-        vehicle detection and fuses with the YOLO-Pose human tracks.
-        """
         if self._calibration is not None and not self._calibration_applied:
             h, w = frame.shape[:2]
             self.estimator.set_homography(self._calibration.homography((w, h)))
             self._calibration_applied = True
 
-        # Only detect vehicles if main.py already provides YOLO-Pose human detections
-        target_classes = (
-            self.vehicle_cls_ids
-            if external_persons is not None
-            else list(set([self.person_cls_id] + self.vehicle_cls_ids))
-        )
-
-        run_detector = external_persons is None or (self._frame_idx % self.detect_every_n == 0)
+        standalone = external_persons is None
+        run = standalone or (self._frame_idx % self.detect_every_n == 0)
         self._frame_idx += 1
-        results = None
-        if run_detector:
-            results = self.model.track(
-                frame,
-                persist=True,
-                classes=target_classes,
-                conf=self.v_conf if external_persons is not None else min(self.v_conf, self.p_conf),
-                tracker=self._resolve_tracker(tracker_config),
-                imgsz=self.vehicle_imgsz,
-                half=self.vehicle_half,
-                verbose=False,
-            )
+        if run:
+            vehicles, persons = self.detect(frame, with_persons=standalone, tracker_config=tracker_config)
+            self._last_vehicles = vehicles
+        else:
+            vehicles, persons = list(self._last_vehicles), []
+        if not standalone:
+            persons = self.normalize_pose_persons(frame, external_persons)
 
-        detected_vehicles: List[Dict] = [] if run_detector else list(self._last_vehicles)
-        detected_persons: List[Dict] = []
-
-        if results and len(results) > 0 and results[0].boxes is not None and results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            ids = results[0].boxes.id.int().cpu().tolist()
-            clss = results[0].boxes.cls.int().cpu().tolist()
-            confs = results[0].boxes.conf.cpu().tolist()
-
-            for bbox, tid, cls_id, conf in zip(boxes, ids, clss, confs):
-                if cls_id in self.vehicle_cls_ids and conf >= self.v_conf:
-                    detected_vehicles.append({
-                        "id": str(tid),
-                        "bbox": bbox.tolist(),
-                        "conf": float(conf),
-                    })
-                elif cls_id == self.person_cls_id and conf >= self.p_conf and external_persons is None:
-                    detected_persons.append({
-                        "id": str(tid),
-                        "bbox": bbox.tolist(),
-                        "conf": float(conf),
-                        "keypoints": None,
-                        "foot_px": None,
-                        "embedding": self._extract_embedding(frame, bbox.tolist()),
-                    })
-
-        if run_detector:
-            self._last_vehicles = detected_vehicles
-
-        if external_persons is not None:
-            detected_persons = self.normalize_pose_persons(frame, external_persons)
-
-        vehicles_state, triggered_events = self.fsm.update(
-            detected_vehicles=detected_vehicles,
-            detected_persons=detected_persons,
-            frame_shape=frame.shape,
-            now=frame_ts,
-        )
-
-        annotated = self.dashboard.render_hud(
-            frame=frame,
-            vehicles=vehicles_state,
-            recent_events=self.logger.get_recent_events(),
-        )
-
-        if triggered_events:
-            self.logger.process_events(triggered_events, annotated)
-
+        vehicles_state, events = self.fsm.update(vehicles, persons, frame.shape, now=frame_ts,
+                                                 left_view_ids=left_view_ids)
+        self.last_events = events
+        annotated = self.dashboard.render_hud(frame, vehicles_state, now=frame_ts) if draw else frame
+        if self.event_sink is not None:
+            for ev in events:
+                self.event_sink(ev, annotated)
         return annotated
+
+    def telemetry(self, now: float) -> List[Dict[str, Any]]:
+        return self.dashboard.telemetry(self.fsm.vehicles, now)

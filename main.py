@@ -1,46 +1,60 @@
+"""
+Factory monitoring service: worker identity, zones, directional lines/regions, forklift driver safety.
+
+    python main.py --source data/input/clip1.mp4
+    python main.py --source rtsp://user:pass@cam/stream --restart-on-failure      (24/7 live camera)
+
+Per frame:
+  detector (YOLO-pose + tracker) -> identity manager (stable worker IDs, re-entry, markers)
+  -> zones / lines / regions (per worker, with late attribution of provisional tracks)
+  -> forklift detection + driver state machine
+  -> one event store (SQLite + CSV + snapshots) -> alarm outputs (beep / webhook / MQTT)
+  -> HUD, segmented recording, telemetry API, heartbeat file
+"""
 from __future__ import annotations
+
 import argparse
+import json
 import logging
+import os
+import signal
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
-import yaml
-
 import torch
 
+from app.analytics.crossings import CrossingAnalytics
+from app.analytics.entities import AttributionBuffer, entity_key
+from app.analytics.zones import ZoneAnalytics
+from app.core.alarms import AlarmDispatcher
+from app.core.clock import StreamClock
+from app.core.config import load_settings, persistence_mode
+from app.core.events import ALARM, EventStore, make_event
+from app.core.logging_setup import setup_logging
+from app.core.scene import load_scene
 from app.detection.detector import IndustrialPoseDetector, PoseDetection
 from app.identity.manager import EnterpriseIdentityManager
-from app.identity.reid_model import PoseGuidedOSNetExtractor, SKELETON_LIMBS
+from app.identity.open_set import OpenSetCalibrator
+from app.identity.reid_model import SKELETON_LIMBS, PoseGuidedOSNetExtractor
 from app.logic.calibration import DEFAULT_CALIBRATION_PATH, load_calibration
 from app.logic.geometry import MetricBEVProjector
+from app.output.recorder import SegmentedVideoWriter
+from app.service.web import TelemetryHub, start_web_service
 from app.streams.video_reader import VariableFPSVideoReader
-from app.zones.manager import MultiZoneManager
-from app.vehicle_monitoring.pipeline import VehicleMonitoringPipeline
-from app.logic.directional_tracker import DirectionalTracker
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | [%(levelname)s] | %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger("FactoryReID")
 
 
 def resolve_device(requested: str, half: bool) -> Tuple[str, bool]:
-    """
-    Fail-soft device selection with an explicit message. A CPU-only PyTorch build (the default
-    `pip install torch` on Windows) used to crash deep inside YOLO with "Torch not compiled with CUDA".
-    """
+    """Fail-soft device selection with an explicit message (CPU-only PyTorch builds used to crash deep in YOLO)."""
     if "cuda" in str(requested) and not torch.cuda.is_available():
-        build = f"torch {torch.__version__} (CUDA build: {torch.version.cuda})"
         logger.error(
-            "CUDA requested (%s) but not available in %s. Falling back to CPU: expect ~1 FPS. "
-            "Install the CUDA build of PyTorch from https://pytorch.org/get-started/locally/ "
-            "and check `python -c \"import torch; print(torch.cuda.is_available())\"` prints True.",
-            requested, build,
+            "CUDA requested (%s) but not available in torch %s (CUDA build: %s). Falling back to CPU: expect ~1 FPS. "
+            "Install the CUDA build of PyTorch from https://pytorch.org/get-started/locally/.",
+            requested, torch.__version__, torch.version.cuda,
         )
         return "cpu", False
     if "cuda" in str(requested):
@@ -48,411 +62,637 @@ def resolve_device(requested: str, half: bool) -> Tuple[str, bool]:
     return str(requested), half
 
 
-def load_config(config_path: str = "configs/settings.yaml") -> Dict:
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def build_pose_persons_for_vehicle_monitor(
+def build_persons_for_vehicle_monitor(
     detections: List[PoseDetection],
     track_to_global: Dict[int, int],
-    bev_projector: Optional[MetricBEVProjector] = None,
     track_embeddings: Optional[Dict[int, np.ndarray]] = None,
-) -> List[Dict]:
+) -> List[Dict[str, Any]]:
     """
-    Packages IndustrialPoseDetector + EnterpriseIdentityManager outputs
-    for the Vehicle & Driver Monitoring Pipeline.
-
-    Includes Seated Cab-Operator Compensation:
-    When a driver sits inside a forklift/truck cab (like ID:7), the cab body occludes
-    their ankles (keypoints 15 & 16). We synthesize virtual seat-level ground keypoints
-    so the true cab operator is never rejected due to ANKLES_OCCLUDED.
+    Person records for the forklift module. The REAL keypoints and ground point are passed with an explicit
+    `ground_uncertain` flag. (The old code invented ankle keypoints with 0.75 confidence for anybody whose legs were
+    hidden: that turned a worker behind a pallet into a "seated operator" and disabled the distance-uncertainty
+    gate. Seated drivers are recognised inside the driver state machine instead.)
     """
-    pose_persons: List[Dict] = []
+    out = []
     for det in detections:
-        gid = track_to_global.get(det.track_id, -1)
-        person_id = str(gid) if gid != -1 else f"T{det.track_id}"
+        gid = track_to_global.get(det.track_id)
+        out.append({
+            "id": str(gid) if gid is not None else f"T{det.track_id}",
+            "global_id": gid if gid is not None else -1,
+            "track_id": det.track_id,
+            "bbox": det.bbox_xyxy.astype(float).tolist(),
+            "keypoints": np.column_stack([det.keypoints_xy, det.keypoints_conf]),
+            "foot_px": (float(det.ground_uv[0]), float(det.ground_uv[1])),
+            "ground_uncertain": bool(det.ground_extrapolated),
+            "bev_xy": det.bev_xy,
+            "embedding": (track_embeddings or {}).get(det.track_id),
+        })
+    return out
 
-        kpts_xy = det.keypoints_xy.copy()
-        kpts_conf = det.keypoints_conf.copy()
-        x1, y1, x2, y2 = det.bbox_xyxy
-        ug, vg = int(det.ground_uv[0]), int(det.ground_uv[1])
-        bev_xy = det.bev_xy
 
-        torso_conf = float(np.mean(kpts_conf[[5, 6, 11, 12]]))
-        ankle_conf = float(np.max(kpts_conf[[15, 16]]))
+class FactoryMonitor:
+    def __init__(self, cfg: Dict[str, Any], vehicle_config_path: str, calibration_path: str):
+        self.cfg = cfg
+        sys_cfg, stream_cfg, det_cfg, reid_cfg = cfg["system"], cfg["stream"], cfg["detection"], cfg["reid"]
+        bev_cfg = cfg["physics_bev"]
+        self.camera_id = str(sys_cfg.get("camera_id", "cam1"))
+        self.display = bool(sys_cfg.get("display_gui", True))
+        self.max_errors = int(sys_cfg.get("max_consecutive_errors", 100))
+        self.heartbeat_path = sys_cfg.get("heartbeat_path") or None
+        self.max_stall_sec = float(stream_cfg.get("max_stall_sec", 0.0))
+        sys_cfg["device"], sys_cfg["half_precision"] = resolve_device(
+            sys_cfg.get("device", "cuda:0"), bool(sys_cfg.get("half_precision", True)))
 
-        if torso_conf >= 0.30 and ankle_conf < 0.40:
-            vis_hips = [idx for idx in (11, 12, 13, 14) if kpts_conf[idx] >= 0.25]
-            if vis_hips:
-                seat_x = float(np.mean(kpts_xy[vis_hips, 0]))
-                seat_y = float(np.max(kpts_xy[vis_hips, 1]))
-            else:
-                seat_x = float(0.5 * (x1 + x2))
-                seat_y = float(y1 + 0.78 * (y2 - y1))
-
-            kpts_xy[15] = [seat_x - 8.0, min(float(y2), seat_y + 12.0)]
-            kpts_xy[16] = [seat_x + 8.0, min(float(y2), seat_y + 12.0)]
-            kpts_conf[15] = max(kpts_conf[15], 0.75)
-            kpts_conf[16] = max(kpts_conf[16], 0.75)
-
-            ug, vg = int(seat_x), int(min(float(y2), seat_y + 12.0))
-            if bev_projector is not None:
-                try:
-                    bev_xy = bev_projector.to_bev_meters(float(ug), float(vg))
-                except Exception:
-                    logger.exception("BEV projection of seated operator failed")
-
-        kpts_17x3 = np.column_stack([kpts_xy, kpts_conf])
-
-        pose_persons.append(
-            {
-                "id": person_id,
-                "global_id": gid,
-                "bbox": det.bbox_xyxy.astype(float).tolist(),
-                "keypoints": kpts_17x3,
-                "foot_px": (ug, vg),
-                "bev_xy": bev_xy,
-                # Real OSNet embedding from the identity manager (same feature space as global IDs).
-                "embedding": (track_embeddings or {}).get(det.track_id),
-            }
+        # ---- stream & clock -----------------------------------------------------------------------------------
+        logger.info("Opening video stream: %s", "(live camera)" if "://" in str(stream_cfg["source"])
+                    else stream_cfg["source"])
+        self.reader = VariableFPSVideoReader(
+            source=stream_cfg["source"],
+            drop_frames_on_lag=stream_cfg.get("drop_frames_on_lag", True),
+            reconnect_delay_sec=stream_cfg.get("reconnect_delay_sec", 3.0),
+            max_reconnect_delay_sec=stream_cfg.get("max_reconnect_delay_sec", 30.0),
+            rtsp_transport=stream_cfg.get("rtsp_transport", "tcp"),
+            read_timeout_sec=stream_cfg.get("read_timeout_sec", 5.0),
         )
-    return pose_persons
+        self.W, self.H = self.reader.width, self.reader.height
+        self.clock = StreamClock(self.reader.is_live,
+                                 StreamClock.parse_start_time(stream_cfg.get("recording_start_time")))
+        logger.info("Stream %dx%d @ %.1f nominal FPS (%s)", self.W, self.H, self.reader.nominal_fps,
+                    "live" if self.reader.is_live else "file")
 
-
-def draw_industrial_hud(
-    frame: np.ndarray,
-    detections: list[PoseDetection],
-    track_to_global: Dict[int, int],
-    identity_manager: EnterpriseIdentityManager,
-    fps_instant: float,
-    kpt_thresh: float = 0.20,
-    dir_tracker: Optional[DirectionalTracker] = None,
-) -> None:
-    for det in detections:
-        tid = det.track_id
-        gid = track_to_global.get(tid, -1)
-        x1, y1, x2, y2 = det.bbox_xyxy.astype(int)
-
-        if gid == -1:
-            box_color = (160, 160, 160)
-            status_tag = f"T:{tid} [INIT]"
-        elif det.is_intersecting:
-            box_color = (0, 140, 255)
-            status_tag = f"ID:{gid} [GALLERY LOCKED]"
+        # ---- detector, calibration, Re-ID ---------------------------------------------------------------------
+        self.detector = IndustrialPoseDetector(
+            model_weights=det_cfg["model_weights"], tracker_config=det_cfg["tracker_config"],
+            device=sys_cfg["device"], conf_thres=det_cfg.get("conf_thres", 0.08),
+            iou_thres=det_cfg.get("iou_thres", 0.6), imgsz=det_cfg.get("imgsz", 1536),
+            half=sys_cfg.get("half_precision", True),
+        )
+        calibration = load_calibration(calibration_path)
+        if calibration is not None:
+            logger.info("Ground calibration loaded from %s (clicked at %s)", calibration_path, calibration.image_wh)
+            src, dst, ref = calibration.image_points_px, calibration.world_points_m, calibration.image_wh
         else:
-            box_color = (0, 220, 0)
-            status_tag = f"ID:{gid}"
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2, cv2.LINE_AA)
-
-        for p1, p2 in SKELETON_LIMBS:
-            if det.keypoints_conf[p1] >= kpt_thresh and det.keypoints_conf[p2] >= kpt_thresh:
-                pt1 = tuple(det.keypoints_xy[p1].astype(int))
-                pt2 = tuple(det.keypoints_xy[p2].astype(int))
-                cv2.line(frame, pt1, pt2, (255, 220, 0), 2, cv2.LINE_AA)
-
-        ug, vg = int(det.ground_uv[0]), int(det.ground_uv[1])
-        cv2.circle(frame, (ug, vg), 6, (255, 255, 0), -1, cv2.LINE_AA)
-        cv2.circle(frame, (ug, vg), 9, (0, 0, 0), 2, cv2.LINE_AA)
-
-        bev_str = ""
-        if det.bev_xy is not None:
-            bev_str = f" | BEV:({det.bev_xy[0]:.1f}m, {det.bev_xy[1]:.1f}m)"
-
-        dir_str = ""
-        if dir_tracker is not None:
-            lookup_key = gid if gid != -1 else f"T_{tid}"
-            last_dir = dir_tracker.get_person_status(lookup_key)
-            if last_dir:
-                dir_str = f" | {last_dir}"
-
-        header_text = f"{status_tag}{bev_str}{dir_str}"
-        (tw, th_text), _ = cv2.getTextSize(header_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-        cv2.rectangle(frame, (x1, max(0, y1 - th_text - 10)), (x1 + tw + 8, y1), box_color, -1)
-        cv2.putText(
-            frame,
-            header_text,
-            (x1 + 4, max(15, y1 - 5)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 0, 0) if box_color != (160, 160, 160) else (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+            logger.warning("No %s: metric distances are NOT valid until scripts/calibrate_ground_plane.py is run "
+                           "for this camera.", calibration_path)
+            src, dst = bev_cfg.get("src_image_pts"), bev_cfg.get("dst_meter_pts")
+            ref = bev_cfg.get("calibration_ref_wh") or [self.W, self.H]
+        self.projector = MetricBEVProjector(src_image_pts=src, dst_meter_pts=dst,
+                                            default_px_per_meter=bev_cfg.get("default_px_per_meter", 110.0),
+                                            stream_wh=(self.W, self.H), calib_ref_wh=(int(ref[0]), int(ref[1])))
+        self.reid = PoseGuidedOSNetExtractor(
+            model_name=reid_cfg["model_name"], weights_path=reid_cfg.get("weights_path") or None,
+            device=sys_cfg["device"], kpt_conf_thresh=reid_cfg.get("kpt_conf_thresh", 0.20),
+            min_laplacian_var=reid_cfg.get("min_laplacian_var", 10.0),
+            head_branch_weight=reid_cfg.get("head_branch_weight", 0.35),
+            color_branch_weight=reid_cfg.get("color_branch_weight", 0.20),
+            min_gallery_height_px=reid_cfg.get("min_gallery_height_px", 72),
+            min_visible_kpts=reid_cfg.get("min_visible_kpts", 5),
         )
 
-    banner = (
-        f"Stream FPS: {fps_instant:.1f} | Active Frame Tracks: {len(detections)} | "
-        f"Total Registered IDs: {len(identity_manager.identities)}"
-    )
-    if dir_tracker is not None and (dir_tracker.lines or dir_tracker.entrance_zones):
-        banner += f" | IN: {dir_tracker.total_entries} OUT: {dir_tracker.total_exits}"
+        # ---- scene (zones, lines, regions, doors) -------------------------------------------------------------
+        self.scene = load_scene(cfg["scene"]["path"], settings=cfg).scaled((self.W, self.H))
+        logger.info("Scene: %d zones, %d lines, %d regions, %d exit doors", len(self.scene.zones),
+                    len(self.scene.lines), len(self.scene.regions), len(self.scene.exit_regions))
 
-    cv2.rectangle(frame, (10, 10), (920, 48), (20, 20, 20), -1)
-    cv2.putText(frame, banner, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 180), 2, cv2.LINE_AA)
+        # ---- optional helmet markers --------------------------------------------------------------------------
+        self.registry = None
+        marker_reader = None
+        mk = cfg["markers"]
+        if mk.get("enabled"):
+            from app.identity.markers import HelmetMarkerReader, WorkerRegistry
 
+            self.registry = WorkerRegistry(mk.get("registry_path"), mk.get("accept_unregistered", False))
+            marker_reader = HelmetMarkerReader(self.registry, mk.get("dictionary"),
+                                               int(mk.get("min_person_height_px", 120)))
+            logger.info("Helmet markers enabled: %d registered workers", len(self.registry.by_marker))
 
-def main(
-    config_path: str,
-    vehicle_config_path: str = "configs/vehicle_monitoring.yaml",
-    source_override: Optional[str] = None,
-    calibration_path: str = DEFAULT_CALIBRATION_PATH,
-) -> None:
-    cfg = load_config(config_path)
-    if source_override:
-        cfg["stream"]["source"] = source_override
-    sys_cfg = cfg["system"]
-    sys_cfg["device"], sys_cfg["half_precision"] = resolve_device(
-        sys_cfg.get("device", "cuda:0"), bool(sys_cfg.get("half_precision", True))
-    )
-    stream_cfg = cfg["stream"]
-    det_cfg = cfg["detection"]
-    reid_cfg = cfg["reid"]
-    bev_cfg = cfg["physics_bev"]
-    zones_cfg = cfg["zones"]
-
-    logger.info(f"Opening video stream: {stream_cfg['source']}")
-    reader = VariableFPSVideoReader(
-        source=stream_cfg["source"],
-        drop_frames_on_lag=stream_cfg.get("drop_frames_on_lag", True),
-        reconnect_delay_sec=stream_cfg.get("reconnect_delay_sec", 3.0),
-    )
-
-    laplacian_var = float(reid_cfg.get("min_laplacian_var", 10.0))
-    logger.info(
-        f"Stream Resolution: {reader.width}x{reader.height} @ {reader.nominal_fps:.1f} nominal FPS | "
-        f"Native Blur Gate: {laplacian_var:.1f}"
-    )
-
-    detector = IndustrialPoseDetector(
-        model_weights=det_cfg["model_weights"],
-        tracker_config=det_cfg["tracker_config"],
-        device=sys_cfg["device"],
-        conf_thres=det_cfg.get("conf_thres", 0.08),
-        iou_thres=det_cfg.get("iou_thres", 0.55),
-        imgsz=det_cfg.get("imgsz", 1536),
-        half=sys_cfg.get("half_precision", True),
-    )
-
-    # Ground calibration: configs/calibration.yaml (written by scripts/calibrate_ground_plane.py) wins;
-    # the physics_bev points in settings.yaml are only a fallback. ONE homography serves persons and vehicles.
-    calibration = load_calibration(calibration_path)
-    if calibration is not None:
-        logger.info(f"Ground calibration loaded from {calibration_path} (clicked at {calibration.image_wh})")
-        src_pts, dst_pts, ref_wh = calibration.image_points_px, calibration.world_points_m, calibration.image_wh
-    else:
-        logger.warning(
-            f"No {calibration_path}: using the physics_bev points of settings.yaml. Metric distances are only "
-            "as good as that calibration - run scripts/calibrate_ground_plane.py on this camera."
-        )
-        src_pts, dst_pts = bev_cfg.get("src_image_pts"), bev_cfg.get("dst_meter_pts")
-        ref_wh = tuple(bev_cfg.get("calibration_ref_wh", [reader.width, reader.height]))
-    bev_projector = MetricBEVProjector(
-        src_image_pts=src_pts,
-        dst_meter_pts=dst_pts,
-        default_px_per_meter=bev_cfg.get("default_px_per_meter", 110.0),
-        stream_wh=(reader.width, reader.height),
-        calib_ref_wh=(int(ref_wh[0]), int(ref_wh[1])),
-    )
-
-    reid_extractor = PoseGuidedOSNetExtractor(
-        model_name=reid_cfg["model_name"],
-        weights_path=reid_cfg.get("weights_path") or None,
-        device=sys_cfg["device"],
-        kpt_conf_thresh=reid_cfg.get("kpt_conf_thresh", 0.20),
-        min_laplacian_var=laplacian_var,
-        head_branch_weight=reid_cfg.get("head_branch_weight", 0.35),
-        color_branch_weight=reid_cfg.get("color_branch_weight", 0.20),
-        min_gallery_height_px=reid_cfg.get("min_gallery_height_px", 72),
-        min_visible_kpts=reid_cfg.get("min_visible_kpts", 5),
-    )
-
-    identity_manager = EnterpriseIdentityManager(
-        reid_extractor=reid_extractor,
-        bev_projector=bev_projector,
-        cos_sim_thresh=reid_cfg.get("cos_sim_thresh", 0.60),
-        spatial_recovery_sim_thresh=reid_cfg.get("spatial_recovery_sim_thresh", 0.48),
-        reentry_sim_thresh=reid_cfg.get("reentry_sim_thresh", 0.82),
-        max_worker_speed_mps=bev_cfg.get("max_worker_speed_mps", 3.5),
-        max_internal_occlusion_m=bev_cfg.get("max_internal_occlusion_m", 5.5),
-        lag_diffusion_coeff=bev_cfg.get("lag_diffusion_coeff", 0.65),
-        base_pose_jitter_m=bev_cfg.get("base_pose_jitter_m", 0.70),
-        reid_interval_sec=reid_cfg.get("reid_interval_sec", 0.35),
-        stitch_sim_thresh=reid_cfg.get("stitch_sim_thresh", 0.55),
-        stitch_margin=reid_cfg.get("stitch_margin", 0.04),
-        reentry_min_gap_sec=reid_cfg.get("reentry_min_gap_sec", 2.0),
-        reentry_margin=reid_cfg.get("reentry_margin", 0.08),
-        reentry_min_samples=reid_cfg.get("reentry_min_samples", 3),
-        occlusion_max_sec=reid_cfg.get("occlusion_max_sec", 20.0),
-        border_margin_ratio=reid_cfg.get("border_margin_ratio", 0.06),
-        track_gap_reset_sec=reid_cfg.get("track_gap_reset_sec", 1.5),
-        exit_edges=reid_cfg.get("exit_edges", ["left", "right", "top", "bottom"]),
-        exit_confirm_sec=reid_cfg.get("exit_confirm_sec", 0.8),
-        mismatch_min_span_sec=reid_cfg.get("mismatch_min_span_sec", 1.0),
-        anchor_min_height_px=reid_cfg.get("anchor_min_height_px", 110),
-        track_state_ttl_sec=reid_cfg.get("track_state_ttl_sec", 10.0),
-        identity_retention_sec=reid_cfg.get("identity_retention_sec", 3600.0),
-        max_exited_identities=reid_cfg.get("max_exited_identities", 300),
-        pool_max_samples=reid_cfg.get("pool_max_samples", 8),
-        pool_window_sec=reid_cfg.get("pool_window_sec", 4.0),
-        decision_log_path=reid_cfg.get("decision_log_path") or None,
-    )
-
-    zone_manager = MultiZoneManager(
-        zone_definitions=zones_cfg.get("definitions", {}),
-        entry_confirm_sec=zones_cfg.get("entry_confirm_sec", 0.50),
-        exit_confirm_sec=zones_cfg.get("exit_confirm_sec", 1.00),
-        force_exit_timeout_sec=zones_cfg.get("force_exit_timeout_sec", 15.0),
-    )
-
-    dir_tracker = DirectionalTracker(cfg)
-
-    # Initialize the modular Vehicle & Driver Monitoring Pipeline
-    vehicle_pipeline: Optional[VehicleMonitoringPipeline] = None
-    if Path(vehicle_config_path).exists():
-        logger.info(f"Initializing Vehicle & Driver Monitoring Module from: {vehicle_config_path}")
-        vehicle_pipeline = VehicleMonitoringPipeline(
-            config_path=vehicle_config_path,
-            reid_extractor=reid_extractor,
+        osc = reid_cfg["open_set"]
+        self.identity = EnterpriseIdentityManager(
+            reid_extractor=self.reid, bev_projector=self.projector,
+            cos_sim_thresh=reid_cfg["cos_sim_thresh"],
+            spatial_recovery_sim_thresh=reid_cfg["spatial_recovery_sim_thresh"],
+            reentry_sim_thresh=reid_cfg["reentry_sim_thresh"],
+            max_worker_speed_mps=bev_cfg["max_worker_speed_mps"],
+            max_internal_occlusion_m=bev_cfg["max_internal_occlusion_m"],
+            lag_diffusion_coeff=bev_cfg["lag_diffusion_coeff"], base_pose_jitter_m=bev_cfg["base_pose_jitter_m"],
+            reid_interval_sec=reid_cfg["reid_interval_sec"], stitch_sim_thresh=reid_cfg["stitch_sim_thresh"],
+            stitch_margin=reid_cfg["stitch_margin"], reentry_min_gap_sec=reid_cfg["reentry_min_gap_sec"],
+            reentry_margin=reid_cfg["reentry_margin"], reentry_min_samples=reid_cfg["reentry_min_samples"],
+            occlusion_max_sec=reid_cfg["occlusion_max_sec"], border_margin_ratio=reid_cfg["border_margin_ratio"],
+            track_gap_reset_sec=reid_cfg["track_gap_reset_sec"], exit_edges=reid_cfg["exit_edges"],
+            exit_confirm_sec=reid_cfg["exit_confirm_sec"], mismatch_min_span_sec=reid_cfg["mismatch_min_span_sec"],
+            anchor_min_height_px=reid_cfg["anchor_min_height_px"],
+            track_state_ttl_sec=reid_cfg["track_state_ttl_sec"],
+            identity_retention_sec=reid_cfg["identity_retention_sec"],
+            max_exited_identities=reid_cfg["max_exited_identities"],
+            pool_max_samples=reid_cfg["pool_max_samples"], pool_window_sec=reid_cfg["pool_window_sec"],
+            decision_log_path=reid_cfg.get("decision_log_path") or None,
+            recover_strict_after_sec=reid_cfg["recover_strict_after_sec"],
+            exit_regions={n: s["polygon"] for n, s in self.scene.exit_regions.items()},
+            open_set=OpenSetCalibrator(
+                base_threshold=reid_cfg["reentry_sim_thresh"], quantile=osc["quantile"], margin=osc["margin"],
+                min_samples=osc["min_samples"], max_threshold=osc["max_threshold"], enabled=osc["enabled"]),
+            impostor_sample_interval_sec=osc["sample_interval_sec"],
+            marker_reader=marker_reader,
+            marker_read_interval_sec=mk.get("read_interval_sec", 0.5),
+            marker_min_votes=mk.get("min_votes", 2), marker_vote_window_sec=mk.get("vote_window_sec", 4.0),
         )
 
-        # ONE homography for persons and vehicles: the projector's matrix is already scaled to the stream
-        # resolution. (The old code rebuilt it from the unscaled reference points -> two coordinate systems.)
-        if bev_projector.H is not None:
-            vehicle_pipeline.estimator.set_homography(bev_projector.H)
+        # identity persistence (auto = only for live cameras: re-running a clip must not "remember" it)
+        pers = reid_cfg["persistence"]
+        mode = persistence_mode(pers.get("mode", "auto"))
+        self.id_store = None
+        self._last_id_save = time.monotonic()
+        self.id_save_interval = float(pers.get("save_interval_sec", 60.0))
+        if mode == "on" or (mode == "auto" and self.reader.is_live):
+            from app.identity.store import IdentityStore
 
-    writer = None
-    out_path = sys_cfg.get("output_video_path")
-    if out_path:
-        Path(out_path).parent.mkdir(parents=True, exist_ok=True)  # cv2.VideoWriter fails silently otherwise
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, reader.nominal_fps, (reader.width, reader.height))
+            tag = f"{reid_cfg['model_name']}|{Path(str(reid_cfg.get('weights_path') or '')).name}"
+            store_dir = Path(pers.get("dir", "data/identity_store")) / self.camera_id   # local IDs are per camera
+            self.id_store = IdentityStore(str(store_dir), self.clock, model_tag=tag,
+                                          retention_sec=float(reid_cfg["identity_retention_sec"]))
+            self.id_store.load_into(self.identity, time.monotonic() if self.reader.is_live else 0.0)
 
-    win_title = "Enterprise Factory Re-ID & Zone Monitoring"
-    if sys_cfg.get("display_gui", True):
-        cv2.namedWindow(win_title, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win_title, min(1440, reader.width), min(900, reader.height))
+        # ---- cross-camera identity (same worker = same person id P# in every camera) --------------------------
+        self.linker = None
+        self._person_seen: Dict[int, int] = {}
+        cc = cfg["cross_camera"]
+        if cc.get("enabled"):
+            from app.multicam.registry import CameraTopology, CrossCameraLinker
 
-    prev_ts = time.monotonic()
-    fps_ema = reader.nominal_fps
+            Path(cc["registry_path"]).parent.mkdir(parents=True, exist_ok=True)
+            self.linker = CrossCameraLinker(
+                cc["registry_path"], self.camera_id, CameraTopology(cc.get("topology")),
+                link_threshold=cc["link_threshold"], margin=cc["margin"], min_obs=cc["min_obs"],
+                decide_after_sec=cc["decide_after_sec"], late_merge_sec=cc["late_merge_sec"],
+                retention_sec=cc["retention_sec"], sync_interval_sec=cc["sync_interval_sec"],
+            )
+            logger.info("Cross-camera identity enabled (registry %s)", cc["registry_path"])
+            if not self.reader.is_live and not stream_cfg.get("recording_start_time"):
+                logger.warning("Cross-camera identity with video FILES needs stream.recording_start_time for every "
+                               "camera, otherwise the clips are not aligned in time.")
 
-    logger.info("Pipeline initialized. Starting real-time inference loop...")
-    try:
-        while True:
-            ok, frame, frame_ts = reader.read()
+        # ---- events, alarms, analytics ------------------------------------------------------------------------
+        ev = cfg["events"]
+        self.events = EventStore(
+            db_path=ev.get("db_path"), csv_dir=ev.get("csv_dir"), snapshot_dir=ev.get("snapshot_dir"),
+            clock=self.clock, camera_id=self.camera_id, snapshot_types=ev.get("snapshot_event_types") or [],
+            retention_days=float(ev.get("retention_days", 0.0)), label_lookup=self._label_of,
+        )
+        self.alarms = AlarmDispatcher(cfg["alarms"])
+        self.events.subscribe(self.alarms.handle)
+        att = cfg["attribution"]
+        self.attribution = AttributionBuffer(lambda e: self.events.emit(e), att.get("timeout_sec", 20.0),
+                                             att.get("record_unidentified", True))
+        zc, cc = cfg["zones"], cfg["crossings"]
+        self.zones = ZoneAnalytics(self.scene.zones, zc["entry_confirm_sec"], zc["exit_confirm_sec"],
+                                   zc["lost_timeout_sec"])
+        self.include_unverified_in_zones = bool(zc.get("include_unverified", True))
+        self.crossings = CrossingAnalytics(
+            self.scene.lines, self.scene.regions, dead_band_px=cc["dead_band_px"], cooldown_sec=cc["cooldown_sec"],
+            max_gap_sec=cc["max_gap_sec"], segment_margin=cc["segment_margin"],
+            region_exit_confirm_sec=cc["region_exit_confirm_sec"], region_lost_sec=cc["region_lost_sec"],
+            draw_trails=cc.get("draw_trails", True),
+        )
+        self._provisional: Dict[int, float] = {}   # track ids used as "T<tid>" analytics keys -> last seen
+
+        # ---- forklifts ----------------------------------------------------------------------------------------
+        self.vehicles = None
+        if vehicle_config_path and Path(vehicle_config_path).exists():
+            from app.vehicle_monitoring.pipeline import VehicleMonitoringPipeline
+
+            self.vehicles = VehicleMonitoringPipeline(config_path=vehicle_config_path, device=sys_cfg["device"])
+            if not self.vehicles.cfg.get("enabled", True):
+                self.vehicles = None
+            elif self.projector.H is not None:
+                self.vehicles.estimator.set_homography(self.projector.H)   # ONE homography for people & vehicles
+            if self.vehicles is not None:
+                logger.info("Forklift / driver monitoring enabled (%s)", vehicle_config_path)
+
+        # ---- outputs ------------------------------------------------------------------------------------------
+        rec = cfg["recording"]
+        self.recorder = None
+        if rec.get("output_video_path"):
+            self.recorder = SegmentedVideoWriter(rec["output_video_path"], self.reader.nominal_fps, (self.W, self.H),
+                                                 rec.get("segment_minutes", 0.0), rec.get("max_segments", 96))
+        web = cfg["web"]
+        self.hub = TelemetryHub(web.get("stream_max_fps", 10.0), web.get("stream_width", 1280),
+                                jpeg_enabled=bool(web.get("enabled")))
+        self.hub.events_provider = lambda limit, sev: self.events.recent(limit, sev)
+        if web.get("enabled"):
+            start_web_service(self.hub, web.get("host", "127.0.0.1"), web.get("port", 8050), web.get("token", ""))
+        self.win_title = f"Factory Monitoring - {self.camera_id}"
+        if self.display:
+            cv2.namedWindow(self.win_title, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.win_title, min(1440, self.W), min(900, self.H))
+
+        self.max_frames = 0   # >0: stop after this many frames (--max-frames, smoke tests / benchmarks)
+        self._last_ts: Optional[float] = None
+        self.fps = 0.0
+        self.frames = 0
+        self.errors = 0
+        self.last_error = ""
+        self.started_wall = time.time()
+        self._prev_mono = time.monotonic()
+        self._last_publish = 0.0
+        self._last_heartbeat = 0.0
+        self._stop = False
+
+    # ------------------------------------------------------------------
+    def _label_of(self, gid: int) -> Optional[str]:
+        label = self.identity.identity_label(gid)
+        return self.registry.display_name(label) if (label and self.registry is not None) else label
+
+    def _route(self, ev: Dict[str, Any], frame: Optional[np.ndarray]) -> None:
+        """Alarms go out immediately (with a snapshot); other events of provisional tracks wait for the worker ID."""
+        if ev.get("severity") == ALARM:
+            self.events.emit(ev, frame)
+        else:
+            self.attribution.submit(ev)
+
+    # ------------------------------------------------------------------
+    def process(self, frame: np.ndarray, ts: float) -> np.ndarray:
+        self._last_ts = ts
+        active_tids = set(self.identity.track_to_global.keys())
+        detections = self.detector.track_frame(frame, active_track_ids=active_tids)
+        t2g = self.identity.process_frame(frame, detections, ts)
+
+        fsm = self.vehicles.fsm if self.vehicles is not None else None
+        # identity bookkeeping -> analytics state and event attribution
+        for old, new in self.identity.pop_merged():
+            self.zones.rename(old, new)
+            self.crossings.rename(old, new)
+            if fsm is not None:
+                fsm.rename_person(str(old), str(new))
+            self.events.add_alias(old, new, ts)
+            if self.linker is not None:
+                self.linker.notify_merge(old, new)
+            self._person_seen.pop(old, None)
+        if self.linker is not None:
+            self.linker.observe(self.identity, self.clock, ts)
+            for gid, pid in self.linker.links().items():
+                if self._person_seen.get(gid) != pid:
+                    self._person_seen[gid] = pid
+                    self.events.emit(make_event("PERSON_LINKED", ts, worker_id=gid, subject=f"P{pid}", value=pid))
+        for gid, label in self.identity.pop_labeled():
+            self.events.set_label(gid, label, ts)
+            self.events.emit(make_event("WORKER_IDENTIFIED", ts, worker_id=gid, subject=self._label_of(gid),
+                                        method="helmet_marker"))
+        for det in detections:
+            gid = t2g.get(det.track_id)
+            if gid is not None and det.track_id in self._provisional:
+                del self._provisional[det.track_id]
+                self.zones.promote(det.track_id, gid)
+                self.crossings.promote(det.track_id, gid)
+                if fsm is not None:
+                    fsm.rename_person(f"T{det.track_id}", str(gid))
+                self.attribution.resolve(det.track_id, gid)
+        exited = self.identity.pop_newly_exited()
+        for gid in exited:
+            for ev in self.zones.close_entity(gid, ts) + self.crossings.close_entity(gid, ts):
+                self._route(ev, frame)
+            ident = self.identity.identities.get(gid)
+            self.events.emit(make_event(
+                "WORKER_LEFT_CAMERA", ts, worker_id=gid, subject=None if ident is None else ident.exit_edge,
+                reason=None if ident is None else ident.exit_reason))
+
+        # zones / lines / regions
+        points_all: Dict[Any, Tuple[float, float]] = {}
+        for det in detections:
+            gid = t2g.get(det.track_id)
+            key = entity_key(gid, det.track_id)
+            if gid is None:
+                self._provisional[det.track_id] = ts
+            points_all[key] = det.ground_uv
+        zone_points = points_all if self.include_unverified_in_zones else {
+            k: v for k, v in points_all.items() if isinstance(k, int)}
+        for ev in self.zones.update(zone_points, ts):
+            self._route(ev, frame)
+        if self.crossings.enabled:
+            for ev in self.crossings.update(points_all, ts):
+                self._route(ev, frame)
+        self.attribution.tick(ts)
+        for tid in [t for t, last in self._provisional.items() if ts - last > 60.0]:
+            del self._provisional[tid]
+
+        # forklifts
+        draw = self.display or self.recorder is not None or self.hub.jpeg_enabled
+        if self.vehicles is not None:
+            embs = {d.track_id: self.identity.track_best_emb[d.track_id][0]
+                    for d in detections if d.track_id in self.identity.track_best_emb}
+            persons = build_persons_for_vehicle_monitor(detections, t2g, embs)
+            if self.registry is not None:
+                self.vehicles.dashboard.labels = {
+                    str(g): self._label_of(g) for g in t2g.values() if self.identity.identity_label(g)}
+            frame = self.vehicles.process_frame(frame, external_persons=persons, frame_ts=ts,
+                                                left_view_ids=[str(g) for g in exited], draw=draw)
+            for ev in self.vehicles.last_events:
+                self._route(ev, frame)
+
+        if draw:
+            self.zones.draw(frame, ts)
+            self.crossings.draw(frame, active_keys=set(points_all))
+            self._draw_people(frame, detections, t2g)
+            self._draw_banner(frame)
+        self._publish(ts, detections, t2g, frame)
+        return frame
+
+    # ------------------------------------------------------------------
+    def _draw_people(self, frame: np.ndarray, detections: List[PoseDetection], t2g: Dict[int, int]) -> None:
+        drivers = self.vehicles.fsm.driver_of if self.vehicles is not None else {}
+        for det in detections:
+            gid = t2g.get(det.track_id)
+            x1, y1, x2, y2 = det.bbox_xyxy.astype(int)
+            if gid is None:
+                color, tag = (160, 160, 160), f"T:{det.track_id} [INIT]"
+            else:
+                label = self._label_of(gid)
+                color = (0, 140, 255) if det.is_intersecting else (0, 220, 0)
+                pid = self._person_seen.get(gid)
+                tag = f"ID:{gid}" + (f" P{pid}" if pid is not None else "") + (f" {label}" if label else "")
+            key = entity_key(gid, det.track_id)
+            zones = self.zones.zones_of(key)
+            if zones:
+                tag += " @" + ",".join(zones)
+            last = self.crossings.last_label.get(key)
+            if last:
+                tag += f" | {last}"
+            vid = drivers.get(str(gid) if gid is not None else f"T{det.track_id}")
+            if vid is not None:
+                tag += f" | DRIVER F#{vid}"
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+            for p1, p2 in SKELETON_LIMBS:
+                if det.keypoints_conf[p1] >= 0.2 and det.keypoints_conf[p2] >= 0.2:
+                    cv2.line(frame, tuple(det.keypoints_xy[p1].astype(int)), tuple(det.keypoints_xy[p2].astype(int)),
+                             (255, 220, 0), 2, cv2.LINE_AA)
+            ug, vg = int(det.ground_uv[0]), int(det.ground_uv[1])
+            cv2.circle(frame, (ug, vg), 6, (255, 255, 0) if not det.ground_extrapolated else (0, 165, 255), -1)
+            (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            cv2.rectangle(frame, (x1, max(0, y1 - th - 10)), (x1 + tw + 8, y1), color, -1)
+            cv2.putText(frame, tag, (x1 + 4, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (255, 255, 255) if gid is None else (0, 0, 0), 2, cv2.LINE_AA)
+
+    def _draw_banner(self, frame: np.ndarray) -> None:
+        st = self.identity.stats()
+        txt = (f"{self.camera_id} | FPS {self.fps:.1f} | IDs active {st['active']} / known {st['identities']} | "
+               f"re-entry thr {self.identity.reentry_threshold():.2f}")
+        if self.crossings.enabled:
+            totals: Dict[str, int] = {}
+            for counts in self.crossings.counts.values():
+                for k, v in counts.items():
+                    totals[k] = totals.get(k, 0) + v
+            txt += " | " + " ".join(f"{k}:{v}" for k, v in totals.items())
+        cv2.rectangle(frame, (10, 10), (min(frame.shape[1] - 10, 20 + 11 * len(txt)), 48), (20, 20, 20), -1)
+        cv2.putText(frame, txt, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 180), 2, cv2.LINE_AA)
+
+    def _status(self) -> Dict[str, Any]:
+        return {
+            "camera_id": self.camera_id,
+            "wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "uptime_sec": round(time.time() - self.started_wall, 1),
+            "fps": round(self.fps, 2),
+            "frames": self.frames,
+            "consecutive_errors": self.errors,
+            "last_error": self.last_error,
+            "stream": self.reader.status(),
+            "identity": self.identity.stats(),
+            "cross_camera": None if self.linker is None else {
+                "linked_local_ids": len(self._person_seen), "link_threshold": round(self.linker.threshold(), 3)},
+            "events": {"written": self.events.n_written, "failed": self.events.n_failed},
+            "active_alarms": [
+                {"vehicle_id": v.vehicle_id, "type": v.alarm_type, "driver_id": v.associated_driver_id}
+                for v in (self.vehicles.fsm.vehicles.values() if self.vehicles is not None else []) if v.alarm_active
+            ],
+        }
+
+    def _publish(self, ts: float, detections: List[PoseDetection], t2g: Dict[int, int], frame: np.ndarray) -> None:
+        now = time.monotonic()
+        if now - self._last_publish < 0.5 and not self.hub.jpeg_enabled:
+            return
+        self._last_publish = now
+        persons = []
+        for det in detections:
+            gid = t2g.get(det.track_id)
+            key = entity_key(gid, det.track_id)
+            persons.append({"worker_id": gid, "person_id": self._person_seen.get(gid),
+                            "label": self._label_of(gid) if gid is not None else None,
+                            "track_id": det.track_id, "bbox": [round(float(v), 1) for v in det.bbox_xyxy],
+                            "zones": self.zones.zones_of(key)})
+        telemetry = {
+            "time": self.clock.iso(ts),
+            "persons": persons,
+            "zones": self.zones.snapshot(ts),
+            "zone_totals": {str(k): v for k, v in self.zones.worker_totals(ts).items()},
+            "crossings": self.crossings.snapshot(),
+            "vehicles": self.vehicles.telemetry(ts) if self.vehicles is not None else [],
+        }
+        self.hub.publish(self._status(), telemetry, frame)
+
+    def _heartbeat(self) -> None:
+        if not self.heartbeat_path or time.monotonic() - self._last_heartbeat < 5.0:
+            return
+        self._last_heartbeat = time.monotonic()
+        try:
+            p = Path(self.heartbeat_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._status(), default=str, indent=1), encoding="utf-8")
+            os.replace(tmp, p)
+        except Exception:
+            logger.exception("Heartbeat write failed")
+
+    def _maybe_save_identities(self, force: bool = False) -> None:
+        if self.id_store is None:
+            return
+        if force or time.monotonic() - self._last_id_save >= self.id_save_interval:
+            self._last_id_save = time.monotonic()
+            try:
+                self.id_store.save(self.identity)
+            except Exception:
+                logger.exception("Identity store save failed")
+
+    # ------------------------------------------------------------------
+    def stop(self, *_: Any) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        logger.info("Pipeline initialised. Processing...")
+        last_wait_log = 0.0
+        while not self._stop:
+            ok, frame, ts = self.reader.read()
             if not ok or frame is None:
-                logger.info("End of stream reached.")
-                break
+                if self.reader.ended:
+                    logger.info("End of stream reached.")
+                    break
+                stalled = self.reader.status()["seconds_since_last_frame"]
+                if time.monotonic() - last_wait_log > 10.0:
+                    last_wait_log = time.monotonic()
+                    logger.warning("No frame from the camera for %.0f s (reconnecting)", stalled)
+                if self.max_stall_sec > 0 and stalled > self.max_stall_sec:
+                    raise RuntimeError(f"camera stalled for {stalled:.0f} s")
+                self._heartbeat()
+                continue
 
-            now_wall = time.monotonic()
-            dt_wall = max(1e-3, now_wall - prev_ts)  # real processing rate, not the video's nominal FPS
-            fps_ema = 0.9 * fps_ema + 0.1 * (1.0 / dt_wall)
-            prev_ts = now_wall
+            now = time.monotonic()
+            self.fps = 0.9 * self.fps + 0.1 * (1.0 / max(1e-3, now - self._prev_mono)) if self.frames else 0.0
+            self._prev_mono = now
+            self.frames += 1
+            try:
+                frame = self.process(frame, ts)
+                self.errors = 0
+            except Exception as e:
+                self.errors += 1
+                self.last_error = f"{type(e).__name__}: {e}"
+                logger.exception("Frame %d failed (%d consecutive)", self.frames, self.errors)
+                if self.errors >= self.max_errors:
+                    raise
+                continue
 
-            active_tids = set(identity_manager.track_to_global.keys())
-            detections = detector.track_frame(frame, active_track_ids=active_tids)
-            track_to_global = identity_manager.process_frame(frame, detections, frame_ts)
-
-            # Build ground points for both verified Global IDs (for zones) and all tracks (for tripwires)
-            active_ground_points: Dict[int, Tuple[float, float]] = {}
-            all_directional_points: Dict[Any, Tuple[float, float]] = {}
-            for det in detections:
-                gid = track_to_global.get(det.track_id)
-                if gid is not None and gid != -1:
-                    active_ground_points[gid] = det.ground_uv
-                    dir_tracker.promote_track_to_global(det.track_id, gid)
-                    all_directional_points[gid] = det.ground_uv
-                else:
-                    all_directional_points[f"T_{det.track_id}"] = det.ground_uv
-
-            zone_events = zone_manager.update_all(active_ground_points, frame_ts)
-            for ev in zone_events:
-                logger.info(f"ZONE EVENT: {ev}")
-
-            # Update Directional Tracking (Line-Crossing & Entrance/Exit Gate Zones)
-            dir_events = dir_tracker.update_all(all_directional_points, frame_ts)
-            for dev in dir_events:
-                logger.info(f"DIRECTION EVENT: {dev}")
-
-            # Workers who just LEFT the camera (reported once by the identity manager, which also unbinds
-            # their tracks so a newcomer can never inherit the departed worker's ID).
-            # Identities merged by the self-healing consolidation: move zone/direction state to the survivor
-            # so the same worker is not counted twice.
-            for old_gid, new_gid in identity_manager.pop_merged():
-                zone_manager.rename_identity(old_gid, new_gid)
-                dir_tracker.rename_entity(old_gid, new_gid)
-
-            for gid_left in identity_manager.pop_newly_exited():
-                dir_tracker.exited_camera_ids.add(gid_left)
-                logger.info(f"ID:{gid_left} left the camera view")
-
-            # Run Vehicle & Driver Monitoring using YOLO-Pose detections (with seated-driver lock)
-            if vehicle_pipeline is not None:
-                track_embeddings = {
-                    d.track_id: identity_manager.track_best_emb[d.track_id][0]
-                    for d in detections
-                    if d.track_id in identity_manager.track_best_emb
-                }
-                pose_persons = build_pose_persons_for_vehicle_monitor(
-                    detections=detections,
-                    track_to_global=track_to_global,
-                    bev_projector=bev_projector,
-                    track_embeddings=track_embeddings,
-                )
-                frame = vehicle_pipeline.process_frame(
-                    frame=frame,
-                    external_persons=pose_persons,
-                    frame_ts=frame_ts,
-                )
-
-            if sys_cfg.get("display_gui", True) or writer is not None:
-                zone_manager.draw_zones(frame)
-                dir_tracker.draw_overlays(frame, active_gids=set(all_directional_points.keys()))
-                draw_industrial_hud(
-                    frame=frame,
-                    detections=detections,
-                    track_to_global=track_to_global,
-                    identity_manager=identity_manager,
-                    fps_instant=fps_ema,
-                    kpt_thresh=reid_cfg.get("kpt_conf_thresh", 0.20),
-                    dir_tracker=dir_tracker,
-                )
-
-            if writer is not None:
-                writer.write(frame)
-
-            if sys_cfg.get("display_gui", True):
-                cv2.imshow(win_title, frame)
+            if self.recorder is not None:
+                self.recorder.write(frame, self.clock.wall(ts))
+            if self.display:
+                cv2.imshow(self.win_title, frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     logger.info("User requested exit ('q').")
                     break
+            self._heartbeat()
+            self._maybe_save_identities()
+            if self.max_frames and self.frames >= self.max_frames:
+                logger.info("Stopping after %d frames (--max-frames).", self.frames)
+                break
 
+    def _close_open_records(self) -> None:
+        """Visits and driver sessions still in progress are recorded up to now (otherwise a stop loses them)."""
+        if self._last_ts is None:
+            return
+        events = self.zones.close_all(self._last_ts)
+        if self.vehicles is not None:
+            events += self.vehicles.fsm.close_all(self._last_ts)
+        for ev in events:
+            self._route(ev, None)
+
+    def close(self) -> None:
+        for name, fn in (
+            ("open visits / sessions", self._close_open_records),
+            ("attribution", self.attribution.flush_all),
+            ("identity store", lambda: self._maybe_save_identities(force=True)),
+            ("identity log", self.identity.close),
+            ("cross-camera linker", self.linker.close if self.linker else (lambda: None)),
+            ("events", self.events.close),
+            ("alarms", self.alarms.close),
+            ("recorder", self.recorder.close if self.recorder else (lambda: None)),
+            ("reader", self.reader.release),
+        ):
+            try:
+                fn()
+            except Exception:
+                logger.exception("Shutdown step '%s' failed", name)
+        if self.display:
+            cv2.destroyAllWindows()
+
+
+def resolve_run_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str], str]:
+    """-> (settings, forklift config path or None, calibration path) for single- or multi-camera runs."""
+    if args.cameras or args.camera_id:
+        from app.multicam.cameras import DEFAULT_CAMERAS_PATH, camera_ids, load_camera_setup
+
+        cameras_path = args.cameras or DEFAULT_CAMERAS_PATH
+        camera_id = args.camera_id
+        if not camera_id:
+            ids = camera_ids(cameras_path)
+            if len(ids) != 1:
+                raise SystemExit(f"--camera-id is required ({cameras_path} defines {ids}); to run them all use "
+                                 "run_multi_camera.py")
+            camera_id = ids[0]
+        setup = load_camera_setup(cameras_path, camera_id)
+        cfg, vehicle_config, calibration = setup.settings, setup.vehicle_config, setup.calibration
+    else:
+        cfg, vehicle_config, calibration = load_settings(args.config), args.vehicle_config, args.calibration
+    if args.source:
+        cfg["stream"]["source"] = args.source
+    if args.no_gui:
+        cfg["system"]["display_gui"] = False
+    for item in args.set or []:
+        apply_override(cfg, item)
+    return cfg, vehicle_config, calibration
+
+
+def apply_override(cfg: Dict[str, Any], item: str) -> None:
+    """--set section.key=value (value parsed as YAML), checked against the known settings and their types."""
+    import yaml
+
+    from app.core.config import validate
+
+    key, sep, raw = item.partition("=")
+    parts = [p for p in key.strip().split(".") if p]
+    if not sep or not parts:
+        raise SystemExit(f"--set expects section.key=value, got '{item}'")
+    nested: Dict[str, Any] = {}
+    node = nested
+    for p in parts[:-1]:
+        node = node.setdefault(p, {})
+    node[parts[-1]] = yaml.safe_load(raw)
+    errors, warnings = validate(nested)
+    if errors or warnings:
+        raise SystemExit(f"--set {item}: " + "; ".join(errors + warnings))
+    node = cfg
+    for p in parts[:-1]:
+        node = node[p]
+    node[parts[-1]] = yaml.safe_load(raw)
+
+
+def run_once(cfg: Dict[str, Any], vehicle_config: Optional[str], calibration: str, max_frames: int = 0) -> None:
+    monitor = FactoryMonitor(cfg, vehicle_config or "", calibration)
+    monitor.max_frames = int(max_frames)
+    for name in ("SIGTERM", "SIGBREAK"):   # SIGBREAK: graceful stop sent by run_multi_camera.py on Windows
+        try:
+            signal.signal(getattr(signal, name), monitor.stop)
+        except (ValueError, AttributeError, OSError):
+            pass
+    try:
+        monitor.run()
     except KeyboardInterrupt:
         logger.info("Interrupted by user. Shutting down...")
     finally:
-        identity_manager.close()
-        if vehicle_pipeline is not None:
-            vehicle_pipeline.logger.close()
-        reader.release()
-        if writer is not None:
-            writer.release()
-        cv2.destroyAllWindows()
+        monitor.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Factory monitoring: worker identity, zones, lines, forklift safety")
+    parser.add_argument("--config", default="configs/settings.yaml")
+    parser.add_argument("--vehicle-config", default="configs/vehicle_monitoring.yaml",
+                        help="forklift module config (missing file or enabled:false = module off)")
+    parser.add_argument("--source", default=None, help="video file / RTSP URL (overrides the settings)")
+    parser.add_argument("--calibration", default=DEFAULT_CALIBRATION_PATH)
+    parser.add_argument("--cameras", default=None,
+                        help="multi-camera list (configs/cameras.yaml); use with --camera-id")
+    parser.add_argument("--camera-id", default=None, help="which camera of --cameras this process runs")
+    parser.add_argument("--no-gui", action="store_true", help="no display window (service mode)")
+    parser.add_argument("--max-frames", type=int, default=0, help="stop after N frames (tests / benchmarks)")
+    parser.add_argument("--set", action="append", metavar="SECTION.KEY=VALUE",
+                        help="override one setting for this run, e.g. --set reid.reentry_sim_thresh=0.85 "
+                             "(repeatable)")
+    parser.add_argument("--restart-on-failure", action="store_true",
+                        help="live cameras: rebuild the pipeline after a fatal error instead of exiting")
+    args = parser.parse_args()
+
+    cfg, vehicle_config, calibration = resolve_run_config(args)
+    setup_logging(cfg["system"].get("log_dir", "logs"), cfg["system"].get("log_level", "INFO"))
+    delay = 10.0
+    while True:
+        try:
+            run_once(cfg, vehicle_config, calibration, args.max_frames)
+            return 0
+        except KeyboardInterrupt:
+            return 0
+        except Exception:
+            logger.exception("Fatal error in the monitoring pipeline")
+            if not args.restart_on_failure:
+                return 1
+            logger.info("Restarting in %.0f s ...", delay)
+            time.sleep(delay)
+            delay = min(300.0, delay * 2.0)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Enterprise Pose-Guided Re-ID & Zone Monitoring")
-    parser.add_argument("--config", type=str, default="configs/settings.yaml", help="Path to settings.yaml")
-    parser.add_argument(
-        "--vehicle-config",
-        type=str,
-        default="configs/vehicle_monitoring.yaml",
-        help="Path to vehicle_monitoring.yaml",
-    )
-    parser.add_argument("--source", type=str, default=None, help="Video file / RTSP URL (overrides settings.yaml)")
-    parser.add_argument("--calibration", type=str, default=DEFAULT_CALIBRATION_PATH,
-                        help="Ground calibration file written by scripts/calibrate_ground_plane.py")
-    args = parser.parse_args()
-    main(args.config, args.vehicle_config, args.source, args.calibration)
+    raise SystemExit(main())

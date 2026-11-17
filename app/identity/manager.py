@@ -7,10 +7,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from app.detection.detector import PoseDetection
+from app.identity.open_set import OpenSetCalibrator
 from app.identity.reid_model import CropQualityReport, PoseGuidedOSNetExtractor
 from app.logic.geometry import (
     MetricBEVProjector,
@@ -58,8 +60,10 @@ class WorkerIdentity:
     # Lifecycle: an EXITED identity may only be recovered through the strict re-entry gate.
     status: str = STATUS_ACTIVE
     exit_ts: float = 0.0
-    exit_reason: str = ""  # "BORDER" | "TIMEOUT"
-    exit_edge: str = ""
+    exit_reason: str = ""  # "BORDER" | "DOOR" | "TIMEOUT" | "RESTART"
+    exit_edge: str = ""    # border edge, or exit-region (door) name
+    # Hard identity from a helmet marker (app/identity/markers.py): never matched/merged with another label.
+    label: Optional[str] = None
 
     def add_clean_observation(
         self,
@@ -195,6 +199,14 @@ class EnterpriseIdentityManager:
         decision_log_max_mb: float = 50.0,
         pool_max_samples: int = 8,
         pool_window_sec: float = 4.0,
+        recover_strict_after_sec: float = 4.0,
+        exit_regions: Optional[Dict[str, Sequence[Sequence[float]]]] = None,
+        open_set: Optional[OpenSetCalibrator] = None,
+        impostor_sample_interval_sec: float = 1.0,
+        marker_reader: Any = None,
+        marker_read_interval_sec: float = 0.5,
+        marker_min_votes: int = 2,
+        marker_vote_window_sec: float = 4.0,
     ):
         self.reid = reid_extractor
         self.bev = bev_projector
@@ -237,6 +249,27 @@ class EnterpriseIdentityManager:
         # uses the quality-weighted mean of the recent samples instead of a single (possibly bad) frame.
         self.pool_max_samples = int(pool_max_samples)
         self.pool_window_sec = float(pool_window_sec)
+
+        # Long in-scene occlusions are as risky as re-entries (a newcomer from a mid-scene door may be "recovered"
+        # as the hidden worker): after this many seconds the open-set threshold and margin apply there too.
+        self.recover_strict_after_sec = float(recover_strict_after_sec)
+        # Doors INSIDE the image (polygons in stream pixels): vanishing there = leaving the camera.
+        self.exit_regions: Dict[str, np.ndarray] = {
+            name: np.asarray(poly, dtype=np.float32).reshape(-1, 2) for name, poly in (exit_regions or {}).items()
+        }
+        # Self-calibrating re-entry threshold (impostor distribution of this site; see app/identity/open_set.py)
+        self.open_set = open_set if open_set is not None else OpenSetCalibrator(reentry_sim_thresh, enabled=False)
+        self.impostor_sample_interval_sec = float(impostor_sample_interval_sec)
+        self._last_impostor_ts = -1e18
+        # Optional helmet markers (hard identity)
+        self.marker_reader = marker_reader
+        self.marker_read_interval_sec = float(marker_read_interval_sec)
+        self.marker_min_votes = int(marker_min_votes)
+        self.marker_vote_window_sec = float(marker_vote_window_sec)
+        self.track_marker_votes: Dict[int, Deque[Tuple[float, str]]] = {}
+        self.track_last_marker_ts: Dict[int, float] = {}
+        self.track_label: Dict[int, str] = {}
+        self._labeled: List[Tuple[int, str]] = []
 
         self.track_last_seen_ts: Dict[int, float] = {}
         # tid -> deque of (embedding, weight, view_bin, gallery_valid, ts, sharpness)
@@ -316,6 +349,40 @@ class EnterpriseIdentityManager:
         out, self._merged = self._merged, []
         return out
 
+    def pop_labeled(self) -> List[Tuple[int, str]]:
+        """(gid, label) pairs that received a marker identity since the last call."""
+        out, self._labeled = self._labeled, []
+        return out
+
+    def identity_label(self, gid: int) -> Optional[str]:
+        ident = self.identities.get(int(gid))
+        return None if ident is None else ident.label
+
+    def reentry_threshold(self) -> float:
+        """Similarity required to give an ID back to someone who LEFT (configured value or learned site value)."""
+        return max(self.reentry_sim_thresh, self.open_set.threshold())
+
+    def stats(self) -> Dict[str, Any]:
+        n_exited = sum(1 for i in self.identities.values() if i.status == STATUS_EXITED)
+        return {
+            "identities": len(self.identities),
+            "active": len(self.identities) - n_exited,
+            "exited": n_exited,
+            "labeled": sum(1 for i in self.identities.values() if i.label),
+            "next_global_id": self._next_global_id,
+            "open_set": self.open_set.stats(),
+        }
+
+    def _in_exit_region(self, uv: Tuple[float, float]) -> Optional[str]:
+        for name, poly in self.exit_regions.items():
+            if cv2.pointPolygonTest(poly, (float(uv[0]), float(uv[1])), False) >= 0:
+                return name
+        return None
+
+    @staticmethod
+    def _labels_conflict(a: Optional[str], b: Optional[str]) -> bool:
+        return a is not None and b is not None and a != b
+
     # ------------------------------------------------------------------
     # Track bookkeeping
     # ------------------------------------------------------------------
@@ -332,6 +399,9 @@ class EnterpriseIdentityManager:
             self.track_first_seen_ts.pop(tid, None)
             self.track_best_emb.pop(tid, None)
             self.track_emb_buffer.pop(tid, None)
+            self.track_marker_votes.pop(tid, None)
+            self.track_last_marker_ts.pop(tid, None)
+            self.track_label.pop(tid, None)
             if forget_last_seen:
                 self.track_last_seen_ts.pop(tid, None)
         self.track_separated_coexisted_tracks = {
@@ -445,6 +515,10 @@ class EnterpriseIdentityManager:
                 )
                 if edge is not None:
                     self._mark_exited(ident, frame_ts, "BORDER", edge)
+                    continue
+                door = self._in_exit_region(ident.last_ground_uv) if self.exit_regions else None
+                if door is not None:
+                    self._mark_exited(ident, frame_ts, "DOOR", door)
                     continue
             if absent >= self.occlusion_max_sec:
                 self._mark_exited(ident, frame_ts, "TIMEOUT")
@@ -673,8 +747,12 @@ class EnterpriseIdentityManager:
             best_old_gid: Optional[int] = None
             best_merge_sim: float = 0.0
 
+            best_needs_margin = False
             for gid_old, ident_old in list(self.identities.items()):
                 if gid_old >= gid_new or gid_old in used_global_ids:
+                    continue
+                # Two different helmet markers = two different people, whatever the appearance says.
+                if self._labels_conflict(ident_old.label, ident_new.label):
                     continue
                 # Cannot merge if they ever co-existed as two separate people!
                 if (
@@ -697,6 +775,7 @@ class EnterpriseIdentityManager:
                     continue
 
                 req_sim = 0.64 if dist_m <= 1.8 else 0.70
+                needs_margin = False
                 if ident_old.status == STATUS_EXITED:
                     # Someone who LEFT may only be re-merged under the SAME rules as the strict re-entry gate
                     # (otherwise "reject at the gate -> mint new ID -> merge back" bypasses the gate):
@@ -704,13 +783,21 @@ class EnterpriseIdentityManager:
                     if ident_new.n_obs < self.reentry_min_samples:
                         continue
                     quick = (ident_new.created_ts - ident_old.last_seen_ts) < self.reentry_min_gap_sec
-                    req_sim = max(req_sim, self.reentry_sim_thresh + (0.08 if quick else 0.0))
+                    req_sim = max(req_sim, self.reentry_threshold() + (0.08 if quick else 0.0))
+                    needs_margin = True
+                elif dt_gap > self.recover_strict_after_sec:
+                    # long in-scene occlusion: same open-set rule as RECOVER_LONG
+                    req_sim = max(req_sim, self.reentry_threshold() - 0.06)
+                    needs_margin = True
                 gal_sim = ident_old.compute_gallery_to_gallery_similarity(ident_new)
                 if gal_sim >= req_sim and gal_sim > best_merge_sim:
                     best_merge_sim = gal_sim
                     best_old_gid = gid_old
+                    best_needs_margin = needs_margin
 
-            if best_old_gid is not None and self.identities[best_old_gid].status == STATUS_EXITED:
+            if best_old_gid is not None and best_needs_margin and not (
+                ident_new.label is not None and ident_new.label == self.identities[best_old_gid].label
+            ):
                 # Negative evidence for people who LEFT: the new identity must be clearly closer to this one
                 # than to ANY other identity (exited lookalikes and currently visible workers included).
                 runner_up = max(
@@ -729,32 +816,193 @@ class EnterpriseIdentityManager:
                     best_old_gid = None
 
             if best_old_gid is not None:
-                ident_old = self.identities[best_old_gid]
-                # Merge gallery & state from ident_new into ident_old
-                for v_bin, feats in ident_new.view_gallery.items():
-                    for f in feats:
-                        ident_old.add_clean_observation(f, v_bin, sharpness=25.0, is_isolated=True)
-                ident_old.verified_coexisted_gids.update(ident_new.verified_coexisted_gids)
-                ident_old.coexisted_track_ids.update(ident_new.coexisted_track_ids)
-                ident_old.last_seen_ts = ident_new.last_seen_ts
-                ident_old.last_bev_xy = ident_new.last_bev_xy
-                ident_old.last_ground_uv = ident_new.last_ground_uv
-                ident_old.last_height_px = ident_new.last_height_px
-                ident_old.last_bbox_xyxy = ident_new.last_bbox_xyxy
-                ident_old.px_velocity = ident_new.px_velocity
-                ident_old.last_track_id = tid
-                ident_old.status = STATUS_ACTIVE
-                ident_old.exit_reason = ""
-                self._log_decision(
-                    "MERGED", frame_ts, tid=tid, gid_new=gid_new, gid_old=best_old_gid, gallery_sim=best_merge_sim,
-                )
+                self._merge_into(gid_new, best_old_gid, tid, frame_ts, resolved_assignments, used_global_ids,
+                                 gallery_sim=best_merge_sim, reason="APPEARANCE")
 
-                self.track_to_global[tid] = best_old_gid
-                resolved_assignments[tid] = best_old_gid
-                used_global_ids.discard(gid_new)
-                used_global_ids.add(best_old_gid)
-                del self.identities[gid_new]
-                self._merged.append((gid_new, best_old_gid))
+    def _merge_into(
+        self, gid_src: int, gid_dst: int, tid: int, frame_ts: float, resolved_assignments: Dict[int, int],
+        used_global_ids: Set[int], gallery_sim: Optional[float] = None, reason: str = "APPEARANCE",
+    ) -> None:
+        """Identity `gid_src` is the same worker as the older `gid_dst`: fold it in and report the merge."""
+        ident_new = self.identities[gid_src]
+        ident_old = self.identities[gid_dst]
+        for v_bin, feats in ident_new.view_gallery.items():
+            for f in feats:
+                ident_old.add_clean_observation(f, v_bin, sharpness=25.0, is_isolated=True)
+        for a in ident_new.anchor_embeddings:
+            if len(ident_old.anchor_embeddings) < 3:
+                ident_old.anchor_embeddings.append(a.copy())
+        ident_old.verified_coexisted_gids.update(ident_new.verified_coexisted_gids - {gid_dst})
+        ident_old.coexisted_track_ids.update(ident_new.coexisted_track_ids)
+        ident_old.last_seen_ts = ident_new.last_seen_ts
+        ident_old.last_bev_xy = ident_new.last_bev_xy
+        ident_old.last_ground_uv = ident_new.last_ground_uv
+        ident_old.last_height_px = ident_new.last_height_px
+        ident_old.last_bbox_xyxy = ident_new.last_bbox_xyxy
+        ident_old.px_velocity = ident_new.px_velocity
+        ident_old.last_track_id = tid
+        ident_old.status = STATUS_ACTIVE
+        ident_old.exit_reason = ""
+        ident_old.mismatch_streak = 0
+        if ident_old.label is None and ident_new.label is not None:
+            ident_old.label = ident_new.label
+            self._labeled.append((gid_dst, ident_old.label))
+        self._log_decision(
+            "MERGED", frame_ts, tid=tid, gid_new=gid_src, gid_old=gid_dst, gallery_sim=gallery_sim, reason=reason,
+        )
+        for t in [t for t, g in self.track_to_global.items() if g == gid_src]:
+            self.track_to_global[t] = gid_dst
+            if t in resolved_assignments:
+                resolved_assignments[t] = gid_dst
+        self.track_to_global[tid] = gid_dst
+        resolved_assignments[tid] = gid_dst
+        used_global_ids.discard(gid_src)
+        used_global_ids.add(gid_dst)
+        for ident in self.identities.values():
+            if gid_src in ident.verified_coexisted_gids:
+                ident.verified_coexisted_gids.discard(gid_src)
+                if ident.global_id != gid_dst:
+                    ident.verified_coexisted_gids.add(gid_dst)
+        self.pair_coexistence_counts = {
+            k: v for k, v in self.pair_coexistence_counts.items() if gid_src not in k
+        }
+        del self.identities[gid_src]
+        self._merged.append((gid_src, gid_dst))
+
+    # ------------------------------------------------------------------
+    # Open-set calibration: impostor samples from workers visible at the same time
+    # ------------------------------------------------------------------
+    def _sample_impostors(self, detections: List[PoseDetection], resolved: Dict[int, int], frame_ts: float) -> None:
+        if not self.open_set.enabled or frame_ts - self._last_impostor_ts < self.impostor_sample_interval_sec:
+            return
+        self._last_impostor_ts = frame_ts
+        items = []
+        for det in detections:
+            gid = resolved.get(det.track_id)
+            if gid is None or not det.is_isolated or det.is_intersecting:
+                continue
+            emb, view, n, _ = self._track_pooled_embedding(det.track_id, frame_ts, valid_only=True)
+            if emb is None or n < 2 or self.identities[gid].n_obs < 3:
+                continue
+            items.append((gid, emb, view))
+        pairs = 0
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                gid_a, emb_a, view_a = items[i]
+                gid_b, emb_b, view_b = items[j]
+                if gid_a == gid_b:
+                    continue
+                # simultaneously visible and isolated -> certainly two different people
+                self.open_set.add_impostor(self.identities[gid_b].compute_similarity(emb_a, view_a))
+                self.open_set.add_impostor(self.identities[gid_a].compute_similarity(emb_b, view_b))
+                pairs += 1
+                if pairs >= 30:
+                    return
+
+    # ------------------------------------------------------------------
+    # Helmet markers (hard identity)
+    # ------------------------------------------------------------------
+    def _bind_track(self, tid: int, gid: int, det: PoseDetection, frame_ts: float, resolved: Dict[int, int],
+                    used: Set[int], stage: str) -> None:
+        for t in [t for t, g in self.track_to_global.items() if g == gid and t != tid]:
+            del self.track_to_global[t]   # the identity can only be on one track
+            resolved.pop(t, None)
+        ident = self.identities[gid]
+        status_before = ident.status
+        ident.status = STATUS_ACTIVE
+        ident.exit_reason = ""
+        ident.mismatch_streak = 0
+        self._reset_identity_kinematics(ident, det, frame_ts)
+        self.track_to_global[tid] = gid
+        self.track_last_reid_ts[tid] = frame_ts
+        prev = resolved.get(tid)
+        if prev is not None and prev != gid:
+            used.discard(prev)
+        resolved[tid] = gid
+        used.add(gid)
+        self._log_decision("MATCHED", frame_ts, tid=tid, gid=gid, stage=stage, sim=None,
+                           dt_lost=0.0, status_before=status_before, near_border=False)
+
+    def _new_labeled_identity(self, det: PoseDetection, label: str, frame_ts: float) -> int:
+        gid = self._next_global_id
+        self._next_global_id += 1
+        ident = WorkerIdentity(
+            global_id=gid,
+            created_ts=self.track_first_seen_ts.get(det.track_id, frame_ts),
+            last_track_id=det.track_id,
+            last_seen_ts=frame_ts,
+            last_bev_xy=np.asarray(det.bev_xy, dtype=np.float32).copy(),
+            last_ground_uv=det.ground_uv,
+            last_height_px=det.apparent_height_px,
+            last_bbox_xyxy=det.bbox_xyxy.copy(),
+            label=label,
+        )
+        emb, view, _, sharp = self._track_pooled_embedding(det.track_id, frame_ts, valid_only=True)
+        if emb is not None:
+            ident.add_clean_observation(emb, view, sharpness=sharp, is_isolated=det.is_isolated,
+                                        crop_height_px=float(det.bbox_xyxy[3] - det.bbox_xyxy[1]),
+                                        anchor_min_height_px=self.anchor_min_height_px)
+        self.identities[gid] = ident
+        self._log_decision("NEW_ID", frame_ts, tid=det.track_id, gid=gid, best_existing_sim=None,
+                           seen_frames=self.track_seen_counts.get(det.track_id, 0), label=label)
+        return gid
+
+    def _process_markers(self, frame: np.ndarray, detections: List[PoseDetection], resolved: Dict[int, int],
+                         used: Set[int], frame_ts: float) -> None:
+        if self.marker_reader is None:
+            return
+        for det in detections:
+            tid = det.track_id
+            if det.is_intersecting or frame_ts - self.track_last_marker_ts.get(tid, -1e18) < self.marker_read_interval_sec:
+                continue
+            self.track_last_marker_ts[tid] = frame_ts
+            try:
+                label = self.marker_reader.read(frame, det.bbox_xyxy, det.keypoints_xy, det.keypoints_conf)
+            except Exception:
+                logger.exception("Marker reading failed")
+                continue
+            if label is None:
+                continue
+            votes = self.track_marker_votes.setdefault(tid, deque(maxlen=12))
+            votes.append((frame_ts, label))
+            n = sum(1 for t, l in votes if l == label and frame_ts - t <= self.marker_vote_window_sec)
+            if n < self.marker_min_votes:
+                continue
+            gid = resolved.get(tid)
+            if gid is not None and self.identities[gid].label == label:
+                self.track_label[tid] = label
+                continue
+            self.track_label[tid] = label
+            self._apply_label(tid, label, det, resolved, used, frame_ts)
+
+    def _apply_label(self, tid: int, label: str, det: PoseDetection, resolved: Dict[int, int], used: Set[int],
+                     frame_ts: float) -> None:
+        owner = next((g for g, i in self.identities.items() if i.label == label), None)
+        gid = resolved.get(tid)
+        if owner is not None and owner != gid and owner in used:
+            # the labelled worker is ALSO visible elsewhere right now: one of the two readings is wrong
+            self._log_decision("MARKER_CONFLICT", frame_ts, tid=tid, label=label, owner=owner, gid=gid)
+            return
+        if gid is not None:
+            ident = self.identities[gid]
+            if ident.label is None and owner is None:
+                ident.label = label
+                self._labeled.append((gid, label))
+                self._log_decision("LABELED", frame_ts, tid=tid, gid=gid, label=label)
+                return
+            if ident.label is None and owner is not None:
+                if owner < gid:
+                    self._merge_into(gid, owner, tid, frame_ts, resolved, used, reason="MARKER")
+                else:
+                    self._merge_into(owner, gid, tid, frame_ts, resolved, used, reason="MARKER")
+                return
+            # bound to an identity with ANOTHER marker: the tracker jumped to a different person
+            self._log_decision("MARKER_REBIND", frame_ts, tid=tid, gid=gid, label=label, owner=owner,
+                               previous_label=ident.label)
+        target = owner if owner is not None else self._new_labeled_identity(det, label, frame_ts)
+        if owner is None:
+            self._labeled.append((target, label))
+        self._bind_track(tid, target, det, frame_ts, resolved, used, stage="MARKER")
 
     def process_frame(
         self, frame: np.ndarray, detections: List[PoseDetection], frame_ts: float
@@ -794,10 +1042,11 @@ class EnterpriseIdentityManager:
             det.apparent_height_px = self.bev.estimate_standing_height_px(
                 det.bbox_xyxy, det.keypoints_xy, det.keypoints_conf
             )
-            u_g, v_g, _ = self.bev.estimate_ground_contact_point(
+            u_g, v_g, extrapolated = self.bev.estimate_ground_contact_point(
                 det.bbox_xyxy, det.keypoints_xy, det.keypoints_conf
             )
             det.ground_uv = (u_g, v_g)
+            det.ground_extrapolated = bool(extrapolated)
             det.bev_xy = self.bev.to_bev_meters(u_g, v_g)
 
         # Determine spatial isolation & record pairwise track separation co-existence
@@ -1003,8 +1252,14 @@ class EnterpriseIdentityManager:
                         <= 1.5
                     )
 
+                    track_label = self.track_label.get(det.track_id)
+                    det_in_door = self._in_exit_region(det.ground_uv) if self.exit_regions else None
                     for c, gid in enumerate(candidate_gids):
                         ident = self.identities[gid]
+
+                        # HARD VETO 0: a different helmet marker is a different person
+                        if self._labels_conflict(track_label, ident.label):
+                            continue
 
                         # HARD VETO 1: Co-Existence Mutual Exclusion
                         # If `det.track_id` was ever seen separated in the same frame as `ident`,
@@ -1027,11 +1282,13 @@ class EnterpriseIdentityManager:
                         if ident.status == STATUS_EXITED:
                             if strict_emb is None or strict_n < self.reentry_min_samples:
                                 continue  # not enough clean evidence yet -> keep waiting / mint a new ID
-                            if ident.exit_reason == "BORDER" and not det_near_border:
-                                continue  # a border-exit must come back in through a border
+                            if ident.exit_reason == "BORDER" and not (det_near_border or det_in_door):
+                                continue  # a border-exit must come back in through a border (or a door)
+                            if ident.exit_reason == "DOOR" and not (det_in_door or det_near_border):
+                                continue  # left through a door inside the image: comes back through a door
                             s_strict = ident.compute_similarity(strict_emb, pose_view)
                             sim_matrix[r, c] = s_strict
-                            req = self.reentry_sim_thresh + (0.08 if dt_lost < self.reentry_min_gap_sec else 0.0)
+                            req = self.reentry_threshold() + (0.08 if dt_lost < self.reentry_min_gap_sec else 0.0)
                             if s_strict >= req:
                                 cost_matrix[r, c] = 1.0 - (0.90 * s_strict)
                                 stage_of[(r, c)] = "REENTRY_STRICT"
@@ -1062,7 +1319,7 @@ class EnterpriseIdentityManager:
                         if not reachable:
                             # STAGE C: Border / Long-Horizon Re-Entry
                             near_border = self._is_near_frame_border(det.bbox_xyxy, W_img, H_img)
-                            if near_border and dt_lost > 2.0 and app_sim >= self.reentry_sim_thresh:
+                            if near_border and dt_lost > 2.0 and app_sim >= self.reentry_threshold():
                                 cost_matrix[r, c] = 1.0 - (0.90 * app_sim)
                                 stage_of[(r, c)] = "BORDER_REENTRY"
                             continue
@@ -1072,11 +1329,17 @@ class EnterpriseIdentityManager:
                             if (dist_m <= 1.6 and dt_lost <= 3.5 and nearby_lost_count == 1)
                             else self.cos_sim_thresh
                         )
+                        stage = "RECOVER"
+                        if dt_lost > self.recover_strict_after_sec:
+                            # After a long hide the newcomer may be someone else in the same uniform (mid-scene
+                            # doors): the open-set threshold (slightly relaxed) and the margin test apply.
+                            required_sim = max(required_sim, self.reentry_threshold() - 0.06)
+                            stage = "RECOVER_LONG"
                         if app_sim >= required_sim:
                             spatial_score = max(0.0, 1.0 - (dist_m / max(max_dist_m, 1.0)))
                             fused_score = 0.80 * app_sim + 0.20 * spatial_score
                             cost_matrix[r, c] = 1.0 - fused_score
-                            stage_of[(r, c)] = "RECOVER"
+                            stage_of[(r, c)] = stage
 
                 row_ind, col_ind = linear_sum_assignment(cost_matrix)
                 for r, c in zip(row_ind, col_ind):
@@ -1101,13 +1364,16 @@ class EnterpriseIdentityManager:
 
                         # Negative evidence: the newcomer must be clearly closer to this identity than to
                         # ANY other identity, including workers who are currently visible on screen.
-                        if stage in ("REENTRY_STRICT", "STITCH", "BORDER_REENTRY"):
+                        if stage in ("REENTRY_STRICT", "STITCH", "BORDER_REENTRY", "RECOVER_LONG"):
                             if stage == "REENTRY_STRICT":
                                 m_emb, _ = self._track_mean_embedding(det.track_id, frame_ts)
                                 margin_needed = self.reentry_margin
                             else:
                                 m_emb = row_emb[r]
-                                margin_needed = self.stitch_margin if stage == "STITCH" else self.reentry_margin
+                                margin_needed = (
+                                    self.stitch_margin if stage == "STITCH"
+                                    else (0.5 * self.reentry_margin if stage == "RECOVER_LONG" else self.reentry_margin)
+                                )
                             m_view = row_view[r]
                             if m_emb is not None:
                                 own_sim = ident.compute_similarity(m_emb, m_view)
@@ -1119,6 +1385,23 @@ class EnterpriseIdentityManager:
                                         margin_needed=margin_needed,
                                     )
                                     continue
+                        elif stage == "RECOVER" and row_emb[r] is not None:
+                            # Occlusion recovery must also beat every identity that is NOT visible elsewhere right
+                            # now (people who LEFT included): a returning worker used to be "recovered" as a
+                            # similar-looking colleague who was merely hidden, because nobody compared with him.
+                            own_sim = ident.compute_similarity(row_emb[r], row_view[r])
+                            runner_up = max(
+                                (other.compute_similarity(row_emb[r], row_view[r])
+                                 for g_o, other in self.identities.items()
+                                 if g_o != gid and g_o not in used_global_ids),
+                                default=0.0,
+                            )
+                            if own_sim - runner_up < self.stitch_margin:
+                                self._log_decision(
+                                    "MATCH_REJECTED_AMBIGUOUS", frame_ts, tid=det.track_id, gid=gid, stage=stage,
+                                    sim=own_sim, runner_up=runner_up, margin_needed=self.stitch_margin,
+                                )
+                                continue
 
                         self._log_decision(
                             "MATCHED", frame_ts, tid=det.track_id, gid=gid, stage=stage,
@@ -1208,6 +1491,10 @@ class EnterpriseIdentityManager:
                         anchor_min_height_px=self.anchor_min_height_px,
                     )
 
+                    label = self.track_label.get(det.track_id)
+                    if label is not None and not any(i.label == label for i in self.identities.values()):
+                        new_ident.label = label
+                        self._labeled.append((new_gid, label))
                     self.identities[new_gid] = new_ident
                     if self._decision_fh is not None:
                         best_other = self._runner_up_similarity(emb, view_bin, new_gid)
@@ -1253,6 +1540,10 @@ class EnterpriseIdentityManager:
 
         # Consolidate any fragmented temporary IDs back into their original lost Global IDs
         self._consolidate_fragmented_identities(resolved_assignments, used_global_ids, frame_ts)
+
+        # Helmet markers (hard identity) and the site's impostor statistics (open-set threshold)
+        self._process_markers(frame, detections, resolved_assignments, used_global_ids, frame_ts)
+        self._sample_impostors(detections, resolved_assignments, frame_ts)
 
         # Who is gone? Mark border exits / long occlusions so they can only return via the strict gate.
         self._update_lifecycle(set(resolved_assignments.values()), frame_ts, W_img, H_img)

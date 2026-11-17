@@ -1,82 +1,152 @@
-system: {device: 'cuda:0', half_precision: true, display_gui: true, output_video_path: output_industrial_reid.mp4}
-stream: {source: 'data/input/test_video.mp4',  # override with: python main.py --source <path|rtsp://...>
-  reconnect_delay_sec: 3.0, drop_frames_on_lag: true}
-# detection.model_weights: yolo11m-pose.pt (default) | yolo11l-pose.pt | yolo11x-pose.pt (more accurate, slower)
-# detection.tracker_config: configs/custom_bytetrack.yaml (default) | configs/trackers/factory_ocsort.yaml |
-#   configs/trackers/factory_deepocsort.yaml | configs/trackers/factory_tracktrack.yaml
-detection: {model_weights: yolo11m-pose.pt, tracker_config: configs/custom_bytetrack.yaml,
-  conf_thres: 0.08, iou_thres: 0.6, imgsz: 1536}
-# reid.model_name: osnet_x1_0 (default, auto-download) | osnet_ain_x1_0 (built to generalise to new sites;
-#   download its MSMT17 checkpoint from the torchreid Model Zoo to weights/osnet_ain_x1_0_msmt17.pt and set
-#   weights_path accordingly). Weights that do not fit the chosen model are refused at start-up.
-reid: {model_name: osnet_x1_0, weights_path: weights/osnet_x1_0_msmt17.pt, kpt_conf_thresh: 0.2,
-  min_laplacian_var: 10.0, head_branch_weight: 0.35, color_branch_weight: 0.2, cos_sim_thresh: 0.6,
-  spatial_recovery_sim_thresh: 0.48, reentry_sim_thresh: 0.82, reid_interval_sec: 0.35,
-  # --- identity safety (a wrong merge is worse than a fresh ID) ---
-  stitch_sim_thresh: 0.55,      # in-place tracklet stitching (was a hard-coded 0.42)
-  stitch_margin: 0.04,          # best-vs-runner-up gap (runner-up includes workers currently on screen)
-  reentry_min_gap_sec: 2.0,     # a worker who just left needs +0.08 extra similarity to return sooner
-  reentry_margin: 0.08,         # best-vs-runner-up gap required to give an EXITED identity back
-  reentry_min_samples: 3,       # clean multi-frame samples required before an EXITED identity is reused
-  exit_confirm_sec: 0.8,        # absence before a worker who walked OUT through a border counts as EXITED
-  exit_edges: [left, right, top, bottom],   # image edges that are real ways out (drop e.g. 'top' for a far wall)
-  mismatch_min_span_sec: 1.0,   # appearance mismatch must persist this long before a binding is broken
-  min_gallery_height_px: 72,    # smaller crops are matched but never stored in a worker's appearance memory
-  min_visible_kpts: 5,          # ... same for crops with fewer visible joints
-  anchor_min_height_px: 110,    # permanent anchors need an even larger crop
-  track_state_ttl_sec: 10.0,    # memory bound: forget dead tracker ids after this long
-  identity_retention_sec: 3600, # memory bound: forget workers who left more than 1 h ago ...
-  max_exited_identities: 300,   # ... and keep at most this many departed workers
-  occlusion_max_sec: 20.0,      # longest in-scene occlusion before the identity is treated as EXITED
-  border_margin_ratio: 0.06,
-  pool_max_samples: 8,          # tracklet appearance = quality-weighted mean of up to this many recent crops
-  pool_window_sec: 4.0,         # ... taken from the last N seconds
-  track_gap_reset_sec: 1.5,     # a track id missing this long and then reappearing is treated as brand new
-  decision_log_path: logs/identity_decisions.jsonl}   # one JSON line per identity decision (empty = off)
-# Ground calibration: configs/calibration.yaml (scripts/calibrate_ground_plane.py) takes precedence.
-# The src_image_pts below are only a placeholder fallback; calibration_ref_wh = resolution they were picked at.
+# =====================================================================================================================
+# Factory monitoring - main settings (hand-edited; every key has a default in app/core/config.py, unknown keys are
+# reported at start-up, wrong types stop the start-up with a clear message).
+# Scene geometry (zones, lines, regions, doors) lives in configs/scene.yaml (written by the drawing tools).
+# =====================================================================================================================
+
+system:
+  camera_id: cam1                 # written into every event (several cameras -> several instances / ids)
+  device: cuda:0
+  half_precision: true
+  display_gui: true               # false (or --no-gui) for a headless service
+  log_dir: logs                   # rotating log files
+  log_level: INFO
+  heartbeat_path: logs/heartbeat.json   # status written every 5 s (watchdog / monitoring)
+  max_consecutive_errors: 100     # failing frames in a row before the process gives up (supervisor restarts it)
+
+stream:
+  source: data/input/test_video.mp4     # file, rtsp://user:pass@ip:554/..., or camera index; --source overrides
+  drop_frames_on_lag: true        # live: always process the newest frame
+  rtsp_transport: tcp             # tcp avoids the grey smearing of lost UDP packets
+  reconnect_delay_sec: 3.0        # first reconnect delay (doubles up to max_reconnect_delay_sec)
+  max_reconnect_delay_sec: 30.0
+  read_timeout_sec: 5.0
+  max_stall_sec: 0                # >0: give up (exit / restart) after this long without frames; 0 = wait forever
+  recording_start_time: ""        # video FILES only: real start time of the clip, e.g. "2026-11-17 08:00:00"
+
+recording:
+  output_video_path: output_industrial_reid.mp4   # empty = no annotated video
+  segment_minutes: 0              # 0 = one file (clips); e.g. 15 for a live camera (rotating files)
+  max_segments: 96                # segments kept (15 min x 96 = 24 h)
+
+detection:
+  model_weights: yolo11m-pose.pt  # yolo11l-pose.pt / yolo11x-pose.pt: more accurate, slower
+  tracker_config: configs/custom_bytetrack.yaml   # or configs/trackers/factory_{ocsort,deepocsort,tracktrack}.yaml
+  conf_thres: 0.08
+  iou_thres: 0.6
+  imgsz: 1536
+
+reid:
+  model_name: osnet_x1_0          # osnet_ain_x1_0 generalises better to new sites (manual weights, see README)
+  weights_path: weights/osnet_x1_0_msmt17.pt
+  kpt_conf_thresh: 0.2
+  min_laplacian_var: 10.0
+  # Uniforms: colour carries little identity, the head/upper body carries more. For an all-uniform site try
+  # head_branch_weight 0.45 and color_branch_weight 0.10 (re-check with the comparison procedure of the README).
+  head_branch_weight: 0.35
+  color_branch_weight: 0.2
+  cos_sim_thresh: 0.6
+  spatial_recovery_sim_thresh: 0.48
+  reentry_sim_thresh: 0.82        # MINIMUM similarity to give an ID back to a returning worker (see open_set)
+  reid_interval_sec: 0.35
+  stitch_sim_thresh: 0.55
+  stitch_margin: 0.04
+  reentry_min_gap_sec: 2.0
+  reentry_margin: 0.08
+  reentry_min_samples: 3
+  recover_strict_after_sec: 4.0   # hidden longer than this inside the scene -> re-entry rules apply too
+  exit_confirm_sec: 0.8
+  exit_edges: [left, right, top, bottom]   # image edges that are real ways out
+  mismatch_min_span_sec: 1.0
+  min_gallery_height_px: 72
+  min_visible_kpts: 5
+  anchor_min_height_px: 110
+  track_state_ttl_sec: 10.0
+  identity_retention_sec: 43200   # remember workers who left for 12 h (lunch, shift breaks)
+  max_exited_identities: 500
+  occlusion_max_sec: 20.0
+  border_margin_ratio: 0.06
+  pool_max_samples: 8
+  pool_window_sec: 4.0
+  track_gap_reset_sec: 1.5
+  decision_log_path: logs/identity_decisions.jsonl
+  open_set:                       # learns how similar DIFFERENT workers look at this site (uniforms!)
+    enabled: true
+    quantile: 0.995               # re-entry threshold >= this quantile of impostor similarities + margin
+    margin: 0.03
+    min_samples: 60
+    max_threshold: 0.95
+    sample_interval_sec: 1.0
+  persistence:                    # identities survive restarts (IDs do not restart at 1)
+    mode: auto                    # auto = live cameras only | on | off
+    dir: data/identity_store
+    save_interval_sec: 60
+
+markers:                          # optional helmet ArUco markers = hard identity (configs/workers.yaml)
+  enabled: false
+  registry_path: configs/workers.yaml
+  dictionary: DICT_4X4_50
+  accept_unregistered: false
+  read_interval_sec: 0.5
+  min_votes: 2
+  vote_window_sec: 4.0
+  min_person_height_px: 120
+
+# Ground calibration: configs/calibration.yaml (scripts/calibrate_ground_plane.py) is used when present.
 physics_bev:
   max_worker_speed_mps: 3.5
   max_internal_occlusion_m: 5.5
   lag_diffusion_coeff: 0.65
   base_pose_jitter_m: 0.7
   default_px_per_meter: 110.0
-  calibration_ref_wh: [1280, 720]
-  src_image_pts:
-  - [320, 280]
-  - [960, 280]
-  - [1180, 680]
-  - [100, 680]
-  dst_meter_pts:
-  - [0.0, 0.0]
-  - [6.0, 0.0]
-  - [6.0, 8.0]
-  - [0.0, 8.0]
+
+scene:
+  path: configs/scene.yaml
+
 zones:
   entry_confirm_sec: 0.5
   exit_confirm_sec: 1.0
-  force_exit_timeout_sec: 15.0
-  definitions: {}
-# directional_tracking:
-  # draw_trails: true
-  # entrance_zones:
-  #   company_entrance_gate:
-  #     polygon:
-  #     - [2075, 966]
-  #     - [2004, 984]
-  #     - [1945, 1000]
-  #     - [1943, 1030]
-  #     - [1924, 1076]
-  #     - [1925, 1124]
-  #     - [1919, 1155]
-  #     - [1931, 1197]
-  #     - [1932, 1249]
-  #     - [1947, 1301]
-  #     - [1975, 1345]
-  #     - [1995, 1378]
-  #     - [2001, 1398]
-  #     - [2193, 1303]
-  #     - [2204, 1266]
-  #     entry_direction_vector: [0.8405, 0.5418]
-  #     min_displacement: 20.0
-  #     color: [255, 165, 0]
+  lost_timeout_sec: 15.0          # not visible this long while inside -> visit closed (LOST)
+  include_unverified: true        # count people before their ID is confirmed (attributed later)
+
+crossings:
+  dead_band_px: 18.0              # foot-point jitter band around a line (scaled per line by the scene file)
+  cooldown_sec: 1.0
+  max_gap_sec: 4.0                # a crossing hidden by an occlusion up to this long still counts
+  segment_margin: 0.10
+  region_exit_confirm_sec: 0.3
+  region_lost_sec: 3.0
+  draw_trails: true
+
+attribution:
+  timeout_sec: 20.0               # events of a not-yet-identified person wait this long for the worker ID
+  record_unidentified: true
+
+events:
+  db_path: data/factory_events.db
+  csv_dir: data/events
+  snapshot_dir: data/snapshots
+  snapshot_event_types: []        # alarms always get a snapshot; add e.g. [WRONG_WAY, ZONE_DWELL_EXCEEDED]
+  retention_days: 90              # snapshots / CSV mirrors older than this are deleted (the database is kept)
+
+alarms:
+  enable_audio_alarm: true
+  alarm_cooldown_sec: 5.0         # rate limit of the OUTPUTS only - every alarm is always recorded
+  audio_frequency_hz: 2200
+  audio_duration_ms: 400
+  forward_min_severity: alarm     # alarm | warning | info
+  webhook_urls: []                # e.g. [http://siren-gateway.local/api/alarm]
+  webhook_headers: {}
+  webhook_timeout_sec: 3.0
+  mqtt: {enabled: false, host: 127.0.0.1, port: 1883, topic: factory/alarms, username: "", password: ""}
+
+# Several cameras: do NOT copy this file per camera. List the cameras in configs/cameras.yaml (see
+# configs/cameras.example.yaml) and start them with run_multi_camera.py; the cross_camera settings live there.
+
+web:
+  enabled: false                  # /api/status /api/telemetry /api/events /video_feed
+  host: 127.0.0.1                 # 0.0.0.0 only behind a protected network / reverse proxy
+  port: 8050
+  token: ""                       # set a token to require ?token=... on every request
+  stream_max_fps: 10
+  stream_width: 1280

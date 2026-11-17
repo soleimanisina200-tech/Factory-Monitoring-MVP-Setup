@@ -1,6 +1,7 @@
 # app/identity/reid_model.py
 from __future__ import annotations
 import logging
+import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,24 +17,35 @@ logger = logging.getLogger("FactoryReID")
 
 MSMT17_GDRIVE_ID = "1KxxvkhV_pnm34VUwtlum-JyvChL_2eP-"
 MODEL_ZOO_URL = "https://kaiyangzhou.github.io/deep-person-reid/MODEL_ZOO"
+# Official mirror of the torchreid model zoo (same author). Google Drive regularly refuses automated downloads
+# ("too many accesses"), which used to stop the very first start of the service.
+HF_MIRROR_BASE = "https://huggingface.co/kaiyangzhou/osnet/resolve/main/"
+MIN_WEIGHT_BYTES = 5_000_000
 
-# Backbones that can be selected with reid.model_name. Only osnet_x1_0 has an automatic download; the others
-# must be downloaded from the torchreid Model Zoo into the listed default path (or reid.weights_path).
+# Backbones that can be selected with reid.model_name. All are downloaded automatically on first use into the
+# listed default path (Google Drive when an id is known, then the mirror); a manual download also works.
 REID_BACKBONES: Dict[str, Dict[str, Any]] = {
     "osnet_x1_0": {
         "default_weights": "weights/osnet_x1_0_msmt17.pt",
         "auto_download": True,
+        "gdrive_id": MSMT17_GDRIVE_ID,
+        "mirror_file": "osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_"
+                       "labelsmooth_flip_jitter.pth",
         "note": "OSNet trained on MSMT17 (current default)",
     },
     "osnet_ain_x1_0": {
         "default_weights": "weights/osnet_ain_x1_0_msmt17.pt",
-        "auto_download": False,
-        "note": "OSNet-AIN: instance-normalised variant designed to generalise to unseen cameras/sites. "
-                "Download the MSMT17 (cross-domain) checkpoint from the Model Zoo.",
+        "auto_download": True,
+        "mirror_file": "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_"
+                       "jitter.pth",
+        "note": "OSNet-AIN: instance-normalised variant designed to generalise to unseen cameras/sites "
+                "(MSMT17 cross-domain checkpoint).",
     },
     "osnet_ibn_x1_0": {
         "default_weights": "weights/osnet_ibn_x1_0_msmt17.pt",
-        "auto_download": False,
+        "auto_download": True,
+        "mirror_file": "osnet_ibn_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_"
+                       "labelsmooth_flip_jitter.pth",
         "note": "OSNet-IBN: partially instance-normalised variant (cross-domain).",
     },
 }
@@ -61,23 +73,55 @@ class CropQualityReport:
     crop_height_px: float = -1.0  # -1 = unknown
 
 
-def ensure_msmt17_weights(target_path: str = "weights/osnet_x1_0_msmt17.pt") -> str:
+def _download_gdrive(file_id: str, path: Path) -> None:
+    import gdown
+
+    gdown.download(f"https://drive.google.com/uc?id={file_id}", str(path), quiet=True)
+
+
+def _download_http(url: str, path: Path, timeout: float = 60.0) -> None:
+    import shutil
+    import urllib.request
+
+    part = path.with_name(path.name + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": "factory-monitoring"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(part, "wb") as f:  # noqa: S310 (fixed URL)
+        shutil.copyfileobj(resp, f, length=1 << 20)
+    os.replace(part, path)
+
+
+def download_reid_weights(model_name: str, target_path: str) -> str:
+    """Fetch the MSMT17 checkpoint of `model_name`: Google Drive first (when known), then the official mirror."""
+    spec = REID_BACKBONES[model_name]
     path = Path(target_path)
-    if path.exists() and path.stat().st_size > 5_000_000:
+    if path.exists() and path.stat().st_size > MIN_WEIGHT_BYTES:
         return str(path)
-
     path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Downloading official MSMT17 OSNet Re-ID weights to {path}...")
-    try:
-        import gdown
-        url = f"https://drive.google.com/uc?id={MSMT17_GDRIVE_ID}"
-        gdown.download(url, str(path), quiet=False)
-    except Exception as e:
-        logger.warning(f"gdown auto-download failed ({e}).")
+    sources = []
+    if spec.get("gdrive_id"):
+        sources.append(("Google Drive", lambda: _download_gdrive(spec["gdrive_id"], path)))
+    if spec.get("mirror_file"):
+        sources.append(("Hugging Face mirror", lambda: _download_http(HF_MIRROR_BASE + spec["mirror_file"], path)))
+    for name, fetch in sources:
+        logger.info("Downloading %s MSMT17 Re-ID weights to %s (%s)...", model_name, path, name)
+        try:
+            fetch()
+        except Exception as e:
+            logger.warning("%s download failed (%s).", name, str(e).strip().splitlines()[0] if str(e) else type(e))
+        if path.exists() and path.stat().st_size > MIN_WEIGHT_BYTES:
+            return str(path)
+        if path.exists():
+            path.unlink()  # truncated / error page
+    raise RuntimeError(
+        f"CRITICAL ERROR: Failed to acquire MSMT17 weights for '{model_name}' at {path}. Download "
+        f"'{spec.get('mirror_file', model_name)}' manually from {HF_MIRROR_BASE.replace('/resolve/main/', '')} or "
+        f"{MODEL_ZOO_URL} and save it as '{path}'."
+    )
 
-    if not path.exists() or path.stat().st_size < 5_000_000:
-        raise RuntimeError(f"CRITICAL ERROR: Failed to acquire MSMT17 weights at {path}.")
-    return str(path)
+
+def ensure_msmt17_weights(target_path: str = "weights/osnet_x1_0_msmt17.pt") -> str:
+    """Backwards-compatible name: the default OSNet checkpoint."""
+    return download_reid_weights("osnet_x1_0", target_path)
 
 
 def _clean_state_dict(raw: Any) -> Dict[str, torch.Tensor]:
@@ -116,7 +160,7 @@ def resolve_reid_weights(model_name: str, weights_path: Optional[str]) -> str:
     if Path(default).exists():
         return default
     if spec["auto_download"]:
-        return ensure_msmt17_weights(default)
+        return download_reid_weights(model_name, default)
     raise FileNotFoundError(
         f"Re-ID model '{model_name}' needs its own weights ({spec['note']}). Download the checkpoint from "
         f"{MODEL_ZOO_URL} and save it as '{default}' (or set reid.weights_path). Using another model's weights "
