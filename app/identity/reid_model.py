@@ -1,344 +1,258 @@
-# app/identity/reid_model.py
-from __future__ import annotations
 import logging
-import warnings
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Tuple
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchreid
+from torchreid.utils import FeatureExtractor
 
-warnings.filterwarnings("ignore", category=FutureWarning, module="torchreid")
-logger = logging.getLogger("FactoryReID")
+from app.logic.geometry import (
+    KP_L_SHOULDER,
+    KP_R_SHOULDER,
+    KP_L_HIP,
+    KP_R_HIP,
+    KP_L_KNEE,
+    KP_R_KNEE,
+    KP_L_ANKLE,
+    KP_R_ANKLE,
+    is_skeleton_complete,
+)
 
-MSMT17_GDRIVE_ID = "1KxxvkhV_pnm34VUwtlum-JyvChL_2eP-"
-
-SKELETON_LIMBS = [
-    (5, 7), (7, 9),    # Left arm
-    (6, 8), (8, 10),   # Right arm
-    (11, 13), (13, 15),# Left leg
-    (12, 14), (14, 16),# Right leg
-    (5, 6), (11, 12),  # Shoulder & hip bars
-]
-
-IMAGENET_MEAN_BGR = np.array([103.53, 116.28, 123.675], dtype=np.uint8)
-
-
-@dataclass
-class CropQualityReport:
-    is_valid_for_reid: bool
-    is_valid_for_gallery: bool
-    sharpness_score: float
-    visible_ratio: float
-    pose_view_bin: str
-    reject_reason: str = ""
-
-
-def ensure_msmt17_weights(target_path: str = "weights/osnet_x1_0_msmt17.pt") -> str:
-    path = Path(target_path)
-    if path.exists() and path.stat().st_size > 5_000_000:
-        return str(path)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Downloading official MSMT17 OSNet Re-ID weights to {path}...")
-    try:
-        import gdown
-        url = f"https://drive.google.com/uc?id={MSMT17_GDRIVE_ID}"
-        gdown.download(url, str(path), quiet=False)
-    except Exception as e:
-        logger.warning(f"gdown auto-download failed ({e}).")
-
-    if not path.exists() or path.stat().st_size < 5_000_000:
-        raise RuntimeError(f"CRITICAL ERROR: Failed to acquire MSMT17 weights at {path}.")
-    return str(path)
+logger = logging.getLogger(__name__)
 
 
 class PoseGuidedOSNetExtractor:
     """
-    Posture-Invariant Zero-Data Re-ID Engine:
-      - Eliminates grey-bar letterbox artifacts that broke matching between standing & crouching poses.
-      - Uses Keypoint-Aligned Upper-Body Subcrops (tracks head & shoulders even when bent 90 degrees).
-      - Uses Hellinger/Bhattacharyya Keypoint-Guided Chromatic Histograms for uniform/pant discrimination.
+    استخراج‌کننده ویژگی مبتنی بر اسکلت و شبکه OSNet-AIN:
+    - تقسیم بدن به ۳ ناحیه (سر/گردن، کفش/پا، تنه) با وزن‌دهی ضد لباس فرم یکسان
+    - اجرای Batch روی GPU برای حذف گلوگاه همگام‌سازی تک‌تصویری CPU-GPU
     """
 
     def __init__(
         self,
-        model_name: str = "osnet_x1_0",
-        weights_path: Optional[str] = None,
-        device: str = "cuda:0",
-        kpt_conf_thresh: float = 0.30,
-        min_laplacian_var: float = 15.0,
-        head_branch_weight: float = 0.32,
-        color_branch_weight: float = 0.18,
+        model_name: str = "osnet_ain_x1_0",
+        device: str = "cuda",
+        part_weights: dict | None = None,
+        min_kp_conf: float = 0.42,
     ):
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.kpt_conf_thresh = kpt_conf_thresh
-        self.min_laplacian_var = min_laplacian_var
+        self.device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+        self.min_kp_conf = min_kp_conf
 
-        self.head_w = float(head_branch_weight)
-        self.color_w = float(color_branch_weight)
-        self.body_w = max(0.30, 1.0 - self.head_w - self.color_w)
+        weights_cfg = part_weights or {"head": 0.55, "shoes": 0.30, "torso": 0.15}
+        total_w = float(sum(weights_cfg.values())) or 1.0
+        self.w_head = weights_cfg.get("head", 0.55) / total_w
+        self.w_shoes = weights_cfg.get("shoes", 0.30) / total_w
+        self.w_torso = weights_cfg.get("torso", 0.15) / total_w
 
-        valid_weights_path = (
-            weights_path if (weights_path and Path(weights_path).exists()) else ensure_msmt17_weights()
+        logger.info(f"Loading Re-ID model '{model_name}' on {self.device}...")
+        try:
+            self.extractor = FeatureExtractor(model_name=model_name, device=self.device)
+        except Exception as e:
+            logger.warning(f"Could not load {model_name} ({e}), falling back to 'osnet_x1_0'...")
+            self.extractor = FeatureExtractor(model_name="osnet_x1_0", device=self.device)
+
+        logger.info(
+            f"Re-ID Extractor ready (Part Weights -> Head: {self.w_head:.2f}, Shoes: {self.w_shoes:.2f}, Torso: {self.w_torso:.2f})"
         )
-        logger.info(f"Loading true Person Re-ID MSMT17 weights from: {valid_weights_path}")
 
-        self.extractor = torchreid.utils.FeatureExtractor(
-            model_name=model_name,
-            model_path=valid_weights_path,
-            device=str(self.device),
-        )
-        self.clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(4, 4))
+    def _safe_crop_rgb(self, frame_bgr: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray | None:
+        h, w = frame_bgr.shape[:2]
+        cx1 = max(0, min(w - 1, int(x1)))
+        cy1 = max(0, min(h - 1, int(y1)))
+        cx2 = max(0, min(w, int(x2)))
+        cy2 = max(0, min(h, int(y2)))
 
-    def normalize_illumination(self, bgr_crop: np.ndarray) -> np.ndarray:
-        lab = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2LAB)
-        l_chan, a_chan, b_chan = cv2.split(lab)
-        l_eq = self.clahe.apply(l_chan)
-        merged = cv2.merge((l_eq, a_chan, b_chan))
-        return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+        if (cx2 - cx1) < 12 or (cy2 - cy1) < 12:
+            return None
 
-    @staticmethod
-    def resize_for_osnet(crop_bgr: np.ndarray, target_w: int = 128, target_h: int = 256) -> np.ndarray:
+        crop_bgr = frame_bgr[cy1:cy2, cx1:cx2]
+        if crop_bgr.size == 0:
+            return None
+        return cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+
+    def _build_anatomic_part_crops(
+        self,
+        frame_bgr: np.ndarray,
+        box: list[int],
+        keypoints: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
         """
-        Resizes crop to OSNet's native (128, 256) resolution using replicate-border aspect clamping
-        instead of flat grey bars, preventing artificial step-edges and vertical receptive-field shifts
-        when workers crouch or bend over.
+        ساخت ۳ برش آناتومیک مجزا (سر/گردن، تنه، ساق/کفش) با استفاده از کی‌پوینت‌ها یا هندسه باکس.
         """
-        h, w = crop_bgr.shape[:2]
-        if h <= 0 or w <= 0:
-            return np.full((target_h, target_w, 3), IMAGENET_MEAN_BGR, dtype=np.uint8)
+        x1, y1, x2, y2 = box
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw < 20 or bh < 45:
+            return None
 
-        desired_h = max(h, int(w * 1.55))
-        if desired_h > h:
-            pad_top = (desired_h - h) // 2
-            pad_bot = desired_h - h - pad_top
-            padded = cv2.copyMakeBorder(crop_bgr, pad_top, pad_bot, 0, 0, cv2.BORDER_REPLICATE)
-            if pad_top > 0:
-                padded[:pad_top] = (
-                    0.35 * padded[:pad_top].astype(np.float32) + 0.65 * IMAGENET_MEAN_BGR
-                ).astype(np.uint8)
-            if pad_bot > 0:
-                padded[-pad_bot:] = (
-                    0.35 * padded[-pad_bot:].astype(np.float32) + 0.65 * IMAGENET_MEAN_BGR
-                ).astype(np.uint8)
-            crop_bgr = padded
+        # مقادیر پیش‌فرض هندسی در صورت نبودن برخی کی‌پوینت‌ها
+        head_y1 = y1
+        head_y2 = int(y1 + 0.28 * bh)
+        head_x1 = int(x1 + 0.12 * bw)
+        head_x2 = int(x2 - 0.12 * bw)
 
-        interp = cv2.INTER_AREA if (crop_bgr.shape[1] > target_w) else cv2.INTER_LINEAR
-        return cv2.resize(crop_bgr, (target_w, target_h), interpolation=interp)
+        torso_y1 = int(y1 + 0.22 * bh)
+        torso_y2 = int(y1 + 0.62 * bh)
+        torso_x1 = int(x1 + 0.08 * bw)
+        torso_x2 = int(x2 - 0.08 * bw)
 
-    @staticmethod
-    def classify_pose_view(
-        kpts_xy: np.ndarray,
-        kpts_conf: np.ndarray,
-        bbox_width: float,
-        thresh: float = 0.30,
-    ) -> str:
-        if kpts_conf[5] >= thresh and kpts_conf[6] >= thresh:
-            dx = float(kpts_xy[5, 0] - kpts_xy[6, 0])
-            torso_w = abs(dx)
-            face_vis = sum(1 for i in (0, 1, 2) if kpts_conf[i] >= thresh)
+        shoes_y1 = int(y1 + 0.68 * bh)
+        shoes_y2 = y2
+        shoes_x1 = x1
+        shoes_x2 = x2
 
-            if torso_w < max(8.0, 0.22 * bbox_width):
-                sh_mid_x = 0.5 * float(kpts_xy[5, 0] + kpts_xy[6, 0])
-                if kpts_conf[0] >= thresh:
-                    return "RIGHT" if float(kpts_xy[0, 0]) > sh_mid_x else "LEFT"
-                return "LEFT" if float(kpts_conf[5]) > float(kpts_conf[6]) else "RIGHT"
+        if keypoints is not None and len(keypoints) >= 17:
+            sh_pts = [
+                keypoints[idx]
+                for idx in (KP_L_SHOULDER, KP_R_SHOULDER)
+                if keypoints[idx][2] >= self.min_kp_conf
+            ]
+            hip_pts = [
+                keypoints[idx]
+                for idx in (KP_L_HIP, KP_R_HIP)
+                if keypoints[idx][2] >= self.min_kp_conf
+            ]
+            knee_pts = [
+                keypoints[idx]
+                for idx in (KP_L_KNEE, KP_R_KNEE)
+                if keypoints[idx][2] >= self.min_kp_conf
+            ]
+            ank_pts = [
+                keypoints[idx]
+                for idx in (KP_L_ANKLE, KP_R_ANKLE)
+                if keypoints[idx][2] >= self.min_kp_conf
+            ]
 
-            if dx > 0 and face_vis >= 1:
-                return "FRONT"
-            if dx < 0 and face_vis == 0:
-                return "BACK"
-            return "FRONT" if face_vis >= 2 else "BACK"
-        return "FRONT"
+            if sh_pts:
+                sh_y = float(np.mean([p[1] for p in sh_pts]))
+                head_y2 = int(min(y2, max(y1 + 16, sh_y + 0.08 * bh)))
+                torso_y1 = int(max(y1, sh_y - 0.04 * bh))
 
-    def build_pose_silhouette_mask(
+                if len(sh_pts) == 2:
+                    min_sh_x = min(sh_pts[0][0], sh_pts[1][0])
+                    max_sh_x = max(sh_pts[0][0], sh_pts[1][0])
+                    pad_x = max(12.0, 0.20 * (max_sh_x - min_sh_x))
+                    torso_x1 = int(max(x1, min_sh_x - pad_x))
+                    torso_x2 = int(min(x2, max_sh_x + pad_x))
+
+            if hip_pts:
+                hip_y = float(np.mean([p[1] for p in hip_pts]))
+                if hip_y > torso_y1 + 15:
+                    torso_y2 = int(min(y2, hip_y + 0.05 * bh))
+
+            if knee_pts or ank_pts:
+                if knee_pts:
+                    knee_y = float(np.mean([p[1] for p in knee_pts]))
+                    shoes_y1 = int(max(y1 + 0.50 * bh, min(y2 - 16, knee_y - 0.04 * bh)))
+                if ank_pts:
+                    ank_y = float(np.max([p[1] for p in ank_pts]))
+                    shoes_y2 = int(min(frame_bgr.shape[0], max(shoes_y1 + 16, ank_y + 0.06 * bh)))
+
+        full_rgb = self._safe_crop_rgb(frame_bgr, x1, y1, x2, y2)
+        if full_rgb is None:
+            return None
+
+        head_rgb = self._safe_crop_rgb(frame_bgr, head_x1, head_y1, head_x2, head_y2)
+        torso_rgb = self._safe_crop_rgb(frame_bgr, torso_x1, torso_y1, torso_x2, torso_y2)
+        shoes_rgb = self._safe_crop_rgb(frame_bgr, shoes_x1, shoes_y1, shoes_x2, shoes_y2)
+
+        if head_rgb is None:
+            head_rgb = full_rgb[: max(12, int(0.30 * full_rgb.shape[0])), :]
+        if torso_rgb is None:
+            torso_rgb = full_rgb[
+                int(0.25 * full_rgb.shape[0]) : max(24, int(0.65 * full_rgb.shape[0])), :
+            ]
+        if shoes_rgb is None:
+            shoes_rgb = full_rgb[int(0.65 * full_rgb.shape[0]) :, :]
+
+        return head_rgb, torso_rgb, shoes_rgb
+
+    def extract_batch(
         self,
-        crop_shape: Tuple[int, int, int],
-        local_kpts_xy: np.ndarray,
-        kpts_conf: np.ndarray,
-    ) -> Tuple[np.ndarray, float]:
-        h, w = crop_shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        th = self.kpt_conf_thresh
+        frame_bgr: np.ndarray,
+        boxes: list[list[int]],
+        keypoints_list: list[np.ndarray | None] | None = None,
+        require_complete_skeleton: bool = False,
+    ) -> list[np.ndarray | None]:
+        """
+        استخراج دسته‌ای (Batched GPU Inference) برای تمام کارگران حاضر در فریم طی یک مرحله Forward Pass.
+        """
+        num_targets = len(boxes)
+        if num_targets == 0 or frame_bgr is None or frame_bgr.size == 0:
+            return []
 
-        cv2.ellipse(
-            mask,
-            (w // 2, int(h * 0.52)),
-            (max(4, int(w * 0.36)), max(8, int(h * 0.44))),
-            0,
-            0,
-            360,
-            210,
-            -1,
-        )
+        h, w = frame_bgr.shape[:2]
+        flat_crops = []
+        valid_target_indices = []
 
-        limb_radius = max(int(w * 0.16), 6)
-        head_radius = max(int(w * 0.22), 9)
+        for i in range(num_targets):
+            box = boxes[i]
+            kpts = keypoints_list[i] if (keypoints_list and i < len(keypoints_list)) else None
 
-        head_pts = [local_kpts_xy[i] for i in range(5) if kpts_conf[i] >= th]
-        if head_pts:
-            center = np.mean(head_pts, axis=0).astype(np.int32)
-            cv2.circle(mask, tuple(center), head_radius, 255, -1)
+            if require_complete_skeleton and kpts is not None:
+                if not is_skeleton_complete(kpts, w, h, min_conf=self.min_kp_conf):
+                    continue
 
-        torso_indices = [i for i in (5, 6, 12, 11) if kpts_conf[i] >= th]
-        if len(torso_indices) >= 3:
-            torso_poly = local_kpts_xy[torso_indices].astype(np.int32)
-            hull = cv2.convexHull(torso_poly)
-            cv2.fillConvexPoly(mask, hull, 255)
-            cv2.polylines(mask, [hull], isClosed=True, color=255, thickness=limb_radius)
+            part_crops = self._build_anatomic_part_crops(frame_bgr, box, kpts)
+            if part_crops is None:
+                continue
 
-        for p1, p2 in SKELETON_LIMBS:
-            if kpts_conf[p1] >= th and kpts_conf[p2] >= th:
-                pt1 = tuple(local_kpts_xy[p1].astype(np.int32))
-                pt2 = tuple(local_kpts_xy[p2].astype(np.int32))
-                cv2.line(mask, pt1, pt2, 255, thickness=limb_radius * 2, lineType=cv2.LINE_AA)
+            head_rgb, torso_rgb, shoes_rgb = part_crops
+            flat_crops.extend([head_rgb, torso_rgb, shoes_rgb])
+            valid_target_indices.append(i)
 
-        ksize = 9 if min(h, w) >= 40 else 5
-        mask_float = cv2.GaussianBlur(mask, (ksize, ksize), 0).astype(np.float32) / 255.0
-        soft_alpha = 0.20 + 0.80 * mask_float
-        visible_ratio = float(np.mean(mask > 127))
-        return soft_alpha[:, :, None], visible_ratio
-
-    def extract_anatomical_upper_subcrop(
-        self,
-        masked_crop: np.ndarray,
-        local_kpts_xy: np.ndarray,
-        kpts_conf: np.ndarray,
-    ) -> np.ndarray:
-        h, w = masked_crop.shape[:2]
-        th = self.kpt_conf_thresh
-        upper_indices = [i for i in range(7) if kpts_conf[i] >= th]
-
-        if len(upper_indices) >= 2:
-            pts = local_kpts_xy[upper_indices]
-            pad_x = max(12.0, 0.28 * w)
-            pad_y_top = max(14.0, 0.22 * h)
-            pad_y_bot = max(14.0, 0.24 * h)
-
-            ux1 = int(np.clip(np.min(pts[:, 0]) - pad_x, 0, max(0, w - 2)))
-            ux2 = int(np.clip(np.max(pts[:, 0]) + pad_x, ux1 + 1, w))
-            uy1 = int(np.clip(np.min(pts[:, 1]) - pad_y_top, 0, max(0, h - 2)))
-            uy2 = int(np.clip(np.max(pts[:, 1]) + pad_y_bot, uy1 + 1, h))
-
-            if (uy2 - uy1) >= 18 and (ux2 - ux1) >= 18:
-                return masked_crop[uy1:uy2, ux1:ux2]
-
-        return masked_crop[: max(18, int(h * 0.50)), :]
-
-    @staticmethod
-    def _hellinger_hist(lab_patch: np.ndarray, hsv_patch: np.ndarray, mask_patch: Optional[np.ndarray]) -> np.ndarray:
-        if lab_patch.size == 0 or hsv_patch.size == 0:
-            return np.zeros(64, dtype=np.float32)
-
-        if mask_patch is not None and (mask_patch.shape[:2] != lab_patch.shape[:2] or np.count_nonzero(mask_patch) < 8):
-            mask_patch = None
-
-        h_a = cv2.calcHist([lab_patch], [1], mask_patch, [16], [0, 256]).flatten()
-        h_b = cv2.calcHist([lab_patch], [2], mask_patch, [16], [0, 256]).flatten()
-        h_h = cv2.calcHist([hsv_patch], [0], mask_patch, [16], [0, 180]).flatten()
-        h_s = cv2.calcHist([hsv_patch], [1], mask_patch, [16], [0, 256]).flatten()
-
-        raw = np.concatenate([h_a, h_b, h_h, h_s]).astype(np.float32)
-        l1_norm = raw / (np.sum(raw) + 1e-6)
-        hellinger = np.sqrt(l1_norm)
-        return hellinger / (np.linalg.norm(hellinger) + 1e-6)
-
-    def extract_chromatic_part_descriptor(
-        self,
-        norm_crop: np.ndarray,
-        alpha_mask: np.ndarray,
-        local_kpts_xy: np.ndarray,
-        kpts_conf: np.ndarray,
-    ) -> np.ndarray:
-        h, w = norm_crop.shape[:2]
-        binary_mask = (alpha_mask[:, :, 0] > 0.52).astype(np.uint8) * 255
-
-        lab = cv2.cvtColor(norm_crop, cv2.COLOR_BGR2LAB)
-        hsv = cv2.cvtColor(norm_crop, cv2.COLOR_BGR2HSV)
-
-        th = self.kpt_conf_thresh
-        hip_vis = [local_kpts_xy[i, 1] for i in (11, 12) if kpts_conf[i] >= th]
-        raw_split = int(np.mean(hip_vis)) if hip_vis else int(h * 0.52)
-        split_y = int(np.clip(raw_split, max(1, int(h * 0.35)), max(2, min(h - 1, int(h * 0.70)))))
-
-        upper_vec = self._hellinger_hist(lab[:split_y], hsv[:split_y], binary_mask[:split_y])
-        lower_vec = self._hellinger_hist(lab[split_y:], hsv[split_y:], binary_mask[split_y:])
-        full_vec = self._hellinger_hist(lab, hsv, binary_mask)
-
-        color_vec = np.concatenate([upper_vec, lower_vec, full_vec]).astype(np.float32)
-        return color_vec / (np.linalg.norm(color_vec) + 1e-6)
-
-    def evaluate_and_extract(
-        self,
-        frame: np.ndarray,
-        bbox_xyxy: np.ndarray,
-        keypoints_xy: np.ndarray,
-        keypoints_conf: np.ndarray,
-        is_intersecting: bool,
-    ) -> Tuple[Optional[np.ndarray], CropQualityReport]:
-        H_img, W_img = frame.shape[:2]
-        x1, y1, x2, y2 = np.clip(bbox_xyxy.astype(np.int32), [0, 0, 0, 0], [W_img, H_img, W_img, H_img])
-        bw, bh = int(x2 - x1), int(y2 - y1)
-
-        if bw < 12 or bh < 24:
-            return None, CropQualityReport(False, False, 0.0, 0.0, "FRONT", "BBox too small")
-
-        raw_crop = frame[y1:y2, x1:x2].copy()
-        local_kpts = keypoints_xy.copy()
-        local_kpts[:, 0] -= x1
-        local_kpts[:, 1] -= y1
-
-        gray = cv2.cvtColor(raw_crop, cv2.COLOR_BGR2GRAY)
-        if bw > 128:
-            gray = cv2.resize(gray, (128, max(1, int(128 * bh / bw))), interpolation=cv2.INTER_AREA)
-        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-        scale_factor = min(1.0, (bh / 140.0) ** 1.5)
-        effective_blur_thresh = max(6.0, self.min_laplacian_var * scale_factor)
-
-        alpha_mask, vis_ratio = self.build_pose_silhouette_mask(raw_crop.shape, local_kpts, keypoints_conf)
-
-        norm_crop = self.normalize_illumination(raw_crop)
-        bg_fill = np.full_like(norm_crop, IMAGENET_MEAN_BGR)
-        masked_crop = (
-            norm_crop.astype(np.float32) * alpha_mask + bg_fill.astype(np.float32) * (1.0 - alpha_mask)
-        ).astype(np.uint8)
-
-        upper_crop = self.extract_anatomical_upper_subcrop(masked_crop, local_kpts, keypoints_conf)
-
-        body_input = self.resize_for_osnet(masked_crop, 128, 256)
-        upper_input = self.resize_for_osnet(upper_crop, 128, 256)
-
-        rgb_body = cv2.cvtColor(body_input, cv2.COLOR_BGR2RGB)
-        rgb_upper = cv2.cvtColor(upper_input, cv2.COLOR_BGR2RGB)
+        results: list[np.ndarray | None] = [None] * num_targets
+        if not flat_crops:
+            return results
 
         with torch.no_grad():
-            feats = self.extractor([rgb_body, rgb_upper])
-            feats = F.normalize(feats, p=2, dim=1).cpu().numpy().astype(np.float32)
+            raw_features = self.extractor(flat_crops)
+            if not isinstance(raw_features, torch.Tensor):
+                raw_features = torch.tensor(raw_features, device=self.device, dtype=torch.float32)
 
-        color_feat = self.extract_chromatic_part_descriptor(norm_crop, alpha_mask, local_kpts, keypoints_conf)
+            # نرمال‌سازی L2 روی GPU قبل از انتقال به CPU
+            normed_features = F.normalize(raw_features, p=2, dim=1)
+            # شکل‌دهی به (N_valid, 3, 512) برای ترکیب وزن‌دار سر، تنه و کفش روی GPU
+            reshaped = normed_features.view(len(valid_target_indices), 3, -1)
 
-        composite = np.concatenate(
-            [
-                np.sqrt(self.body_w) * feats[0],
-                np.sqrt(self.head_w) * feats[1],
-                np.sqrt(self.color_w) * color_feat,
-            ]
-        ).astype(np.float32)
-        composite /= np.linalg.norm(composite) + 1e-8
+            part_scales = torch.tensor(
+                [np.sqrt(self.w_head), np.sqrt(self.w_torso), np.sqrt(self.w_shoes)],
+                device=reshaped.device,
+                dtype=reshaped.dtype,
+            ).view(1, 3, 1)
 
-        view_bin = self.classify_pose_view(keypoints_xy, keypoints_conf, float(bw), self.kpt_conf_thresh)
-        valid_for_gallery = (not is_intersecting) and (sharpness >= effective_blur_thresh)
+            weighted_parts = reshaped * part_scales
+            # ترکیب بردار وزن‌دار در فضای 512 بعدی + حفظ تمایز بخش‌ها
+            fused_gpu = (
+                self.w_head * reshaped[:, 0, :]
+                + self.w_torso * reshaped[:, 1, :]
+                + self.w_shoes * reshaped[:, 2, :]
+            )
+            # الحاق بردار بخش‌ها برای تفکیک حداکثری در ضرب داخلی کسینوسی
+            concat_gpu = weighted_parts.reshape(len(valid_target_indices), -1)
+            final_gpu = F.normalize(torch.cat([concat_gpu, fused_gpu], dim=1), p=2, dim=1)
 
-        return composite, CropQualityReport(
-            is_valid_for_reid=True,
-            is_valid_for_gallery=valid_for_gallery,
-            sharpness_score=sharpness,
-            visible_ratio=vis_ratio,
-            pose_view_bin=view_bin,
-            reject_reason="Intersecting" if is_intersecting else "OK",
+            final_cpu = final_gpu.cpu().numpy()
+
+        for idx_in_batch, target_idx in enumerate(valid_target_indices):
+            results[target_idx] = final_cpu[idx_in_batch]
+
+        return results
+
+    def extract(self, cv2_image: np.ndarray, keypoints: np.ndarray | None = None) -> np.ndarray | None:
+        """
+        متد تک‌تصویری سازگار با فراخوانی‌های قدیمی.
+        """
+        if cv2_image is None or cv2_image.size == 0:
+            return None
+
+        h, w = cv2_image.shape[:2]
+        batch_out = self.extract_batch(
+            frame_bgr=cv2_image,
+            boxes=[[0, 0, w, h]],
+            keypoints_list=[keypoints],
+            require_complete_skeleton=False,
         )
+        return batch_out[0] if batch_out else None
+
+
+OSNetExtractor = PoseGuidedOSNetExtractor

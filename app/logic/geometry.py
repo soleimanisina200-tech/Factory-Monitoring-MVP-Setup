@@ -1,214 +1,236 @@
-# app/logic/geometry.py
-from __future__ import annotations
-from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+# ایندکس‌های استاندارد ۱۷ مفصل COCO Keypoints
+KP_NOSE = 0
+KP_L_EYE = 1
+KP_R_EYE = 2
+KP_L_EAR = 3
+KP_R_EAR = 4
+KP_L_SHOULDER = 5
+KP_R_SHOULDER = 6
+KP_L_ELBOW = 7
+KP_R_ELBOW = 8
+KP_L_WRIST = 9
+KP_R_WRIST = 10
+KP_L_HIP = 11
+KP_R_HIP = 12
+KP_L_KNEE = 13
+KP_R_KNEE = 14
+KP_L_ANKLE = 15
+KP_R_ANKLE = 16
 
-class MetricBEVProjector:
+# اتصالات استخوان‌های اسکلت انسان برای رسم گرافیکی (مشابه نسخه قبلی)
+SKELETON_CONNECTIONS = [
+    (5, 6),   # شانه به شانه
+    (5, 7),   # شانه چپ به آرنج چپ
+    (7, 9),   # آرنج چپ به مچ دست چپ
+    (6, 8),   # شانه راست به آرنج راست
+    (8, 10),  # آرنج راست به مچ دست راست
+    (5, 11),  # شانه چپ به لگن چپ
+    (6, 12),  # شانه راست به لگن راست
+    (11, 12), # لگن به لگن
+    (11, 13), # لگن چپ به زانو چپ
+    (13, 15), # زانو چپ به مچ پا چپ
+    (12, 14), # لگن راست به زانو راست
+    (14, 16), # زانو راست به مچ پا راست
+]
+
+
+class HomographyTransformer:
+    def __init__(self, src_points=None, dst_points=None):
+        self.matrix = None
+        if src_points and dst_points and len(src_points) >= 4 and len(dst_points) >= 4:
+            src = np.array(src_points, dtype=np.float32)
+            dst = np.array(dst_points, dtype=np.float32)
+            self.matrix, _ = cv2.findHomography(src, dst)
+
+    def transform_point(self, point: tuple[int, int]) -> tuple[float, float]:
+        if self.matrix is None:
+            return float(point[0]), float(point[1])
+        pts = np.array([[[float(point[0]), float(point[1])]]], dtype=np.float32)
+        projected = cv2.perspectiveTransform(pts, self.matrix)
+        return float(projected[0, 0, 0]), float(projected[0, 0, 1])
+
+
+def calculate_ioa(target_box: list[int], other_box: list[int]) -> float:
+    xA = max(target_box[0], other_box[0])
+    yA = max(target_box[1], other_box[1])
+    xB = min(target_box[2], other_box[2])
+    yB = min(target_box[3], other_box[3])
+    interWidth = max(0, xB - xA)
+    interHeight = max(0, yB - yA)
+    interArea = interWidth * interHeight
+    if interArea == 0:
+        return 0.0
+    targetArea = max(1, (target_box[2] - target_box[0]) * (target_box[3] - target_box[1]))
+    return interArea / float(targetArea)
+
+
+def is_touching_border(box: list[int], frame_w: int, frame_h: int, margin: int = 28) -> bool:
+    x1, y1, x2, y2 = box
+    return (x1 <= margin) or (y1 <= margin) or (x2 >= frame_w - margin) or (y2 >= frame_h - margin)
+
+
+def is_skeleton_complete(
+    keypoints: np.ndarray | None,
+    frame_w: int,
+    frame_h: int,
+    margin: int = 20,
+    min_conf: float = 0.45,
+) -> bool:
+    if keypoints is None or len(keypoints) < 17:
+        return False
+    core_indices = [KP_L_SHOULDER, KP_R_SHOULDER, KP_L_HIP, KP_R_HIP]
+    for idx in core_indices:
+        x, y, conf = keypoints[idx]
+        if conf < min_conf:
+            return False
+        if x <= margin or x >= (frame_w - margin) or y <= margin or y >= (frame_h - margin):
+            return False
+    return True
+
+
+def is_occluded_by_others(
+    target_box: list[int],
+    all_boxes: list[list[int]],
+    ioa_threshold: float = 0.18,
+    keypoints: np.ndarray | None = None,
+    min_kp_conf: float = 0.42,
+) -> bool:
+    tx1, ty1, tx2, ty2 = target_box
+    bw = max(1, tx2 - tx1)
+    bh = max(1, ty2 - ty1)
+    aspect_ratio = bh / float(bw)
+
+    for other_box in all_boxes:
+        if target_box == other_box:
+            continue
+        ox1, oy1, ox2, oy2 = other_box
+        overlap_ioa = calculate_ioa(target_box, other_box)
+        if overlap_ioa > ioa_threshold:
+            if oy2 >= (ty2 - 12) or overlap_ioa > 0.45:
+                return True
+
+    if aspect_ratio < 1.30:
+        return True
+
+    if keypoints is not None and len(keypoints) >= 17:
+        shoulders_vis = (
+            keypoints[KP_L_SHOULDER][2] >= min_kp_conf
+            or keypoints[KP_R_SHOULDER][2] >= min_kp_conf
+        )
+        ankles_vis = (
+            keypoints[KP_L_ANKLE][2] >= min_kp_conf
+            or keypoints[KP_R_ANKLE][2] >= min_kp_conf
+        )
+        knees_vis = (
+            keypoints[KP_L_KNEE][2] >= min_kp_conf
+            or keypoints[KP_R_KNEE][2] >= min_kp_conf
+        )
+        if shoulders_vis and (not ankles_vis) and (not knees_vis):
+            return True
+
+    return False
+
+
+def get_foot_point(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    keypoints: np.ndarray | None = None,
+    expected_aspect_ratio: float | None = None,
+    min_kp_conf: float = 0.45,
+) -> tuple[int, int]:
+    center_x = int((x1 + x2) / 2)
+    bottom_y = int(y2)
+
+    if keypoints is not None and len(keypoints) >= 17:
+        l_ank = keypoints[KP_L_ANKLE]
+        r_ank = keypoints[KP_R_ANKLE]
+
+        vis_ankles_x = []
+        vis_ankles_y = []
+        if l_ank[2] >= min_kp_conf and l_ank[0] > 0 and l_ank[1] > 0:
+            vis_ankles_x.append(l_ank[0])
+            vis_ankles_y.append(l_ank[1])
+        if r_ank[2] >= min_kp_conf and r_ank[0] > 0 and r_ank[1] > 0:
+            vis_ankles_x.append(r_ank[0])
+            vis_ankles_y.append(r_ank[1])
+
+        if vis_ankles_y:
+            foot_x = int(np.mean(vis_ankles_x))
+            foot_y = int(max(vis_ankles_y))
+            shoe_offset = int(0.03 * (y2 - y1))
+            return foot_x, max(bottom_y, foot_y + shoe_offset)
+
+    return center_x, bottom_y
+
+
+def estimate_body_orientation(
+    keypoints: np.ndarray | None,
+    box: list[int] | None = None,
+    min_kp_conf: float = 0.40,
+) -> tuple[str, float]:
+    if keypoints is None or len(keypoints) < 17:
+        return "FRONT", 0.35
+
+    l_sh = keypoints[KP_L_SHOULDER]
+    r_sh = keypoints[KP_R_SHOULDER]
+    l_hip = keypoints[KP_L_HIP]
+    r_hip = keypoints[KP_R_HIP]
+
+    sh_valid = l_sh[2] >= min_kp_conf and r_sh[2] >= min_kp_conf
+    hip_valid = l_hip[2] >= min_kp_conf and r_hip[2] >= min_kp_conf
+
+    if not sh_valid and not hip_valid:
+        return "FRONT", 0.35
+
+    dx_sh = (l_sh[0] - r_sh[0]) if sh_valid else 0.0
+    dx_hip = (l_hip[0] - r_hip[0]) if hip_valid else 0.0
+    combined_dx = 0.65 * dx_sh + 0.35 * dx_hip
+    torso_h = max(20.0, (box[3] - box[1]) * 0.35) if box is not None else 60.0
+    width_ratio = abs(combined_dx) / float(torso_h)
+
+    if width_ratio < 0.34:
+        return ("LEFT" if combined_dx >= 0 else "RIGHT"), 0.60
+
+    total_front_score = np.clip(combined_dx / (0.5 * torso_h), -1.0, 1.0)
+    conf = float(min(0.95, 0.55 + 0.35 * abs(total_front_score)))
+    return ("FRONT" if total_front_score >= 0.0 else "BACK"), conf
+
+
+def estimate_normalized_height(box: list[int], keypoints: np.ndarray | None, frame_h: int) -> float | None:
+    x1, y1, x2, y2 = box
+    bh = float(y2 - y1)
+    bw = float(max(1, x2 - x1))
+    if (bh / bw) < 1.65:
+        return None
+    _, foot_y = get_foot_point(x1, y1, x2, y2, keypoints=keypoints)
+    depth_scale = max(0.35, float(foot_y) / float(max(1, frame_h)))
+    return bh / depth_scale
+
+
+def draw_skeleton(frame: np.ndarray, keypoints: np.ndarray | None, min_conf: float = 0.40):
     """
-    Hybrid Homography + Pose-Corrected Anthropometric Metric Projector.
-    Uses bone-length priors (shoulder-to-hip & limb lengths) when a worker crouches
-    so bending over never distorts real-world metric distance calculations.
+    رسم خطوط استخوان‌های اسکلت و مفاصل روی بدن انسان (مشابه تصویر نسخه قبلی).
     """
+    if keypoints is None or len(keypoints) < 17:
+        return
 
-    def __init__(
-        self,
-        src_image_pts: Optional[List[List[float]]] = None,
-        dst_meter_pts: Optional[List[List[float]]] = None,
-        default_px_per_meter: float = 110.0,
-        stream_wh: Optional[Tuple[int, int]] = None,
-        calib_ref_wh: Optional[Tuple[int, int]] = None,
-    ):
-        self.H: Optional[np.ndarray] = None
-        self.default_scale = 1.0 / max(default_px_per_meter, 1.0)
+    # رسم استخوان‌ها (Lines)
+    for pt1_idx, pt2_idx in SKELETON_CONNECTIONS:
+        pt1 = keypoints[pt1_idx]
+        pt2 = keypoints[pt2_idx]
+        if pt1[2] >= min_conf and pt2[2] >= min_conf:
+            p1 = (int(pt1[0]), int(pt1[1]))
+            p2 = (int(pt2[0]), int(pt2[1]))
+            cv2.line(frame, p1, p2, (0, 255, 120), 2)
 
-        if src_image_pts is not None and dst_meter_pts is not None:
-            src = np.array(src_image_pts, dtype=np.float32)
-            dst = np.array(dst_meter_pts, dtype=np.float32)
-
-            if stream_wh is not None and calib_ref_wh is not None:
-                sw, sh = stream_wh
-                rw, rh = calib_ref_wh
-                if np.max(src[:, 0]) <= rw and sw > rw * 1.2:
-                    src[:, 0] *= float(sw) / float(rw)
-                    src[:, 1] *= float(sh) / float(rh)
-
-            if src.shape == (4, 2) and dst.shape == (4, 2):
-                self.H, _ = cv2.findHomography(src, dst, method=0)
-
-    @staticmethod
-    def estimate_standing_height_px(
-        bbox_xyxy: np.ndarray,
-        keypoints_xy: Optional[np.ndarray],
-        keypoints_conf: Optional[np.ndarray],
-        kpt_thresh: float = 0.30,
-    ) -> float:
-        """
-        Estimates the worker's true upright standing height in pixels even when crouching or bending.
-        Prevents bbox height shrinkage during crouching from corrupting metric scale.
-        """
-        x1, y1, x2, y2 = bbox_xyxy
-        bw = float(x2 - x1)
-        bh = max(20.0, float(y2 - y1))
-
-        # If crouching/bending (wide aspect ratio), estimate standing height from skeleton bone lengths or max(bh, 1.8*bw)
-        skeletal_est = bh
-        if keypoints_xy is not None and keypoints_conf is not None and len(keypoints_conf) >= 17:
-            sh_vis = [i for i in (5, 6) if keypoints_conf[i] >= kpt_thresh]
-            hip_vis = [i for i in (11, 12) if keypoints_conf[i] >= kpt_thresh]
-            if sh_vis and hip_vis:
-                sh_pt = np.mean(keypoints_xy[sh_vis], axis=0)
-                hip_pt = np.mean(keypoints_xy[hip_vis], axis=0)
-                torso_px = float(np.linalg.norm(hip_pt - sh_pt))
-                # Standing human height is ~3.3x shoulder-to-hip length
-                skeletal_est = max(bh, torso_px * 3.3)
-
-        return float(np.clip(max(bh, skeletal_est, bw * 1.65), bh, bh * 1.85))
-
-    @staticmethod
-    def estimate_ground_contact_point(
-        bbox_xyxy: np.ndarray,
-        keypoints_xy: Optional[np.ndarray],
-        keypoints_conf: Optional[np.ndarray],
-        kpt_thresh: float = 0.30,
-    ) -> Tuple[float, float, bool]:
-        x1, y1, x2, y2 = bbox_xyxy
-        u_box = 0.5 * float(x1 + x2)
-        bh = max(16.0, float(y2 - y1))
-
-        if keypoints_xy is None or keypoints_conf is None or len(keypoints_conf) < 17:
-            return u_box, float(y2), True
-
-        ankle_vis = [i for i in (15, 16) if keypoints_conf[i] >= kpt_thresh and keypoints_xy[i][1] > 0]
-        if ankle_vis:
-            pts = keypoints_xy[ankle_vis]
-            u_ank = float(np.mean(pts[:, 0]))
-            v_ank = float(np.max(pts[:, 1]))
-            u_stable = 0.60 * u_ank + 0.40 * u_box
-            v_stable = float(np.clip(v_ank, float(y2) - 0.10 * bh, float(y2) + 0.04 * bh))
-            return u_stable, v_stable, False
-
-        sh_vis = [i for i in (5, 6) if keypoints_conf[i] >= kpt_thresh and keypoints_xy[i][1] > 0]
-        hip_vis = [i for i in (11, 12) if keypoints_conf[i] >= kpt_thresh and keypoints_xy[i][1] > 0]
-        if sh_vis and hip_vis:
-            sh_mid = np.mean(keypoints_xy[sh_vis], axis=0)
-            hip_mid = np.mean(keypoints_xy[hip_vis], axis=0)
-            torso_len = float(np.linalg.norm(hip_mid - sh_mid))
-            if torso_len > 6.0:
-                extrapolated_v = float(hip_mid[1] + 1.60 * torso_len)
-                v_clamped = float(np.clip(extrapolated_v, float(y2), float(y2) + 0.20 * bh))
-                u_stable = 0.50 * float(hip_mid[0]) + 0.50 * u_box
-                return u_stable, v_clamped, True
-
-        return u_box, float(y2), True
-
-    def to_bev_meters(self, u: float, v: float) -> np.ndarray:
-        if self.H is not None:
-            vec = np.array([u, v, 1.0], dtype=np.float64)
-            proj = self.H @ vec
-            if proj[2] > 0.08:
-                bx, by = float(proj[0] / proj[2]), float(proj[1] / proj[2])
-                if -40.0 <= bx <= 120.0 and -40.0 <= by <= 120.0:
-                    return np.array([bx, by], dtype=np.float32)
-
-        return np.array([u * self.default_scale, v * self.default_scale], dtype=np.float32)
-
-    def compute_metric_distance(
-        self,
-        uv1: Tuple[float, float],
-        bev1: np.ndarray,
-        h1_px: float,
-        uv2: Tuple[float, float],
-        bev2: np.ndarray,
-        h2_px: float,
-    ) -> float:
-        avg_h_px = max(28.0, 0.5 * (h1_px + h2_px))
-        meters_per_px = 1.72 / avg_h_px
-        du = uv1[0] - uv2[0]
-        dv = (uv1[1] - uv2[1]) * 1.25
-        anthro_dist = float(np.hypot(du, dv) * meters_per_px)
-
-        bev_dist = float(np.linalg.norm(bev1 - bev2))
-        if bev_dist > 2.0 * anthro_dist or anthro_dist > 2.0 * bev_dist:
-            return anthro_dist
-        return 0.35 * bev_dist + 0.65 * anthro_dist
-
-
-def compute_single_iou(boxA: np.ndarray, boxB: np.ndarray) -> float:
-    xA = max(float(boxA[0]), float(boxB[0]))
-    yA = max(float(boxA[1]), float(boxB[1]))
-    xB = min(float(boxA[2]), float(boxB[2]))
-    yB = min(float(boxA[3]), float(boxB[3]))
-    inter = max(0.0, xB - xA) * max(0.0, yB - yA)
-    areaA = max(1.0, float(boxA[2] - boxA[0]) * float(boxA[3] - boxA[1]))
-    areaB = max(1.0, float(boxB[2] - boxB[0]) * float(boxB[3] - boxB[1]))
-    return float(inter / (areaA + areaB - inter + 1e-6))
-
-
-def compute_pairwise_iou_matrix(boxes_xyxy: np.ndarray) -> np.ndarray:
-    N = len(boxes_xyxy)
-    if N <= 1:
-        return np.zeros((N, N), dtype=np.float32)
-
-    x1 = boxes_xyxy[:, 0][:, None]
-    y1 = boxes_xyxy[:, 1][:, None]
-    x2 = boxes_xyxy[:, 2][:, None]
-    y2 = boxes_xyxy[:, 3][:, None]
-
-    areas = np.maximum(0.0, (x2 - x1)) * np.maximum(0.0, (y2 - y1))
-    xx1 = np.maximum(x1, x1.T)
-    yy1 = np.maximum(y1, y1.T)
-    xx2 = np.minimum(x2, x2.T)
-    yy2 = np.minimum(y2, y2.T)
-
-    inter_w = np.maximum(0.0, xx2 - xx1)
-    inter_h = np.maximum(0.0, yy2 - yy1)
-    inter_area = inter_w * inter_h
-
-    union_area = areas + areas.T - inter_area + 1e-6
-    iou = inter_area / union_area
-    np.fill_diagonal(iou, 0.0)
-    return iou.astype(np.float32)
-
-
-def compute_intersection_contamination(
-    boxes_xyxy: np.ndarray,
-    keypoints_xy: Optional[np.ndarray],
-    keypoints_conf: Optional[np.ndarray],
-    max_iou_thresh: float = 0.18,
-    kpt_thresh: float = 0.40,
-) -> np.ndarray:
-    """
-    Strictly flags any detection that overlaps with another worker (IoU > 0.18)
-    or has another worker's skeleton joints intruding inside its bounding box.
-    """
-    N = len(boxes_xyxy)
-    if N <= 1:
-        return np.zeros(N, dtype=bool)
-
-    iou_mat = compute_pairwise_iou_matrix(boxes_xyxy)
-    contaminated = np.max(iou_mat, axis=1) > max_iou_thresh
-
-    if keypoints_xy is not None and keypoints_conf is not None and len(keypoints_xy) == N:
-        for i in range(N):
-            if contaminated[i]:
-                continue
-            x1, y1, x2, y2 = boxes_xyxy[i]
-            bw, bh = x2 - x1, y2 - y1
-            cx1, cy1 = x1 + 0.10 * bw, y1 + 0.08 * bh
-            cx2, cy2 = x2 - 0.10 * bw, y2 - 0.08 * bh
-
-            for j in range(N):
-                if i == j:
-                    continue
-                vis_idx = [k for k in range(17) if keypoints_conf[j, k] >= kpt_thresh]
-                if not vis_idx:
-                    continue
-                pts = keypoints_xy[j, vis_idx]
-                inside = (pts[:, 0] >= cx1) & (pts[:, 0] <= cx2) & (pts[:, 1] >= cy1) & (pts[:, 1] <= cy2)
-                if np.any(inside):
-                    contaminated[i] = True
-                    break
-
-    return contaminated
+    # رسم مفصل‌ها (Circles)
+    for idx in range(17):
+        pt = keypoints[idx]
+        if pt[2] >= min_conf:
+            center = (int(pt[0]), int(pt[1]))
+            cv2.circle(frame, center, 3, (0, 255, 255), -1)

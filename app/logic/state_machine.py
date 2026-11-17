@@ -1,96 +1,237 @@
-# app/logic/state_machine.py
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-import cv2
-import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class WorkerZoneState:
-    global_id: int
-    is_inside: bool = False
-    entry_accum_sec: float = 0.0
-    exit_accum_sec: float = 0.0
-    entered_at_ts: float = 0.0
-    last_seen_ts: float = 0.0
-    total_dwell_sec: float = 0.0
-
-
-class TimeBasedZoneStateMachine:
+class ZoneStateMachine:
     """
-    Variable-FPS resilient Zone State Machine.
-    Uses monotonic seconds instead of frame counters for entry/exit hysteresis and FORCE_EXIT GC.
+    ماشین وضعیت زمان‌محور و فریم‌محور بدون خطای بایاس زمانی (Zero-Bias Dwell Time)
+    با پشتیبانی از انتقال مستقیم بین نواحی همسایه و مکانیزم FORCE_EXIT.
     """
 
     def __init__(
         self,
-        zone_id: str,
-        polygon_pts: List[List[int]],
-        entry_confirm_sec: float = 0.60,
-        exit_confirm_sec: float = 1.20,
-        force_exit_timeout_sec: float = 15.0,
+        entry_frames: int = 8,
+        exit_frames: int = 12,
+        timeout_sec: float = 4.0,
+        entry_confirm_sec: float = 0.30,
+        exit_confirm_sec: float = 0.45,
+        stale_cleanup_sec: float = 300.0,
     ):
-        self.zone_id = zone_id
-        self.polygon = np.array(polygon_pts, dtype=np.int32)
+        self.entry_frames = entry_frames
+        self.exit_frames = exit_frames
+        self.timeout_sec = timeout_sec
         self.entry_confirm_sec = entry_confirm_sec
         self.exit_confirm_sec = exit_confirm_sec
-        self.force_exit_timeout_sec = force_exit_timeout_sec
-        self.states: Dict[int, WorkerZoneState] = {}
-        self.prev_frame_ts: float = 0.0
+        self.stale_cleanup_sec = stale_cleanup_sec
+        self.states = {}
 
-    def update(
-        self,
-        active_workers_ground_uv: Dict[int, Tuple[float, float]],
-        frame_ts: float,
-    ) -> List[Dict]:
-        events: List[Dict] = []
-        dt = max(0.01, min(frame_ts - self.prev_frame_ts, 2.0)) if self.prev_frame_ts > 0 else 0.033
-        self.prev_frame_ts = frame_ts
+    def _init_person_state(self, timestamp: float) -> dict:
+        return {
+            "status": "OUTSIDE",
+            "zone": None,
+            "entry_time": 0.0,
+            "last_seen": timestamp,
+            "last_seen_inside": timestamp,
+            # بافرهای کاندیدای ورود و خروج بدون خطای بایاس
+            "candidate_zone": None,
+            "candidate_frames": 0,
+            "candidate_start_ts": None,
+            "exit_buffer_frames": 0,
+            "exit_start_ts": None,
+            "pending_events": [],
+        }
 
-        # 1. Process visible workers using Pose-Extrapolated Ground Contact Point
-        for gid, (u_g, v_g) in active_workers_ground_uv.items():
-            in_poly = cv2.pointPolygonTest(self.polygon, (float(u_g), float(v_g)), False) >= 0
-            st = self.states.setdefault(gid, WorkerZoneState(global_id=gid, last_seen_ts=frame_ts))
-            st.last_seen_ts = frame_ts
+    def update(self, person_id: str, momentary_zone: str | None, timestamp: float):
+        """
+        به‌روزرسانی وضعیت حضور کارگر در نواحی.
+        خروجی: (event, event_data, status, active_dwell)
+        """
+        if person_id not in self.states:
+            self.states[person_id] = self._init_person_state(timestamp)
 
-            if in_poly:
-                st.exit_accum_sec = 0.0
-                if not st.is_inside:
-                    st.entry_accum_sec += dt
-                    if st.entry_accum_sec >= self.entry_confirm_sec:
-                        st.is_inside = True
-                        st.entered_at_ts = frame_ts - st.entry_accum_sec
-                        events.append({"event": "ZONE_ENTER", "zone": self.zone_id, "global_id": gid, "ts": frame_ts})
+        state = self.states[person_id]
+        state["last_seen"] = timestamp
+
+        event = None
+        event_data = None
+        active_dwell = 0.0
+
+        # اگر از فریم قبلی رویداد انتقالی (مثلاً ورود بلافاصله پس از خروج از زون همسایه) در صف است
+        if state["pending_events"]:
+            event, event_data = state["pending_events"].pop(0)
+
+        if state["status"] == "OUTSIDE":
+            if momentary_zone is not None:
+                if state["candidate_zone"] != momentary_zone:
+                    state["candidate_zone"] = momentary_zone
+                    state["candidate_frames"] = 1
+                    state["candidate_start_ts"] = timestamp
                 else:
-                    st.total_dwell_sec = frame_ts - st.entered_at_ts
+                    state["candidate_frames"] += 1
+
+                elapsed_entry = timestamp - (state["candidate_start_ts"] or timestamp)
+                if (
+                    state["candidate_frames"] >= self.entry_frames
+                    or elapsed_entry >= self.entry_confirm_sec
+                ):
+                    true_entry_ts = state["candidate_start_ts"] or timestamp
+                    state["status"] = "INSIDE"
+                    state["zone"] = momentary_zone
+                    state["entry_time"] = true_entry_ts
+                    state["last_seen_inside"] = timestamp
+                    state["candidate_zone"] = None
+                    state["candidate_frames"] = 0
+                    state["candidate_start_ts"] = None
+                    state["exit_buffer_frames"] = 0
+                    state["exit_start_ts"] = None
+
+                    active_dwell = max(0.0, timestamp - true_entry_ts)
+                    event = "ZONE_ENTER"
+                    event_data = {
+                        "person_id": person_id,
+                        "zone": momentary_zone,
+                        "timestamp": true_entry_ts,
+                        "duration": 0.0,
+                    }
             else:
-                st.entry_accum_sec = 0.0
-                if st.is_inside:
-                    st.exit_accum_sec += dt
-                    if st.exit_accum_sec >= self.exit_confirm_sec:
-                        st.is_inside = False
-                        dwell = frame_ts - st.entered_at_ts
-                        events.append(
-                            {"event": "ZONE_EXIT", "zone": self.zone_id, "global_id": gid, "dwell_sec": round(dwell, 2), "ts": frame_ts}
-                        )
+                state["candidate_zone"] = None
+                state["candidate_frames"] = 0
+                state["candidate_start_ts"] = None
 
-        # 2. FORCE_EXIT Garbage Collector (Time-based, surviving temporary camera drops)
-        stale_gids = []
-        for gid, st in self.states.items():
-            if gid not in active_workers_ground_uv:
-                unseen_sec = frame_ts - st.last_seen_ts
-                if st.is_inside and unseen_sec >= self.force_exit_timeout_sec:
-                    st.is_inside = False
-                    dwell = st.last_seen_ts - st.entered_at_ts
-                    events.append(
-                        {"event": "FORCE_EXIT", "zone": self.zone_id, "global_id": gid, "dwell_sec": round(dwell, 2), "ts": frame_ts}
+        elif state["status"] == "INSIDE":
+            current_zone = state["zone"]
+
+            if momentary_zone == current_zone:
+                # کارگر همچنان داخل همان زون است
+                state["last_seen_inside"] = timestamp
+                state["exit_buffer_frames"] = 0
+                state["exit_start_ts"] = None
+                state["candidate_zone"] = None
+                state["candidate_frames"] = 0
+                state["candidate_start_ts"] = None
+                active_dwell = max(0.0, timestamp - state["entry_time"])
+            else:
+                # کارگر خارج از زون فعلی دیده شده (یا بیرون رفته یا وارد زون همسایه شده است)
+                if state["exit_buffer_frames"] == 0:
+                    state["exit_start_ts"] = timestamp
+                state["exit_buffer_frames"] += 1
+
+                # اگر مستقیماً وارد یک زون همسایه (momentary_zone != None) شده، همزمان شمارش ورود به زون جدید را انجام بده
+                if momentary_zone is not None:
+                    if state["candidate_zone"] != momentary_zone:
+                        state["candidate_zone"] = momentary_zone
+                        state["candidate_frames"] = 1
+                        state["candidate_start_ts"] = timestamp
+                    else:
+                        state["candidate_frames"] += 1
+                else:
+                    state["candidate_zone"] = None
+                    state["candidate_frames"] = 0
+                    state["candidate_start_ts"] = None
+
+                elapsed_exit = timestamp - (state["exit_start_ts"] or timestamp)
+                active_dwell = max(0.0, timestamp - state["entry_time"])
+
+                if (
+                    state["exit_buffer_frames"] >= self.exit_frames
+                    or elapsed_exit >= self.exit_confirm_sec
+                ):
+                    # زمان واقعی خروج همان لحظه اول خروج از مرز زون است (رفع خطای بایاس duration)
+                    true_exit_ts = state["exit_start_ts"] or timestamp
+                    duration = max(0.0, true_exit_ts - state["entry_time"])
+
+                    event = "ZONE_EXIT"
+                    event_data = {
+                        "person_id": person_id,
+                        "zone": current_zone,
+                        "timestamp": true_exit_ts,
+                        "duration": duration,
+                    }
+
+                    # بررسی اینکه آیا همزمان ورود به زون همسایه نیز تایید شده است؟
+                    next_zone = state["candidate_zone"]
+                    next_frames = state["candidate_frames"]
+                    next_start_ts = state["candidate_start_ts"]
+                    elapsed_next = (
+                        (timestamp - next_start_ts) if next_start_ts is not None else 0.0
                     )
-                    stale_gids.append(gid)
-                elif not st.is_inside and unseen_sec >= self.force_exit_timeout_sec * 2:
-                    stale_gids.append(gid)
 
-        for gid in stale_gids:
-            del self.states[gid]
+                    if next_zone is not None and (
+                        next_frames >= self.entry_frames
+                        or elapsed_next >= self.entry_confirm_sec
+                    ):
+                        state["status"] = "INSIDE"
+                        state["zone"] = next_zone
+                        state["entry_time"] = next_start_ts or true_exit_ts
+                        state["last_seen_inside"] = timestamp
+                        state["exit_buffer_frames"] = 0
+                        state["exit_start_ts"] = None
+                        state["candidate_zone"] = None
+                        state["candidate_frames"] = 0
+                        state["candidate_start_ts"] = None
+                        active_dwell = max(0.0, timestamp - state["entry_time"])
 
-        return events
+                        state["pending_events"].append(
+                            (
+                                "ZONE_ENTER",
+                                {
+                                    "person_id": person_id,
+                                    "zone": next_zone,
+                                    "timestamp": state["entry_time"],
+                                    "duration": 0.0,
+                                },
+                            )
+                        )
+                    else:
+                        state["status"] = "OUTSIDE"
+                        state["zone"] = None
+                        state["entry_time"] = 0.0
+                        state["exit_buffer_frames"] = 0
+                        state["exit_start_ts"] = None
+                        active_dwell = 0.0
+
+        return event, event_data, state["status"], active_dwell
+
+    def process_missing_workers(self, current_timestamp: float) -> list[dict]:
+        """
+        بررسی کارگرانی که در وضعیت INSIDE بوده‌اند اما بیش از timeout_sec دیده نشده‌اند (FORCE_EXIT)
+        و پاکسازی وضعیت‌های قدیمی برای جلوگیری از نشت حافظه.
+        """
+        forced_events = []
+        to_delete = []
+
+        for person_id, state in list(self.states.items()):
+            time_since_seen = current_timestamp - state["last_seen"]
+
+            if state["status"] == "INSIDE" and time_since_seen >= self.timeout_sec:
+                # زمان واقعی خروج آخرین لحظه‌ای است که فرد واقعاً در تصویر/زون دیده شده است
+                true_exit_ts = state.get("last_seen_inside", state["last_seen"])
+                duration = max(0.0, true_exit_ts - state["entry_time"])
+                zone_name = state["zone"]
+
+                forced_events.append(
+                    {
+                        "event": "FORCE_EXIT",
+                        "person_id": person_id,
+                        "zone": zone_name,
+                        "timestamp": true_exit_ts,
+                        "duration": duration,
+                    }
+                )
+                logger.info(
+                    f"[FORCE_EXIT] {person_id} missing for {time_since_seen:.1f}s -> closed session in {zone_name} (duration={duration:.1f}s)"
+                )
+                state["status"] = "OUTSIDE"
+                state["zone"] = None
+                state["entry_time"] = 0.0
+                state["exit_buffer_frames"] = 0
+                state["exit_start_ts"] = None
+
+            elif state["status"] == "OUTSIDE" and time_since_seen > self.stale_cleanup_sec:
+                to_delete.append(person_id)
+
+        for pid in to_delete:
+            del self.states[pid]
+
+        return forced_events

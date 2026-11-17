@@ -13,9 +13,9 @@
 
 
 tracker_type: bytetrack
-track_high_thresh: 0.15   # Catches distant 40px humans at the top of the 2560x1920 yard
-track_low_thresh: 0.05    # Keeps tracks alive during partial occlusion behind pallets/forklift
-new_track_thresh: 0.16    # Immediately initializes tracks for far-away workers
-track_buffer: 120         # 6.0 seconds buffer (@ 20 FPS) so workers hiding for seconds keep their ID
-match_thresh: 0.82
+track_high_thresh: 0.45
+track_low_thresh: 0.12
+new_track_thresh: 0.55
+track_buffer: 25
+match_thresh: 0.80
 fuse_score: True

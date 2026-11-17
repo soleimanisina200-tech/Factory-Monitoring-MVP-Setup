@@ -1,53 +1,63 @@
-system: {device: 'cuda:0', half_precision: true, display_gui: true, output_video_path: output_industrial_reid.mp4}
-stream: {source: 'D:/AI/EsfahanMoghadam/Factory Monitoring MVP Setup/data/input/test_video.mp4',
-  reconnect_delay_sec: 3.0, drop_frames_on_lag: true}
-detection: {model_weights: yolo11m-pose.pt, tracker_config: configs/custom_bytetrack.yaml,
-  conf_thres: 0.08, iou_thres: 0.6, imgsz: 1536}
-reid: {model_name: osnet_x1_0, weights_path: weights/osnet_x1_0_msmt17.pt, kpt_conf_thresh: 0.2,
-  min_laplacian_var: 10.0, head_branch_weight: 0.35, color_branch_weight: 0.2, cos_sim_thresh: 0.6,
-  spatial_recovery_sim_thresh: 0.48, reentry_sim_thresh: 0.82, reid_interval_sec: 0.35}
-physics_bev:
-  max_worker_speed_mps: 3.5
-  max_internal_occlusion_m: 5.5
-  lag_diffusion_coeff: 0.65
-  base_pose_jitter_m: 0.7
-  default_px_per_meter: 110.0
-  calibration_ref_wh: [1280, 720]
-  src_image_pts:
-  - [320, 280]
-  - [960, 280]
-  - [1180, 680]
-  - [100, 680]
-  dst_meter_pts:
-  - [0.0, 0.0]
-  - [6.0, 0.0]
-  - [6.0, 8.0]
-  - [0.0, 8.0]
+stream:
+  source: "D:/AI/EsfahanMoghadam/Factory Monitoring MVP Setup/data/input/test_video.mp4" # مسیر فایل ویدیویی یا آدرس استریم RTSP
+  width: 1280
+  height: 720
+  fps: 25
+  reconnect_delay: 3.0
+
+detection:
+  model_path: "yolo11m-pose.pt"      # مدل YOLO-Pose برای استخراج همزمان باکس و ۱۷ مفصل اسکلت
+  conf_threshold: 0.40
+  iou_threshold: 0.50
+  device: "cuda"
+  tracker_config: "configs/custom_bytetrack.yaml"
+
+reid:
+  model_name: "osnet_ain_x1_0"       # مدل مقاوم به تغییرات نور و استایل (با Fallback خودکار به osnet_x1_0)
+  device: "cuda"
+  similarity_threshold: 0.68         # آستانه پایه تطبیق کسینوسی پس از حذف میانگین لباس فرم
+  margin_threshold: 0.06             # حداقل اختلاف شباهت نفر اول با نفر دوم (قانون Margin برای لباس فرم یکسان)
+  reverify_sim_floor: 0.52           # کف شباهت برای حفظ قفل ترک در فریم‌های بعدی
+  max_gallery_size: 8                # حداکثر بردار ذخیره‌شده به ازای هر باکت زاویه دید
+  probation_frames: 4                # تعداد فریم‌های سالم لازم قبل از صدور Worker_ID دائمی
+  reid_interval_frames: 10           # فاصله فریم‌ها برای بازبینی دوره‌ای ترک‌های قفل‌شده
+  track_ttl_sec: 180.0               # زمان پاکسازی خودکار ترک‌های قدیمی از حافظه (جلوگیری از Memory Leak)
+  border_cooldown_sec: 3.5           # زمان محافظت از آیدی کارگر خارج‌شده از لبه کادر
+  max_speed_px_per_sec: 450.0        # حداکثر سرعت مجاز حرکت انسان در تصویر (Kinematic Gate)
+  uniform_whitening_alpha: 0.55      # ضریب حذف بردار میانگین لباس فرم کارخانه (Feature Centering)
+  part_weights:
+    head: 0.55                       # بیشترین وزن برای ناحیه سر، صورت، گردن و کلاه
+    shoes: 0.30                      # وزن دوم برای ساق پا و کفش ایمنی
+    torso: 0.15                      # کمترین وزن برای تنه (خنثی‌سازی اثر لباس فرم یکسان)
+
+geometry:
+  border_margin_px: 28               # حاشیه تشخیص چسبیدن باکس به لبه تصویر (پیکسل)
+  occlusion_ioa_threshold: 0.18      # آستانه مساحت اشتراک به مساحت سوژه عقب‌تر (IoA)
+  min_keypoint_conf: 0.45            # حداقل اطمینان مفاصل اسکلت
+  homography_src: []                 # در صورت نیاز: ۴ نقطه پیکسلی کف سالن [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+  homography_dst: []                 # در صورت نیاز: ۴ نقطه متریک متناظر [[0,0], [W,0], [W,H], [0,H]]
+
+state_machine:
+  entry_frames: 8                    # حداقل فریم برای تایید ورود
+  exit_frames: 12                    # حداقل فریم برای تایید خروج
+  entry_confirm_sec: 0.32            # زمان تایید ورود بر حسب ثانیه (مستقل از افت FPS)
+  exit_confirm_sec: 0.48             # زمان تایید خروج بر حسب ثانیه (مستقل از افت FPS)
+  timeout_sec: 4.0                   # زمان غیبت برای صدور رویداد FORCE_EXIT
+
 zones:
-  entry_confirm_sec: 0.5
-  exit_confirm_sec: 1.0
-  force_exit_timeout_sec: 15.0
-  definitions: {}
-# directional_tracking:
-  # draw_trails: true
-  # entrance_zones:
-  #   company_entrance_gate:
-  #     polygon:
-  #     - [2075, 966]
-  #     - [2004, 984]
-  #     - [1945, 1000]
-  #     - [1943, 1030]
-  #     - [1924, 1076]
-  #     - [1925, 1124]
-  #     - [1919, 1155]
-  #     - [1931, 1197]
-  #     - [1932, 1249]
-  #     - [1947, 1301]
-  #     - [1975, 1345]
-  #     - [1995, 1378]
-  #     - [2001, 1398]
-  #     - [2193, 1303]
-  #     - [2204, 1266]
-  #     entry_direction_vector: [0.8405, 0.5418]
-  #     min_displacement: 20.0
-  #     color: [255, 165, 0]
+  Zone_Assembly:
+    - [150, 220]
+    - [580, 220]
+    - [640, 650]
+    - [100, 650]
+  Zone_Packaging:
+    - [660, 220]
+    - [1120, 220]
+    - [1180, 650]
+    - [660, 650]
+
+output:
+  save_video: true
+  output_video_path: "output_monitored.mp4"
+  events_csv_path: "zone_events_log.csv"
+  show_display: true
