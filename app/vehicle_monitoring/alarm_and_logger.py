@@ -1,18 +1,28 @@
 import csv
-import time
+import logging
+import queue
 import sqlite3
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
+logger = logging.getLogger("FactoryReID")
+
+# Event types that sound the alarm and are rate-limited per vehicle.
+ALARM_EVENT_TYPES = ("SAFE_DISTANCE_VIOLATION_ALARM", "DRIVER_NOT_VISIBLE_ALARM")
+
 
 class SafetyAlarmAndLogger:
     """
     Provides non-blocking audible/visual alarm activation and persistent event logging
     (SQLite + CSV + Annotated Video Snapshots) for all driver-vehicle events.
+
+    Disk I/O (JPEG snapshot, SQLite, CSV) runs on a background thread so the real-time video loop is never
+    blocked by storage latency. `get_recent_events()` is updated immediately.
     """
 
     def __init__(self, config: dict):
@@ -36,6 +46,10 @@ class SafetyAlarmAndLogger:
         self._last_alarm_ts: Dict[str, float] = {}
         self._recent_events: List[Dict] = []
         self._init_storage()
+
+        self._queue: "queue.Queue[Optional[tuple]]" = queue.Queue(maxsize=512)
+        self._worker = threading.Thread(target=self._writer_loop, name="safety-log-writer", daemon=True)
+        self._worker.start()
 
     def _init_storage(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -75,14 +89,72 @@ class SafetyAlarmAndLogger:
 
         threading.Thread(target=_sound_worker, daemon=True).start()
 
+    # ------------------------------------------------------------------
+    # Background persistence
+    # ------------------------------------------------------------------
+    def _persist(self, record: Dict, frame: np.ndarray) -> None:
+        cv2.imwrite(record["snapshot_path"], frame)
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO vehicle_safety_events
+                (timestamp_iso, event_type, vehicle_id, driver_id, distance_m, threshold_m, snapshot_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record["timestamp_iso"],
+                record["event_type"],
+                record["vehicle_id"],
+                record["driver_id"],
+                record["distance_m"],
+                record["threshold_m"],
+                record["snapshot_path"],
+            ))
+            conn.commit()
+
+        with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                record["timestamp_iso"],
+                record["event_type"],
+                record["vehicle_id"],
+                record["driver_id"],
+                record["distance_m"],
+                record["threshold_m"],
+                record["snapshot_path"],
+            ])
+
+    def _writer_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                return
+            record, frame = item
+            try:
+                self._persist(record, frame)
+            except Exception:
+                logger.exception("Failed to persist safety event %s", record.get("event_type"))
+            finally:
+                self._queue.task_done()
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """Block until queued events are written (used on shutdown and in tests)."""
+        deadline = time.time() + timeout
+        while self._queue.unfinished_tasks and time.time() < deadline:
+            time.sleep(0.01)
+
+    def close(self) -> None:
+        self.flush()
+        self._queue.put(None)
+
+    # ------------------------------------------------------------------
     def process_events(self, events: List[Dict], annotated_frame: np.ndarray):
         now = time.time()
         for ev in events:
             vid = str(ev.get("vehicle_id", "unknown"))
             ev_type = ev.get("event_type", "UNKNOWN")
 
-            # Enforce cooldown for repeat violation alarms on the same vehicle
-            if ev_type == "SAFE_DISTANCE_VIOLATION_ALARM":
+            # Enforce cooldown for repeat alarms on the same vehicle
+            if ev_type in ALARM_EVENT_TYPES:
                 last_ts = self._last_alarm_ts.get(vid, 0.0)
                 if (now - last_ts) < self.cooldown_sec:
                     continue
@@ -92,8 +164,6 @@ class SafetyAlarmAndLogger:
             ts_iso = datetime.fromtimestamp(ev.get("timestamp", now)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             snap_filename = f"{ev_type}_V{vid}_D{ev.get('driver_id')}_{int(now * 1000)}.jpg"
             snap_full_path = self.snapshot_dir / snap_filename
-
-            cv2.imwrite(str(snap_full_path), annotated_frame)
 
             record = {
                 "timestamp_iso": ts_iso,
@@ -105,33 +175,15 @@ class SafetyAlarmAndLogger:
                 "snapshot_path": str(snap_full_path),
             }
 
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    INSERT INTO vehicle_safety_events
-                    (timestamp_iso, event_type, vehicle_id, driver_id, distance_m, threshold_m, snapshot_path)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    record["timestamp_iso"],
-                    record["event_type"],
-                    record["vehicle_id"],
-                    record["driver_id"],
-                    record["distance_m"],
-                    record["threshold_m"],
-                    record["snapshot_path"],
-                ))
-                conn.commit()
-
-            with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    record["timestamp_iso"],
-                    record["event_type"],
-                    record["vehicle_id"],
-                    record["driver_id"],
-                    record["distance_m"],
-                    record["threshold_m"],
-                    record["snapshot_path"],
-                ])
+            try:
+                self._queue.put_nowait((record, annotated_frame.copy()))
+            except queue.Full:
+                # Never lose an audit record: fall back to writing synchronously.
+                logger.warning("Safety log queue full; writing event synchronously")
+                try:
+                    self._persist(record, annotated_frame)
+                except Exception:
+                    logger.exception("Failed to persist safety event %s", ev_type)
 
             self._recent_events.insert(0, record)
             self._recent_events = self._recent_events[:50]

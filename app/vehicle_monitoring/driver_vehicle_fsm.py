@@ -20,6 +20,7 @@ class VehicleSafetyState(str, Enum):
     DRIVER_EXITED_WARNING = "DRIVER_EXITED_WARNING"
     DISTANCE_VIOLATION_ALARM = "DISTANCE_VIOLATION_ALARM"
     DISTANCE_UNCERTAIN = "DISTANCE_UNCERTAIN"
+    DRIVER_NOT_VISIBLE_ALARM = "DRIVER_NOT_VISIBLE_ALARM"
 
 
 @dataclass
@@ -28,15 +29,29 @@ class PersonTrackHistory:
     first_seen_ts: float
     spawn_world_xy: Tuple[float, float]
     current_world_xy: Tuple[float, float]
+    spawn_px: Tuple[float, float] = (0.0, 0.0)
     world_history: Deque[Tuple[float, float, float]] = field(
         default_factory=lambda: deque(maxlen=20)
     )
+    # Image-space centre history: scale-free, so co-motion checks work even before calibration.
+    px_history: Deque[Tuple[float, float, float]] = field(
+        default_factory=lambda: deque(maxlen=20)
+    )
     total_frames_seen: int = 0
+    last_seen_ts: float = 0.0
 
-    def update_position(self, world_xy: Tuple[float, float], ts: float) -> None:
+    def update_position(
+        self,
+        world_xy: Tuple[float, float],
+        ts: float,
+        center_px: Optional[Tuple[float, float]] = None,
+    ) -> None:
         self.current_world_xy = world_xy
         self.world_history.append((world_xy[0], world_xy[1], ts))
+        if center_px is not None:
+            self.px_history.append((float(center_px[0]), float(center_px[1]), ts))
         self.total_frames_seen += 1
+        self.last_seen_ts = ts
 
     def get_speed_mps(self) -> float:
         """Calculates recent walking speed in meters/second."""
@@ -67,7 +82,7 @@ class VehicleSessionRecord:
     overlap_frames: Dict[str, int] = field(default_factory=dict)
     frames_outside_cab: int = 0
     last_measurement: Optional[DistanceMeasurement] = None
-    last_seen_ts: float = field(default_factory=time.time)
+    last_seen_ts: float = 0.0
     is_visible_in_current_frame: bool = True
     exit_timestamp: Optional[float] = None
     alarm_active: bool = False
@@ -78,6 +93,12 @@ class VehicleSessionRecord:
     is_currently_moving: bool = False
     has_ever_moved: bool = False
     last_moved_ts: float = 0.0
+    # Image-space centre history of the vehicle (for driver<->vehicle co-motion checks)
+    px_history: Deque[Tuple[float, float, float]] = field(
+        default_factory=lambda: deque(maxlen=25)
+    )
+    driver_last_seen_ts: float = 0.0
+    driver_lost_since: Optional[float] = None
 
 
 class DriverVehicleMonitorFSM:
@@ -126,6 +147,20 @@ class DriverVehicleMonitorFSM:
         self.assigned_ghost_timeout_sec: float = float(
             pair_cfg.get("assigned_ghost_timeout_sec", 15.0)
         )
+
+        # Driver-identity robustness
+        self.allow_provisional_spawn: bool = bool(pair_cfg.get("allow_provisional_ids_for_spawn", False))
+        self.spawn_border_margin_px: float = float(pair_cfg.get("spawn_border_margin_px", 40))
+        self.handover_iou_thresh: float = float(pair_cfg.get("driver_handover_iou", 0.5))
+        self.handover_max_gap_sec: float = float(pair_cfg.get("driver_handover_max_gap_sec", 1.0))
+        self.min_comotion_cos: float = float(pair_cfg.get("comotion_min_cosine", 0.6))
+        self.comotion_speed_ratio: Tuple[float, float] = (
+            float(pair_cfg.get("comotion_min_speed_ratio", 0.4)),
+            float(pair_cfg.get("comotion_max_speed_ratio", 2.0)),
+        )
+        self.person_history_ttl_sec: float = float(pair_cfg.get("person_history_ttl_sec", 60.0))
+        # 0 disables the "driver vanished" alarm (policy decision to be confirmed by the safety officer).
+        self.driver_lost_alarm_sec: float = float(pair_cfg.get("driver_lost_alarm_sec", 0.0))
 
         self.safe_thresh_m: float = float(dist_cfg.get("safe_distance_threshold_m", 3.0))
         self.warn_thresh_m: float = float(dist_cfg.get("warning_distance_threshold_m", 2.0))
@@ -263,6 +298,7 @@ class DriverVehicleMonitorFSM:
         base_px = (0.5 * (vx1 + vx2), vy2)
         world_xy = self.estimator.pixel_to_world(base_px)
         rec.world_pos_history.append((world_xy[0], world_xy[1], now))
+        rec.px_history.append((0.5 * (vx1 + vx2), 0.5 * (vy1 + vy2), now))
 
         if len(rec.world_pos_history) >= 6:
             x0, y0, _ = rec.world_pos_history[0]
@@ -323,31 +359,128 @@ class DriverVehicleMonitorFSM:
             other_bboxes=other_bboxes,
         )
 
+    @staticmethod
+    def _recent_displacement(hist, k: int) -> Optional[np.ndarray]:
+        if len(hist) < max(2, k):
+            return None
+        pts = list(hist)[-k:]
+        return np.array([pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]], dtype=np.float64)
+
+    def _co_motion(self, rec: VehicleSessionRecord, p_hist: PersonTrackHistory) -> Optional[bool]:
+        """
+        Does this person move WITH the vehicle? A real operator travels with the forklift (same direction,
+        similar speed); a pedestrian standing, or walking elsewhere, while the forklift passes does not.
+
+        Returns True / False when decidable, None when there is not enough history yet.
+        """
+        k = min(len(rec.px_history), len(p_hist.px_history), 10)
+        if k < 4:
+            return None
+        v = self._recent_displacement(rec.px_history, k)
+        p = self._recent_displacement(p_hist.px_history, k)
+        if v is None or p is None:
+            return None
+        v_len, p_len = float(np.linalg.norm(v)), float(np.linalg.norm(p))
+        if v_len < 4.0:  # the vehicle barely moved in image space: cannot judge
+            return None
+        cos = float(np.dot(v, p) / (v_len * p_len + 1e-8)) if p_len > 1e-6 else 0.0
+        ratio = p_len / v_len
+        lo, hi = self.comotion_speed_ratio
+        return bool(cos >= self.min_comotion_cos and lo <= ratio <= hi)
+
+    def _choose_cab_candidates(
+        self,
+        detected_vehicles: List[Dict],
+        person_map: Dict[str, Dict],
+        bound_driver_ids: Set[str],
+    ) -> Dict[str, Tuple[str, float, bool]]:
+        """
+        Global one-to-one assignment of candidate operators to UNASSIGNED vehicles for this frame.
+        Highest-scoring (vehicle, person) pairs win first, so one person can never be claimed by two
+        vehicles and each vehicle sees only its own best candidate.
+        """
+        pairs: List[Tuple[float, str, str, bool]] = []
+        for v in detected_vehicles:
+            vid = str(v["id"])
+            rec = self.vehicles.get(vid)
+            if rec is None or rec.associated_driver_id is not None:
+                continue
+            for pid, pdata in person_map.items():
+                if pid in bound_driver_ids:
+                    continue
+                in_cab, seated = self._analyze_driver_pose_in_cabin(
+                    person_bbox=pdata["bbox"],
+                    vehicle_bbox=rec.bbox,
+                    keypoints=pdata.get("keypoints"),
+                    foot_px=pdata.get("foot_px"),
+                )
+                if not in_cab:
+                    continue
+                ov = self._driver_cab_overlap_ratio(pdata["bbox"], rec.bbox)
+                pairs.append((max(ov, 0.60 if seated else 0.35), vid, pid, seated))
+
+        pairs.sort(key=lambda t: t[0], reverse=True)
+        chosen: Dict[str, Tuple[str, float, bool]] = {}
+        taken: Set[str] = set()
+        for score, vid, pid, seated in pairs:
+            if vid in chosen or pid in taken:
+                continue
+            chosen[vid] = (pid, score, seated)
+            taken.add(pid)
+        return chosen
+
+    def _forget_person(self, pid: str) -> None:
+        self.person_histories.pop(pid, None)
+        forget = getattr(self.estimator, "forget", None)
+        if forget is not None:
+            forget(f"driver_{pid}")
+
+    def _forget_vehicle(self, vid: str) -> None:
+        self.vehicles.pop(vid, None)
+        forget = getattr(self.estimator, "forget", None)
+        if forget is not None:
+            forget(f"veh_{vid}_")
+
     def update(
         self,
         detected_vehicles: List[Dict],
         detected_persons: List[Dict],
         frame_shape: Tuple[int, int],
+        now: Optional[float] = None,
     ) -> Tuple[Dict[str, VehicleSessionRecord], List[Dict]]:
-        now = time.time()
+        """
+        `now` is the FRAME clock (seconds). Using it instead of the wall clock keeps speeds, timeouts and
+        pairing windows correct when a recorded video is processed faster/slower than real time.
+        Event timestamps stay wall-clock (they are written to the audit log).
+        """
+        wall = time.time()
+        now = wall if now is None else float(now)
         events: List[Dict] = []
+        frame_h, frame_w = int(frame_shape[0]), int(frame_shape[1])
 
-        # 1. Update Person Trajectory Histories using YOLO-Pose ground_uv (foot_px) if available
+        # 1. Update person trajectory histories (YOLO-Pose foot point / BEV when available)
         person_map: Dict[str, Dict] = {}
         for p in detected_persons:
             pid = str(p["id"])
             person_map[pid] = p
             px1, py1, px2, py2 = p["bbox"]
             foot_px = p.get("foot_px") or (int(0.5 * (px1 + px2)), int(py2))
-            foot_world = p.get("bev_xy") or self.estimator.pixel_to_world(foot_px)
-            if pid not in self.person_histories:
-                self.person_histories[pid] = PersonTrackHistory(
+            bev = p.get("bev_xy")  # may be a numpy array: never use it in a boolean context
+            foot_world = (
+                (float(bev[0]), float(bev[1])) if bev is not None else self.estimator.pixel_to_world(foot_px)
+            )
+            center_px = (0.5 * (px1 + px2), 0.5 * (py1 + py2))
+            hist = self.person_histories.get(pid)
+            if hist is None:
+                hist = PersonTrackHistory(
                     person_id=pid,
                     first_seen_ts=now,
                     spawn_world_xy=foot_world,
                     current_world_xy=foot_world,
+                    spawn_px=center_px,
                 )
-            self.person_histories[pid].update_position(foot_world, now)
+                self.person_histories[pid] = hist
+            hist.update_position(foot_world, now, center_px)
 
         for rec in self.vehicles.values():
             rec.is_visible_in_current_frame = False
@@ -361,51 +494,35 @@ class DriverVehicleMonitorFSM:
             if r.associated_driver_id is not None
         }
 
+        # 2. Register / update vehicles first, so candidate scoring can see all of them at once
         for v in detected_vehicles:
             vid = str(v["id"])
-            vbbox = v["bbox"]
-
             if vid not in self.vehicles:
-                self.vehicles[vid] = VehicleSessionRecord(
-                    vehicle_id=vid, bbox=vbbox, last_seen_ts=now
-                )
+                self.vehicles[vid] = VehicleSessionRecord(vehicle_id=vid, bbox=v["bbox"], last_seen_ts=now)
             rec = self.vehicles[vid]
-            rec.bbox = vbbox
+            rec.bbox = v["bbox"]
             rec.last_seen_ts = now
             rec.is_visible_in_current_frame = True
             self._update_vehicle_motion(rec, now)
+
+        chosen = self._choose_cab_candidates(detected_vehicles, person_map, bound_driver_ids)
+
+        for v in detected_vehicles:
+            vid = str(v["id"])
+            vbbox = v["bbox"]
+            rec = self.vehicles[vid]
 
             # =========================================================================
             # STEP A: UNASSIGNED VEHICLE -> POSE-GUIDED DRIVER IDENTIFICATION
             # =========================================================================
             if rec.associated_driver_id is None:
-                best_cab_pid: Optional[str] = None
-                best_overlap: float = 0.0
-                best_is_seated_pose: bool = False
+                best_cab_pid, best_overlap, best_is_seated_pose = chosen.get(vid, (None, 0.0, False))
 
-                for pid, pdata in person_map.items():
-                    if pid in bound_driver_ids:
-                        continue
-
-                    in_cab, is_seated_pose = self._analyze_driver_pose_in_cabin(
-                        person_bbox=pdata["bbox"],
-                        vehicle_bbox=vbbox,
-                        keypoints=pdata.get("keypoints"),
-                        foot_px=pdata.get("foot_px"),
-                    )
-                    if not in_cab:
-                        continue
-
-                    ov = self._driver_cab_overlap_ratio(pdata["bbox"], vbbox)
-                    effective_score = max(ov, 0.60 if is_seated_pose else 0.35)
-                    if effective_score > best_overlap:
-                        best_overlap = effective_score
-                        best_cab_pid = pid
-                        best_is_seated_pose = is_seated_pose
-
-                # Reset overlap counters for any person no longer inside the cabin
+                # Reset counters for anyone no longer the cabin candidate; forget people who left the scene
                 for tracked_pid in list(rec.overlap_frames.keys()):
-                    if tracked_pid != best_cab_pid or best_overlap < self.entry_iou_thresh:
+                    if tracked_pid not in person_map:
+                        del rec.overlap_frames[tracked_pid]
+                    elif tracked_pid != best_cab_pid or best_overlap < self.entry_iou_thresh:
                         rec.overlap_frames[tracked_pid] = 0
 
                 # Path 1 & 2: Person is verified inside the cabin ROI via Pose + Overlap
@@ -414,19 +531,19 @@ class DriverVehicleMonitorFSM:
                     person_speed = p_hist.get_speed_mps()
 
                     if rec.is_currently_moving:
-                        rec.overlap_frames[best_cab_pid] = (
-                            rec.overlap_frames.get(best_cab_pid, 0) + 1
-                        )
+                        # A moving vehicle: only someone who travels WITH it can be its operator.
+                        co_motion = self._co_motion(rec, p_hist)
+                        if co_motion is True:
+                            rec.overlap_frames[best_cab_pid] = rec.overlap_frames.get(best_cab_pid, 0) + 1
+                        elif co_motion is False:
+                            rec.overlap_frames[best_cab_pid] = 0
+                        # None: not enough history yet -> neither accumulate nor reset
                         req_frames = self.moving_entry_confirm_frames
                     elif best_is_seated_pose and person_speed <= self.max_boarding_walk_speed_mps:
-                        rec.overlap_frames[best_cab_pid] = (
-                            rec.overlap_frames.get(best_cab_pid, 0) + 1
-                        )
+                        rec.overlap_frames[best_cab_pid] = rec.overlap_frames.get(best_cab_pid, 0) + 1
                         req_frames = self.seated_pose_confirm_frames
                     elif person_speed <= self.max_boarding_walk_speed_mps:
-                        rec.overlap_frames[best_cab_pid] = (
-                            rec.overlap_frames.get(best_cab_pid, 0) + 1
-                        )
+                        rec.overlap_frames[best_cab_pid] = rec.overlap_frames.get(best_cab_pid, 0) + 1
                         req_frames = self.entry_confirm_frames
                     else:
                         rec.overlap_frames[best_cab_pid] = 0
@@ -436,6 +553,8 @@ class DriverVehicleMonitorFSM:
                         rec.associated_driver_id = best_cab_pid
                         bound_driver_ids.add(best_cab_pid)
                         rec.driver_bbox = person_map[best_cab_pid]["bbox"]
+                        rec.driver_last_seen_ts = now
+                        rec.driver_lost_since = None
                         if person_map[best_cab_pid].get("embedding") is not None:
                             rec.driver_reid_embedding = person_map[best_cab_pid]["embedding"]
                         rec.state = VehicleSafetyState.DRIVER_ONBOARD
@@ -448,12 +567,13 @@ class DriverVehicleMonitorFSM:
                                 "vehicle_id": vid,
                                 "driver_id": best_cab_pid,
                                 "distance_m": 0.0,
-                                "timestamp": now,
+                                "timestamp": wall,
                             }
                         )
                         continue
 
-                # Path 3: Cabin Dismount Emergence (Driver steps out of an occluded forklift cab)
+                # Path 3: Cabin Dismount Emergence (Driver steps out of an occluded forklift cab).
+                # Strict: a pedestrian who merely walks into view near a forklift must not become its driver.
                 if rec.associated_driver_id is None:
                     vehicle_active_ok = (
                         not self.require_vehicle_activity_for_spawn or rec.has_ever_moved
@@ -462,46 +582,82 @@ class DriverVehicleMonitorFSM:
                         for pid, pdata in person_map.items():
                             if pid in bound_driver_ids:
                                 continue
+                            if pid.startswith("T") and not self.allow_provisional_spawn:
+                                continue  # identity not verified yet: ID noise must not create drivers
                             p_hist = self.person_histories[pid]
-                            if 3 <= p_hist.total_frames_seen <= 10:
-                                meas = self._compute_distance(
-                                    driver_id=pid,
-                                    person_data=pdata,
-                                    vehicle_id=vid,
-                                    vehicle_bbox=vbbox,
-                                    frame_shape=frame_shape,
+                            if not (3 <= p_hist.total_frames_seen <= 10):
+                                continue
+                            sx, sy = p_hist.spawn_px
+                            m = self.spawn_border_margin_px
+                            if sx <= m or sy <= m or sx >= frame_w - m or sy >= frame_h - m:
+                                continue  # appeared at the image border: walked in from outside the view
+                            meas = self._compute_distance(
+                                driver_id=pid,
+                                person_data=pdata,
+                                vehicle_id=vid,
+                                vehicle_bbox=vbbox,
+                                frame_shape=frame_shape,
+                            )
+                            if (
+                                not meas.is_uncertain
+                                and meas.distance_m is not None
+                                and meas.distance_m <= self.dismount_spawn_radius_m
+                                and p_hist.max_distance_from_spawn_m() < 1.1
+                            ):
+                                rec.associated_driver_id = pid
+                                bound_driver_ids.add(pid)
+                                rec.driver_bbox = pdata["bbox"]
+                                rec.driver_last_seen_ts = now
+                                rec.driver_lost_since = None
+                                if pdata.get("embedding") is not None:
+                                    rec.driver_reid_embedding = pdata["embedding"]
+                                rec.state = VehicleSafetyState.DRIVER_EXITED_SAFE
+                                rec.frames_outside_cab = self.exit_confirm_frames
+                                rec.exit_timestamp = now
+                                rec.last_measurement = meas
+                                events.append(
+                                    {
+                                        "event_type": "DRIVER_EXITED",
+                                        "vehicle_id": vid,
+                                        "driver_id": pid,
+                                        "distance_m": meas.distance_m,
+                                        "timestamp": wall,
+                                    }
                                 )
-                                if (
-                                    not meas.is_uncertain
-                                    and meas.distance_m is not None
-                                    and meas.distance_m <= self.dismount_spawn_radius_m
-                                    and p_hist.max_distance_from_spawn_m() < 1.1
-                                ):
-                                    rec.associated_driver_id = pid
-                                    bound_driver_ids.add(pid)
-                                    rec.driver_bbox = pdata["bbox"]
-                                    if pdata.get("embedding") is not None:
-                                        rec.driver_reid_embedding = pdata["embedding"]
-                                    rec.state = VehicleSafetyState.DRIVER_EXITED_SAFE
-                                    rec.frames_outside_cab = self.exit_confirm_frames
-                                    rec.exit_timestamp = now
-                                    rec.last_measurement = meas
-                                    events.append(
-                                        {
-                                            "event_type": "DRIVER_EXITED",
-                                            "vehicle_id": vid,
-                                            "driver_id": pid,
-                                            "distance_m": meas.distance_m,
-                                            "timestamp": now,
-                                        }
-                                    )
-                                    break
+                                break
                 continue
 
             # =========================================================================
             # STEP B: VEHICLE HAS AN ASSOCIATED DRIVER -> MONITOR EXIT & DISTANCE
             # =========================================================================
             matched_person = person_map.get(rec.associated_driver_id)
+
+            # Handover: the driver's track/global id changed but the same body is still at the same place.
+            if (
+                matched_person is None
+                and rec.driver_bbox is not None
+                and (now - rec.driver_last_seen_ts) <= self.handover_max_gap_sec
+            ):
+                best_iou, best_p = 0.0, None
+                for pid, pdata in person_map.items():
+                    if pid in bound_driver_ids:
+                        continue
+                    iou = self._bbox_iou(pdata["bbox"], rec.driver_bbox)
+                    if iou < self.handover_iou_thresh or iou <= best_iou:
+                        continue
+                    emb_new = pdata.get("embedding")
+                    if (
+                        emb_new is not None
+                        and rec.driver_reid_embedding is not None
+                        and self._cosine_similarity(rec.driver_reid_embedding, emb_new) < 0.35
+                    ):
+                        continue  # clearly a different person standing where the driver was
+                    best_iou, best_p = iou, pdata
+                if best_p is not None:
+                    bound_driver_ids.discard(rec.associated_driver_id)
+                    rec.associated_driver_id = str(best_p["id"])
+                    bound_driver_ids.add(rec.associated_driver_id)
+                    matched_person = best_p
 
             # Re-ID fallback if track ID changed during cabin exit
             if matched_person is None and rec.driver_reid_embedding is not None:
@@ -523,6 +679,12 @@ class DriverVehicleMonitorFSM:
                     matched_person = best_reid_person
 
             if matched_person is not None:
+                rec.driver_last_seen_ts = now
+                if rec.driver_lost_since is not None:
+                    rec.driver_lost_since = None
+                    if rec.state == VehicleSafetyState.DRIVER_NOT_VISIBLE_ALARM:
+                        rec.state = VehicleSafetyState.DISTANCE_UNCERTAIN
+                        rec.alarm_active = False
                 rec.driver_bbox = matched_person["bbox"]
                 if matched_person.get("embedding") is not None:
                     rec.driver_reid_embedding = matched_person["embedding"]
@@ -568,7 +730,7 @@ class DriverVehicleMonitorFSM:
                                 "vehicle_id": vid,
                                 "driver_id": rec.associated_driver_id,
                                 "distance_m": measurement.distance_m,
-                                "timestamp": now,
+                                "timestamp": wall,
                             }
                         )
 
@@ -588,7 +750,7 @@ class DriverVehicleMonitorFSM:
                                         "driver_id": rec.associated_driver_id,
                                         "distance_m": measurement.distance_m,
                                         "threshold_m": self.safe_thresh_m,
-                                        "timestamp": now,
+                                        "timestamp": wall,
                                     }
                                 )
                         elif measurement.distance_m > self.warn_thresh_m:
@@ -598,12 +760,17 @@ class DriverVehicleMonitorFSM:
                             rec.state = VehicleSafetyState.DRIVER_EXITED_SAFE
                             rec.alarm_active = False
             else:
+                if rec.driver_lost_since is None:
+                    rec.driver_lost_since = now
                 if (
                     rec.is_currently_moving
                     and rec.state == VehicleSafetyState.DRIVER_ONBOARD
                 ):
                     rec.alarm_active = False
-                elif rec.state != VehicleSafetyState.UNASSIGNED:
+                elif rec.state not in (
+                    VehicleSafetyState.UNASSIGNED,
+                    VehicleSafetyState.DRIVER_NOT_VISIBLE_ALARM,
+                ):
                     rec.state = VehicleSafetyState.DISTANCE_UNCERTAIN
                     rec.alarm_active = False
                     rec.last_measurement = DistanceMeasurement(
@@ -614,6 +781,27 @@ class DriverVehicleMonitorFSM:
                         vehicle_nearest_px=(0, 0),
                         is_uncertain=True,
                         uncertainty_reason="DRIVER_NOT_VISIBLE_IN_FRAME",
+                    )
+
+                # Fail-safe: a driver who is not visible near a STATIONARY vehicle must not stay silent forever.
+                lost_for = now - rec.driver_lost_since
+                if (
+                    self.driver_lost_alarm_sec > 0
+                    and not rec.is_currently_moving
+                    and lost_for >= self.driver_lost_alarm_sec
+                    and rec.state != VehicleSafetyState.DRIVER_NOT_VISIBLE_ALARM
+                ):
+                    rec.state = VehicleSafetyState.DRIVER_NOT_VISIBLE_ALARM
+                    rec.alarm_active = True
+                    events.append(
+                        {
+                            "event_type": "DRIVER_NOT_VISIBLE_ALARM",
+                            "vehicle_id": vid,
+                            "driver_id": rec.associated_driver_id,
+                            "distance_m": None,
+                            "threshold_m": self.driver_lost_alarm_sec,
+                            "timestamp": wall,
+                        }
                     )
 
         # Clean up stale ghost vehicles
@@ -628,6 +816,17 @@ class DriverVehicleMonitorFSM:
             elif age > self.assigned_ghost_timeout_sec:
                 stale_ids.append(vid)
         for vid in stale_ids:
-            del self.vehicles[vid]
+            self._forget_vehicle(vid)
+
+        # Bound memory: forget people nobody has seen for a long time (unless still bound to a vehicle)
+        still_bound = {r.associated_driver_id for r in self.vehicles.values() if r.associated_driver_id}
+        for pid in [
+            pid
+            for pid, h in self.person_histories.items()
+            if pid not in person_map
+            and pid not in still_bound
+            and (now - h.last_seen_ts) > self.person_history_ttl_sec
+        ]:
+            self._forget_person(pid)
 
         return self.vehicles, events

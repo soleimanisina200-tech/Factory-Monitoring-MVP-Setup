@@ -1,4 +1,5 @@
 # app/vehicle_monitoring/pipeline.py
+import logging
 import yaml
 import numpy as np
 from pathlib import Path
@@ -9,6 +10,8 @@ from app.vehicle_monitoring.distance_estimator import RealWorldDistanceEstimator
 from app.vehicle_monitoring.driver_vehicle_fsm import DriverVehicleMonitorFSM
 from app.vehicle_monitoring.alarm_and_logger import SafetyAlarmAndLogger
 from app.vehicle_monitoring.dashboard import VehicleSafetyDashboard
+
+logger = logging.getLogger("FactoryReID")
 
 
 class VehicleMonitoringPipeline:
@@ -30,6 +33,10 @@ class VehicleMonitoringPipeline:
         self.v_conf: float = float(self.cfg.get("vehicle_conf_threshold", 0.45))
         self.p_conf: float = float(self.cfg.get("person_conf_threshold", 0.45))
 
+        # Vehicles have their own ByteTrack settings: the person tracker is tuned for tiny, partially
+        # occluded humans (very low thresholds) and is wrong for large rigid vehicles.
+        self.vehicle_tracker_cfg: str = str(self.cfg.get("vehicle_tracker_config", "bytetrack.yaml"))
+
         self.reid_extractor = reid_extractor
         self.estimator = RealWorldDistanceEstimator(self.cfg)
         self.fsm = DriverVehicleMonitorFSM(self.cfg, self.estimator)
@@ -37,6 +44,14 @@ class VehicleMonitoringPipeline:
         self.dashboard = VehicleSafetyDashboard(self.cfg)
 
     def _extract_embedding(self, frame: np.ndarray, bbox: List[float]) -> Optional[np.ndarray]:
+        """
+        Optional Re-ID embedding for persons that arrive WITHOUT one (standalone mode).
+        Returns None when no real Re-ID model is available: the old colour-histogram fallback was removed
+        because histogram cosine similarity is high for almost any two people, which silently made the
+        driver Re-ID fallback match the wrong person.
+        """
+        if self.reid_extractor is None:
+            return None
         x1, y1, x2, y2 = map(int, bbox)
         h, w = frame.shape[:2]
         x1, y1 = max(0, x1), max(0, y1)
@@ -44,23 +59,16 @@ class VehicleMonitoringPipeline:
         if x2 <= x1 or y2 <= y1:
             return None
         crop = frame[y1:y2, x1:x2]
-
-        if self.reid_extractor is not None:
-            try:
-                if hasattr(self.reid_extractor, "extract"):
-                    return self.reid_extractor.extract(crop)
-                elif hasattr(self.reid_extractor, "get_embedding"):
-                    return self.reid_extractor.get_embedding(crop)
-                elif callable(self.reid_extractor):
-                    return self.reid_extractor(crop)
-            except Exception:
-                pass
-
-        import cv2
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-        cv2.normalize(hist, hist)
-        return hist.flatten()
+        try:
+            if hasattr(self.reid_extractor, "extract"):
+                return self.reid_extractor.extract(crop)
+            if hasattr(self.reid_extractor, "get_embedding"):
+                return self.reid_extractor.get_embedding(crop)
+            if callable(self.reid_extractor):
+                return self.reid_extractor(crop)
+        except Exception:
+            logger.exception("Re-ID embedding extraction failed")
+        return None
 
     def normalize_pose_persons(
         self, frame: np.ndarray, raw_persons: Any
@@ -102,8 +110,16 @@ class VehicleMonitoringPipeline:
 
         # Case 2: List of dicts or track objects from main.py / IdentityManager
         for item in raw_persons:
+            bev_xy = None
             if isinstance(item, dict):
-                pid = item.get("global_id", item.get("id", item.get("track_id")))
+                # `id` is authoritative (main.py sends "7" for verified workers, "T12" for provisional ones).
+                # global_id == -1 means "not verified yet" and must NEVER be used as an identifier: the old
+                # code did, so every unverified person collapsed into one record called "-1".
+                pid = item.get("id")
+                if pid is None:
+                    gid = item.get("global_id")
+                    pid = gid if gid not in (None, -1) else item.get("track_id")
+                bev_xy = item.get("bev_xy")
                 bbox = item.get("bbox", item.get("box"))
                 kpts = item.get("keypoints", item.get("pose"))
                 foot_px = item.get("foot_px", item.get("foot_point", item.get("ground_point")))
@@ -128,15 +144,22 @@ class VehicleMonitoringPipeline:
                 "keypoints": np.asarray(kpts) if kpts is not None else None,
                 "foot_px": tuple(map(int, foot_px)) if foot_px is not None else None,
                 "embedding": np.asarray(emb) if emb is not None else None,
+                "bev_xy": tuple(float(v) for v in bev_xy) if bev_xy is not None else None,
             })
 
         return normalized
+
+    def _resolve_tracker(self, override: Optional[str]) -> str:
+        cfg = override or self.vehicle_tracker_cfg
+        builtin = cfg in ("bytetrack.yaml", "botsort.yaml")
+        return cfg if (builtin or Path(cfg).exists()) else "bytetrack.yaml"
 
     def process_frame(
         self,
         frame: np.ndarray,
         external_persons: Optional[Any] = None,
-        tracker_config: str = "configs/custom_bytetrack.yaml",
+        tracker_config: Optional[str] = None,
+        frame_ts: Optional[float] = None,
     ) -> np.ndarray:
         """
         If external_persons (from main.py's YOLO-Pose detector) is provided, only runs
@@ -154,7 +177,7 @@ class VehicleMonitoringPipeline:
             persist=True,
             classes=target_classes,
             conf=self.v_conf if external_persons is not None else min(self.v_conf, self.p_conf),
-            tracker=tracker_config if Path(tracker_config).exists() else "bytetrack.yaml",
+            tracker=self._resolve_tracker(tracker_config),
             verbose=False,
         )
 
@@ -191,6 +214,7 @@ class VehicleMonitoringPipeline:
             detected_vehicles=detected_vehicles,
             detected_persons=detected_persons,
             frame_shape=frame.shape,
+            now=frame_ts,
         )
 
         annotated = self.dashboard.render_hud(

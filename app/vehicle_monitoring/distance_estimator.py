@@ -50,6 +50,25 @@ class RealWorldDistanceEstimator:
 
         self._smoothed_world_coords: Dict[str, Tuple[float, float]] = {}
 
+    def set_homography(self, H: Optional[np.ndarray]) -> None:
+        """
+        Single source of truth for the pixel->meter mapping. `main.py` hands over the projector's
+        (resolution-scaled) homography so persons and vehicles are measured in ONE coordinate system.
+        """
+        if H is None:
+            return
+        self.homography_matrix = np.asarray(H, dtype=np.float64)
+        try:
+            self.inv_homography_matrix = np.linalg.inv(self.homography_matrix)
+        except np.linalg.LinAlgError:
+            self.inv_homography_matrix = None
+        self._smoothed_world_coords.clear()  # smoothing state belongs to the old coordinate system
+
+    def forget(self, key_prefix: str) -> None:
+        """Drop smoothing state for tracks that no longer exist (prevents unbounded growth)."""
+        for k in [k for k in self._smoothed_world_coords if k.startswith(key_prefix)]:
+            del self._smoothed_world_coords[k]
+
     def pixel_to_world(self, pt_px: Tuple[float, float]) -> Tuple[float, float]:
         if self.homography_matrix is not None:
             pts = np.array([[[float(pt_px[0]), float(pt_px[1])]]], dtype=np.float32)

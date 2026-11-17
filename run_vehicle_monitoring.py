@@ -5,15 +5,6 @@ from pathlib import Path
 from app.vehicle_monitoring.pipeline import VehicleMonitoringPipeline
 
 
-def load_existing_reid_if_available():
-    """Attempts to reuse the existing project's ReIDModel from app/identity/reid_model.py."""
-    try:
-        from app.identity.reid_model import ReIDModel
-        return ReIDModel()
-    except Exception:
-        return None
-
-
 def main():
     parser = argparse.ArgumentParser(description="AI Vehicle & Driver Safety Monitoring Runner")
     parser.add_argument("--source", type=str, default=None, help="Video path or RTSP stream (defaults to configs/settings.yaml)")
@@ -31,8 +22,9 @@ def main():
                 or 0
             )
 
-    reid_model = load_existing_reid_if_available()
-    pipeline = VehicleMonitoringPipeline(config_path=args.config, reid_extractor=reid_model)
+    # Standalone mode has no pose/Re-ID stack: persons carry no embeddings, so the driver Re-ID
+    # fallback is simply disabled (a colour-histogram stand-in used to make it match wrong people).
+    pipeline = VehicleMonitoringPipeline(config_path=args.config, reid_extractor=None)
 
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
@@ -44,13 +36,16 @@ def main():
         if not ret:
             break
 
-        annotated_frame = pipeline.process_frame(frame)
+        pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+        frame_ts = (pts_ms / 1000.0) if pts_ms and pts_ms > 0 else None
+        annotated_frame = pipeline.process_frame(frame, frame_ts=frame_ts)
         cv2.imshow("Factory Monitoring - Vehicle & Driver Safety", annotated_frame)
 
         if (cv2.waitKey(1) & 0xFF) == ord("q"):
             break
 
     cap.release()
+    pipeline.logger.close()
     cv2.destroyAllWindows()
 
 

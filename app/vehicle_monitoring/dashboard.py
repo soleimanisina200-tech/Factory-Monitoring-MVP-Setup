@@ -18,6 +18,7 @@ class VehicleSafetyDashboard:
         VehicleSafetyState.DRIVER_EXITED_WARNING: (0, 180, 255),      # Orange/Amber
         VehicleSafetyState.DISTANCE_VIOLATION_ALARM: (0, 0, 255),     # Red
         VehicleSafetyState.DISTANCE_UNCERTAIN: (255, 0, 255),         # Magenta
+        VehicleSafetyState.DRIVER_NOT_VISIBLE_ALARM: (0, 0, 200),     # Dark red
     }
 
     def __init__(self, config: dict):
@@ -30,7 +31,7 @@ class VehicleSafetyDashboard:
         dash_cfg = config.get("dashboard", {})
         if dash_cfg.get("enable_web_dashboard", False):
             self._start_web_server(
-                host=dash_cfg.get("host", "0.0.0.0"),
+                host=dash_cfg.get("host", "127.0.0.1"),
                 port=int(dash_cfg.get("port", 8050))
             )
 
@@ -109,7 +110,9 @@ class VehicleSafetyDashboard:
 
         y_cursor = 60
         for rec in sorted_vehicles:
-            if rec.state == VehicleSafetyState.UNASSIGNED:
+            if rec.state == VehicleSafetyState.DRIVER_NOT_VISIBLE_ALARM:
+                dist_str = "DRIVER NOT VISIBLE"
+            elif rec.state == VehicleSafetyState.UNASSIGNED:
                 dist_str = "PARKED / NO DRIVER"
             elif rec.state == VehicleSafetyState.DRIVER_ONBOARD:
                 dist_str = "ONBOARD (0.00 m)"
@@ -134,7 +137,7 @@ class VehicleSafetyDashboard:
         if any_alarm_active:
             cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (0, 0, 255), 10)
             cv2.rectangle(canvas, (w // 2 - 290, 15), (w // 2 + 290, 65), (0, 0, 220), -1)
-            cv2.putText(canvas, "ALARM: DRIVER EXCEEDED SAFE FORKLIFT DISTANCE!",
+            cv2.putText(canvas, "ALARM: DRIVER SAFETY VIOLATION!",
                         (w // 2 - 275, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
 
         with self._lock:
