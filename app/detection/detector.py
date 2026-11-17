@@ -2,9 +2,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
+import logging
 import numpy as np
 import torch
 from ultralytics import YOLO
+
+logger = logging.getLogger("FactoryReID")
 
 
 @dataclass
@@ -43,6 +46,11 @@ class IndustrialPoseDetector:
         self.conf_thres = min(float(conf_thres), 0.22)
         self.iou_thres = float(iou_thres)
         self.imgsz = max(int(imgsz), 1280)
+        if self.conf_thres != float(conf_thres) or self.imgsz != int(imgsz):
+            logger.warning(
+                "Detector settings were clamped: conf_thres %s -> %s (max 0.22), imgsz %s -> %s (min 1280)",
+                conf_thres, self.conf_thres, imgsz, self.imgsz,
+            )
 
         self.model = YOLO(model_weights)
         self.model.to(self.device)

@@ -1,8 +1,11 @@
 # app/identity/manager.py
 from __future__ import annotations
+import json
+import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -13,6 +16,11 @@ from app.logic.geometry import (
     compute_intersection_contamination,
     compute_single_iou,
 )
+
+logger = logging.getLogger("FactoryReID")
+
+STATUS_ACTIVE = "ACTIVE"   # visible, or hidden inside the scene (occluded) for a bounded time
+STATUS_EXITED = "EXITED"   # left through the frame border (or hidden far too long)
 
 
 @dataclass
@@ -39,6 +47,10 @@ class WorkerIdentity:
     # Mutual Exclusion Sets (Tracks & Global IDs verified to belong to OTHER simultaneously visible people)
     coexisted_track_ids: Set[int] = field(default_factory=set)
     verified_coexisted_gids: Set[int] = field(default_factory=set)
+    # Lifecycle: an EXITED identity may only be recovered through the strict re-entry gate.
+    status: str = STATUS_ACTIVE
+    exit_ts: float = 0.0
+    exit_reason: str = ""  # "BORDER" | "TIMEOUT"
 
     def add_clean_observation(
         self,
@@ -133,13 +145,25 @@ class EnterpriseIdentityManager:
         bev_projector: MetricBEVProjector,
         cos_sim_thresh: float = 0.55,
         spatial_recovery_sim_thresh: float = 0.46,
-        reentry_sim_thresh: float = 0.64,
+        reentry_sim_thresh: float = 0.82,
         max_worker_speed_mps: float = 3.2,
         max_internal_occlusion_m: float = 5.5,
         lag_diffusion_coeff: float = 0.65,
         base_pose_jitter_m: float = 0.85,
         reid_interval_sec: float = 0.35,
         probation_frames_for_new_id: int = 4,
+        stitch_sim_thresh: float = 0.55,
+        stitch_margin: float = 0.04,
+        reentry_min_gap_sec: float = 2.0,
+        reentry_margin: float = 0.08,
+        reentry_min_samples: int = 3,
+        exit_confirm_sec: float = 0.5,
+        occlusion_max_sec: float = 20.0,
+        border_margin_ratio: float = 0.06,
+        track_gap_reset_sec: float = 1.5,
+        young_track_sec: float = 2.0,
+        young_track_reid_interval_sec: float = 0.10,
+        decision_log_path: Optional[str] = None,
     ):
         self.reid = reid_extractor
         self.bev = bev_projector
@@ -152,6 +176,28 @@ class EnterpriseIdentityManager:
         self.eps_pose = base_pose_jitter_m
         self.reid_interval_sec = reid_interval_sec
         self.probation_frames = probation_frames_for_new_id
+
+        # --- Identity safety knobs (asymmetric cost: a wrong merge is worse than a fresh ID) ---
+        self.stitch_sim_thresh = stitch_sim_thresh          # Stage A in-place stitching
+        self.stitch_margin = stitch_margin                  # best-vs-runner-up gap for stitching
+        self.reentry_min_gap_sec = reentry_min_gap_sec      # below this gap the re-entry bar is raised
+        self.reentry_margin = reentry_margin                # best-vs-runner-up gap for EXITED identities
+        self.reentry_min_samples = reentry_min_samples      # clean multi-frame samples required
+        self.exit_confirm_sec = exit_confirm_sec            # absence near a border before EXITED
+        self.occlusion_max_sec = occlusion_max_sec          # max in-scene occlusion before EXITED(TIMEOUT)
+        self.border_margin_ratio = border_margin_ratio
+        self.track_gap_reset_sec = track_gap_reset_sec      # a track id absent this long is a "resurrection"
+        self.young_track_sec = young_track_sec
+        self.young_track_reid_interval_sec = young_track_reid_interval_sec
+
+        self.track_last_seen_ts: Dict[int, float] = {}
+        self.track_emb_buffer: Dict[int, Deque[np.ndarray]] = {}
+        self._newly_exited: List[int] = []
+        self._decision_fh = None
+        if decision_log_path:
+            p = Path(decision_log_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            self._decision_fh = open(p, "a", encoding="utf-8", buffering=1)
 
         self.identities: Dict[int, WorkerIdentity] = {}
         self.track_to_global: Dict[int, int] = {}
@@ -170,6 +216,93 @@ class EnterpriseIdentityManager:
         mx = frame_w * margin_ratio
         my = frame_h * margin_ratio
         return bool(x1 <= mx or y1 <= my or x2 >= (frame_w - mx) or y2 >= (frame_h - my))
+
+    # ------------------------------------------------------------------
+    # Diagnostics: one JSON line per identity decision (see `decision_log_path`)
+    # ------------------------------------------------------------------
+    def _log_decision(self, event: str, ts: float, **fields: Any) -> None:
+        if self._decision_fh is None:
+            return
+        rec: Dict[str, Any] = {"event": event, "ts": round(float(ts), 3)}
+        for k, v in fields.items():
+            if isinstance(v, (np.floating, np.integer)):
+                v = v.item()
+            elif isinstance(v, float):
+                v = round(v, 4)
+            rec[k] = v
+        try:
+            self._decision_fh.write(json.dumps(rec, default=str) + "\n")
+        except Exception:
+            logger.exception("Could not write identity decision log")
+
+    def close(self) -> None:
+        if self._decision_fh is not None:
+            self._decision_fh.close()
+            self._decision_fh = None
+
+    # ------------------------------------------------------------------
+    # Identity lifecycle: ACTIVE -> EXITED
+    # ------------------------------------------------------------------
+    def pop_newly_exited(self) -> List[int]:
+        """Global IDs that left the scene since the last call (each reported once)."""
+        out, self._newly_exited = self._newly_exited, []
+        return out
+
+    def _reset_track_state(self, tid: int, unbind: bool = True) -> None:
+        """Forget everything known about a track id (it is dead or being re-used by someone new)."""
+        if unbind:
+            self.track_to_global.pop(tid, None)
+        self.track_last_reid_ts.pop(tid, None)
+        self.track_seen_counts.pop(tid, None)
+        self.track_first_seen_ts.pop(tid, None)
+        self.track_best_emb.pop(tid, None)
+        self.track_emb_buffer.pop(tid, None)
+        for key in [k for k in self.track_separated_coexisted_tracks if tid in k]:
+            del self.track_separated_coexisted_tracks[key]
+
+    def _mark_exited(self, ident: WorkerIdentity, frame_ts: float, reason: str) -> None:
+        ident.status = STATUS_EXITED
+        ident.exit_ts = frame_ts
+        ident.exit_reason = reason
+        ident.mismatch_streak = 0
+        # Unbind every track still pointing at this identity: ByteTrack may keep a "ghost" of the
+        # leaving worker alive and hand that very track id to the next person entering there.
+        for tid, g in list(self.track_to_global.items()):
+            if g == ident.global_id:
+                self._reset_track_state(tid, unbind=True)
+        self._newly_exited.append(ident.global_id)
+        self._log_decision(
+            "EXITED", frame_ts, gid=ident.global_id, reason=reason,
+            absent_sec=frame_ts - ident.last_seen_ts,
+        )
+
+    def _update_lifecycle(self, active_gids: Set[int], frame_ts: float, frame_w: int, frame_h: int) -> None:
+        for gid, ident in self.identities.items():
+            if ident.status == STATUS_EXITED or gid in active_gids:
+                continue
+            absent = frame_ts - ident.last_seen_ts
+            if absent >= self.exit_confirm_sec and self._is_near_frame_border(
+                ident.last_bbox_xyxy, frame_w, frame_h, self.border_margin_ratio
+            ):
+                self._mark_exited(ident, frame_ts, "BORDER")
+            elif absent >= self.occlusion_max_sec:
+                self._mark_exited(ident, frame_ts, "TIMEOUT")
+
+    def _runner_up_similarity(self, emb: np.ndarray, view: str, exclude_gid: int) -> float:
+        """Best similarity of `emb` against every OTHER identity, active ones included."""
+        best = 0.0
+        for gid, ident in self.identities.items():
+            if gid == exclude_gid:
+                continue
+            best = max(best, ident.compute_similarity(emb, view))
+        return best
+
+    def _track_mean_embedding(self, tid: int) -> Tuple[Optional[np.ndarray], int]:
+        buf = self.track_emb_buffer.get(tid)
+        if not buf:
+            return None, 0
+        mean = np.mean(np.stack(list(buf)), axis=0)
+        return (mean / (np.linalg.norm(mean) + 1e-8)).astype(np.float32), len(buf)
 
     def _is_spatially_continuous_with_identity(
         self, ident: WorkerIdentity, det: PoseDetection, current_ts: float
@@ -324,9 +457,30 @@ class EnterpriseIdentityManager:
 
                 gal_sim = ident_old.compute_gallery_to_gallery_similarity(ident_new)
                 req_sim = 0.64 if dist_m <= 1.8 else 0.70
+                if ident_old.status == STATUS_EXITED:
+                    # Someone who LEFT the scene may only be re-merged with strong evidence.
+                    req_sim = max(req_sim, self.reentry_sim_thresh)
                 if gal_sim >= req_sim and gal_sim > best_merge_sim:
                     best_merge_sim = gal_sim
                     best_old_gid = gid_old
+
+            if best_old_gid is not None and self.identities[best_old_gid].status == STATUS_EXITED:
+                # Negative evidence for people who LEFT: the new identity must be clearly closer to this one
+                # than to ANY other identity (exited lookalikes and currently visible workers included).
+                runner_up = max(
+                    (
+                        ident_new.compute_gallery_to_gallery_similarity(other)
+                        for g_other, other in self.identities.items()
+                        if g_other not in (gid_new, best_old_gid)
+                    ),
+                    default=0.0,
+                )
+                if (best_merge_sim - runner_up) < self.reentry_margin:
+                    self._log_decision(
+                        "MERGE_REJECTED_AMBIGUOUS", frame_ts, tid=tid, gid_new=gid_new,
+                        gid_old=best_old_gid, gallery_sim=best_merge_sim, runner_up=runner_up,
+                    )
+                    best_old_gid = None
 
             if best_old_gid is not None:
                 ident_old = self.identities[best_old_gid]
@@ -342,6 +496,11 @@ class EnterpriseIdentityManager:
                 ident_old.last_height_px = ident_new.last_height_px
                 ident_old.last_bbox_xyxy = ident_new.last_bbox_xyxy
                 ident_old.last_track_id = tid
+                ident_old.status = STATUS_ACTIVE
+                ident_old.exit_reason = ""
+                self._log_decision(
+                    "MERGED", frame_ts, tid=tid, gid_new=gid_new, gid_old=best_old_gid, gallery_sim=best_merge_sim,
+                )
 
                 self.track_to_global[tid] = best_old_gid
                 resolved_assignments[tid] = best_old_gid
@@ -352,10 +511,12 @@ class EnterpriseIdentityManager:
     def process_frame(
         self, frame: np.ndarray, detections: List[PoseDetection], frame_ts: float
     ) -> Dict[int, int]:
+        H_img, W_img = frame.shape[:2]
         if not detections:
+            # Nobody visible: lifecycle must still advance (someone may have just left the camera).
+            self._update_lifecycle(set(), frame_ts, W_img, H_img)
             return {}
 
-        H_img, W_img = frame.shape[:2]
         boxes = np.array([d.bbox_xyxy for d in detections], dtype=np.float32)
         kpts_xy = np.array([d.keypoints_xy for d in detections], dtype=np.float32)
         kpts_conf = np.array([d.keypoints_conf for d in detections], dtype=np.float32)
@@ -365,6 +526,17 @@ class EnterpriseIdentityManager:
         # Compute Pose-Corrected Standing Height, Ground Contact Point, and BEV Coordinates
         for i, det in enumerate(detections):
             tid = det.track_id
+            # A track id that vanished for a while and re-appears is a "resurrection": the tracker may
+            # have re-used the id for someone else. Treat it as a brand-new track.
+            last_seen = self.track_last_seen_ts.get(tid)
+            if last_seen is not None and (frame_ts - last_seen) > self.track_gap_reset_sec:
+                self._log_decision(
+                    "TRACK_RESURRECTED", frame_ts, tid=tid, gid=self.track_to_global.get(tid),
+                    gap_sec=frame_ts - last_seen,
+                )
+                self._reset_track_state(tid, unbind=True)
+            self.track_last_seen_ts[tid] = frame_ts
+
             self.track_seen_counts[tid] = self.track_seen_counts.get(tid, 0) + 1
             if tid not in self.track_first_seen_ts:
                 self.track_first_seen_ts[tid] = frame_ts
@@ -422,8 +594,11 @@ class EnterpriseIdentityManager:
 
                 if reachable and gid not in used_global_ids:
                     last_reid_t = self.track_last_reid_ts.get(tid, 0.0)
+                    # Young tracks are the ones most likely to be a hijacked/re-used id: verify them often.
+                    is_young = (frame_ts - self.track_first_seen_ts.get(tid, frame_ts)) < self.young_track_sec
+                    reid_interval = self.young_track_reid_interval_sec if is_young else self.reid_interval_sec
                     need_reid = (not det.is_intersecting) and (
-                        (frame_ts - last_reid_t) >= self.reid_interval_sec or ident.mismatch_streak > 0
+                        (frame_ts - last_reid_t) >= reid_interval or ident.mismatch_streak > 0
                     )
 
                     if need_reid:
@@ -444,11 +619,17 @@ class EnterpriseIdentityManager:
                                     sharpness=report.sharpness_score,
                                     is_isolated=det.is_isolated,
                                 )
-                            elif det.is_isolated and sim < 0.42:
-                                # Track is isolated and clean, but looks very different from `ident`!
+                            elif det.is_isolated:
+                                # Isolated, clean crop that does NOT reach the acceptance threshold. The old
+                                # code only counted sim < 0.42, so sims in [0.42, 0.48) silently kept a
+                                # possibly hijacked binding alive forever.
                                 ident.mismatch_streak += 1
                                 if ident.mismatch_streak >= 3:
                                     # Mismatch circuit breaker tripped: ByteTrack hijacked a different person!
+                                    self._log_decision(
+                                        "BINDING_BROKEN", frame_ts, tid=tid, gid=gid, sim=sim,
+                                        view=report.pose_view_bin,
+                                    )
                                     ident.mismatch_streak = 0
                                     del self.track_to_global[tid]
                                     unassigned_detections.append(det)
@@ -489,8 +670,11 @@ class EnterpriseIdentityManager:
                 det_reports.append(rep)
                 if emb is not None and rep.is_valid_for_gallery:
                     self.track_best_emb[det.track_id] = (emb, rep.pose_view_bin, rep.sharpness_score)
+                    # Multi-frame evidence for the strict re-entry gate (never a single lucky frame).
+                    self.track_emb_buffer.setdefault(det.track_id, deque(maxlen=6)).append(emb.copy())
 
             matched_rows: Set[int] = set()
+            stage_of: Dict[Tuple[int, int], str] = {}
             if candidate_gids:
                 cost_matrix = np.full((len(unassigned_detections), len(candidate_gids)), 1e6, dtype=np.float32)
                 sim_matrix = np.zeros((len(unassigned_detections), len(candidate_gids)), dtype=np.float32)
@@ -507,12 +691,18 @@ class EnterpriseIdentityManager:
                         continue
 
                     track_birth_ts = self.track_first_seen_ts.get(det.track_id, frame_ts)
+                    strict_emb, strict_n = self._track_mean_embedding(det.track_id)
+                    det_near_border = self._is_near_frame_border(
+                        det.bbox_xyxy, W_img, H_img, self.border_margin_ratio
+                    )
 
-                    # Count how many lost identities disappeared within 1.5m of `det` (spatial ambiguity check)
+                    # Count how many lost identities disappeared within 1.5m of `det` (spatial ambiguity check).
+                    # EXITED identities are not "lost nearby": they can only return via the strict gate.
                     nearby_lost_count = sum(
                         1
                         for gid_c in candidate_gids
-                        if (frame_ts - self.identities[gid_c].last_seen_ts) <= 3.0
+                        if self.identities[gid_c].status != STATUS_EXITED
+                        and (frame_ts - self.identities[gid_c].last_seen_ts) <= 3.0
                         and self.bev.compute_metric_distance(
                             self.identities[gid_c].last_ground_uv,
                             self.identities[gid_c].last_bev_xy,
@@ -542,6 +732,22 @@ class EnterpriseIdentityManager:
                         if track_birth_ts < (ident.last_seen_ts - 0.6) and dt_lost > 0.4:
                             continue
 
+                        # STRICT RE-ENTRY GATE for identities that LEFT the scene. They are never eligible for
+                        # in-place stitching or spatial recovery (that is exactly how a newcomer entering from
+                        # the same side used to inherit the ID of the person who just left).
+                        if ident.status == STATUS_EXITED:
+                            if strict_emb is None or strict_n < self.reentry_min_samples:
+                                continue  # not enough clean evidence yet -> keep waiting / mint a new ID
+                            if ident.exit_reason == "BORDER" and not det_near_border:
+                                continue  # a border-exit must come back in through a border
+                            s_strict = ident.compute_similarity(strict_emb, pose_view)
+                            sim_matrix[r, c] = s_strict
+                            req = self.reentry_sim_thresh + (0.08 if dt_lost < self.reentry_min_gap_sec else 0.0)
+                            if s_strict >= req:
+                                cost_matrix[r, c] = 1.0 - (0.90 * s_strict)
+                                stage_of[(r, c)] = "REENTRY_STRICT"
+                            continue
+
                         reachable, dist_m, max_dist_m = self._is_spatially_continuous_with_identity(
                             ident, det, frame_ts
                         )
@@ -557,9 +763,10 @@ class EnterpriseIdentityManager:
                             and (box_iou >= 0.25 or dist_m <= 1.25)
                             and det.is_isolated
                         ):
-                            if app_sim >= 0.42:
+                            if app_sim >= self.stitch_sim_thresh:
                                 stitch_score = 0.65 * app_sim + 0.35 * max(box_iou, 1.0 - dist_m / 1.5)
                                 cost_matrix[r, c] = 1.0 - stitch_score
+                                stage_of[(r, c)] = "STITCH"
                                 continue
 
                         # STAGE B: Spatio-Temporal Occlusion Recovery
@@ -568,6 +775,7 @@ class EnterpriseIdentityManager:
                             near_border = self._is_near_frame_border(det.bbox_xyxy, W_img, H_img)
                             if near_border and dt_lost > 2.0 and app_sim >= self.reentry_sim_thresh:
                                 cost_matrix[r, c] = 1.0 - (0.90 * app_sim)
+                                stage_of[(r, c)] = "BORDER_REENTRY"
                             continue
 
                         required_sim = (
@@ -579,6 +787,7 @@ class EnterpriseIdentityManager:
                             spatial_score = max(0.0, 1.0 - (dist_m / max(max_dist_m, 1.0)))
                             fused_score = 0.80 * app_sim + 0.20 * spatial_score
                             cost_matrix[r, c] = 1.0 - fused_score
+                            stage_of[(r, c)] = "RECOVER"
 
                 row_ind, col_ind = linear_sum_assignment(cost_matrix)
                 for r, c in zip(row_ind, col_ind):
@@ -599,6 +808,38 @@ class EnterpriseIdentityManager:
                         ident = self.identities[gid]
                         emb = det_embeddings[r]
                         rep = det_reports[r]
+                        stage = stage_of.get((r, c), "UNKNOWN")
+
+                        # Negative evidence: the newcomer must be clearly closer to this identity than to
+                        # ANY other identity, including workers who are currently visible on screen.
+                        if stage in ("REENTRY_STRICT", "STITCH", "BORDER_REENTRY"):
+                            if stage == "REENTRY_STRICT":
+                                m_emb, _ = self._track_mean_embedding(det.track_id)
+                                m_view = rep.pose_view_bin if rep else "FRONT"
+                                margin_needed = self.reentry_margin
+                            else:
+                                m_emb, m_view = emb, (rep.pose_view_bin if rep else "FRONT")
+                                margin_needed = self.stitch_margin if stage == "STITCH" else self.reentry_margin
+                            if m_emb is not None:
+                                own_sim = ident.compute_similarity(m_emb, m_view)
+                                runner_up = self._runner_up_similarity(m_emb, m_view, gid)
+                                if (own_sim - runner_up) < margin_needed:
+                                    self._log_decision(
+                                        "MATCH_REJECTED_AMBIGUOUS", frame_ts, tid=det.track_id, gid=gid,
+                                        stage=stage, sim=own_sim, runner_up=runner_up,
+                                        margin_needed=margin_needed,
+                                    )
+                                    continue
+
+                        self._log_decision(
+                            "MATCHED", frame_ts, tid=det.track_id, gid=gid, stage=stage,
+                            sim=float(sim_matrix[r, c]), dt_lost=frame_ts - ident.last_seen_ts,
+                            status_before=ident.status, near_border=bool(
+                                self._is_near_frame_border(det.bbox_xyxy, W_img, H_img, self.border_margin_ratio)
+                            ),
+                        )
+                        ident.status = STATUS_ACTIVE
+                        ident.exit_reason = ""
 
                         self.track_to_global[det.track_id] = gid
                         self.track_last_reid_ts[det.track_id] = frame_ts
@@ -663,6 +904,12 @@ class EnterpriseIdentityManager:
                     )
 
                     self.identities[new_gid] = new_ident
+                    if self._decision_fh is not None:
+                        best_other = self._runner_up_similarity(emb, view_bin, new_gid)
+                        self._log_decision(
+                            "NEW_ID", frame_ts, tid=det.track_id, gid=new_gid,
+                            best_existing_sim=best_other, seen_frames=self.track_seen_counts.get(det.track_id, 0),
+                        )
                     self.track_to_global[det.track_id] = new_gid
                     self.track_last_reid_ts[det.track_id] = frame_ts
                     resolved_assignments[det.track_id] = new_gid
@@ -701,5 +948,8 @@ class EnterpriseIdentityManager:
 
         # Consolidate any fragmented temporary IDs back into their original lost Global IDs
         self._consolidate_fragmented_identities(resolved_assignments, used_global_ids, frame_ts)
+
+        # Who is gone? Mark border exits / long occlusions so they can only return via the strict gate.
+        self._update_lifecycle(set(resolved_assignments.values()), frame_ts, W_img, H_img)
 
         return resolved_assignments
