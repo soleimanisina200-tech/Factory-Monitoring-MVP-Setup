@@ -1,8 +1,14 @@
 system: {device: 'cuda:0', half_precision: true, display_gui: true, output_video_path: output_industrial_reid.mp4}
 stream: {source: 'data/input/test_video.mp4',  # override with: python main.py --source <path|rtsp://...>
   reconnect_delay_sec: 3.0, drop_frames_on_lag: true}
+# detection.model_weights: yolo11m-pose.pt (default) | yolo11l-pose.pt | yolo11x-pose.pt (more accurate, slower)
+# detection.tracker_config: configs/custom_bytetrack.yaml (default) | configs/trackers/factory_ocsort.yaml |
+#   configs/trackers/factory_deepocsort.yaml | configs/trackers/factory_tracktrack.yaml
 detection: {model_weights: yolo11m-pose.pt, tracker_config: configs/custom_bytetrack.yaml,
   conf_thres: 0.08, iou_thres: 0.6, imgsz: 1536}
+# reid.model_name: osnet_x1_0 (default, auto-download) | osnet_ain_x1_0 (built to generalise to new sites;
+#   download its MSMT17 checkpoint from the torchreid Model Zoo to weights/osnet_ain_x1_0_msmt17.pt and set
+#   weights_path accordingly). Weights that do not fit the chosen model are refused at start-up.
 reid: {model_name: osnet_x1_0, weights_path: weights/osnet_x1_0_msmt17.pt, kpt_conf_thresh: 0.2,
   min_laplacian_var: 10.0, head_branch_weight: 0.35, color_branch_weight: 0.2, cos_sim_thresh: 0.6,
   spatial_recovery_sim_thresh: 0.48, reentry_sim_thresh: 0.82, reid_interval_sec: 0.35,
@@ -23,6 +29,8 @@ reid: {model_name: osnet_x1_0, weights_path: weights/osnet_x1_0_msmt17.pt, kpt_c
   max_exited_identities: 300,   # ... and keep at most this many departed workers
   occlusion_max_sec: 20.0,      # longest in-scene occlusion before the identity is treated as EXITED
   border_margin_ratio: 0.06,
+  pool_max_samples: 8,          # tracklet appearance = quality-weighted mean of up to this many recent crops
+  pool_window_sec: 4.0,         # ... taken from the last N seconds
   track_gap_reset_sec: 1.5,     # a track id missing this long and then reappearing is treated as brand new
   decision_log_path: logs/identity_decisions.jsonl}   # one JSON line per identity decision (empty = off)
 # Ground calibration: configs/calibration.yaml (scripts/calibrate_ground_plane.py) takes precedence.

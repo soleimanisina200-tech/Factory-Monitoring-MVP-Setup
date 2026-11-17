@@ -1,0 +1,22 @@
+# Deep OC-SORT tuned for this factory camera.
+# OC-SORT + adaptive appearance. The tracker's own ReID is OFF here on purpose: the identity manager already
+# runs pose-guided OSNet, and a second ReID model would only cost GPU time. What remains is OC-SORT's
+# occlusion-robust motion association with Deep OC-SORT's track handling.
+# Static camera -> camera-motion compensation disabled (it only costs CPU and can add jitter).
+# Use it: settings.yaml -> detection.tracker_config: configs/trackers/factory_deepocsort.yaml
+tracker_type: deepocsort
+track_high_thresh: 0.15
+track_low_thresh: 0.05
+new_track_thresh: 0.18
+track_buffer: 120
+match_thresh: 0.82
+fuse_score: True
+delta_t: 3
+inertia: 0.2
+use_byte: True
+gmc_method: none          # static camera
+with_reid: False          # appearance handled by the identity manager (OSNet / OSNet-AIN)
+model: auto
+proximity_thresh: 0.5
+appearance_thresh: 0.9
+alpha_fixed_emb: 0.95

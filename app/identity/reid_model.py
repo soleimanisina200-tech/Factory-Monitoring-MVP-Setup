@@ -4,7 +4,7 @@ import logging
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 import cv2
 import numpy as np
 import torch
@@ -15,6 +15,28 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="torchreid")
 logger = logging.getLogger("FactoryReID")
 
 MSMT17_GDRIVE_ID = "1KxxvkhV_pnm34VUwtlum-JyvChL_2eP-"
+MODEL_ZOO_URL = "https://kaiyangzhou.github.io/deep-person-reid/MODEL_ZOO"
+
+# Backbones that can be selected with reid.model_name. Only osnet_x1_0 has an automatic download; the others
+# must be downloaded from the torchreid Model Zoo into the listed default path (or reid.weights_path).
+REID_BACKBONES: Dict[str, Dict[str, Any]] = {
+    "osnet_x1_0": {
+        "default_weights": "weights/osnet_x1_0_msmt17.pt",
+        "auto_download": True,
+        "note": "OSNet trained on MSMT17 (current default)",
+    },
+    "osnet_ain_x1_0": {
+        "default_weights": "weights/osnet_ain_x1_0_msmt17.pt",
+        "auto_download": False,
+        "note": "OSNet-AIN: instance-normalised variant designed to generalise to unseen cameras/sites. "
+                "Download the MSMT17 (cross-domain) checkpoint from the Model Zoo.",
+    },
+    "osnet_ibn_x1_0": {
+        "default_weights": "weights/osnet_ibn_x1_0_msmt17.pt",
+        "auto_download": False,
+        "note": "OSNet-IBN: partially instance-normalised variant (cross-domain).",
+    },
+}
 
 SKELETON_LIMBS = [
     (5, 7), (7, 9),    # Left arm
@@ -35,6 +57,8 @@ class CropQualityReport:
     visible_ratio: float
     pose_view_bin: str
     reject_reason: str = ""
+    n_visible_kpts: int = -1      # -1 = unknown
+    crop_height_px: float = -1.0  # -1 = unknown
 
 
 def ensure_msmt17_weights(target_path: str = "weights/osnet_x1_0_msmt17.pt") -> str:
@@ -54,6 +78,68 @@ def ensure_msmt17_weights(target_path: str = "weights/osnet_x1_0_msmt17.pt") -> 
     if not path.exists() or path.stat().st_size < 5_000_000:
         raise RuntimeError(f"CRITICAL ERROR: Failed to acquire MSMT17 weights at {path}.")
     return str(path)
+
+
+def _clean_state_dict(raw: Any) -> Dict[str, torch.Tensor]:
+    state = raw.get("state_dict", raw) if isinstance(raw, Mapping) else raw
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in dict(state).items():
+        if torch.is_tensor(v):
+            out[k[7:] if k.startswith("module.") else k] = v
+    return out
+
+
+def weights_match_ratio(model: torch.nn.Module, state_dict: Mapping[str, Any]) -> float:
+    """
+    Fraction of the backbone's tensors (classifier excluded) that the checkpoint provides with the right shape.
+    torchreid silently DROPS mismatching layers, so loading e.g. OSNet weights into OSNet-AIN would otherwise
+    run an almost randomly initialised network without any error.
+    """
+    sd = _clean_state_dict(state_dict)
+    target = {k: v for k, v in model.state_dict().items() if not k.startswith("classifier")}
+    if not target:
+        return 0.0
+    matched = sum(1 for k, v in target.items() if k in sd and tuple(sd[k].shape) == tuple(v.shape))
+    return matched / len(target)
+
+
+def resolve_reid_weights(model_name: str, weights_path: Optional[str]) -> str:
+    """Pick the checkpoint for `model_name` and refuse silently-wrong combinations."""
+    spec = REID_BACKBONES.get(model_name)
+    if weights_path and Path(weights_path).exists():
+        return str(weights_path)
+    if spec is None:
+        raise FileNotFoundError(
+            f"Re-ID model '{model_name}': weights not found at '{weights_path}'. Supported: {sorted(REID_BACKBONES)}"
+        )
+    default = spec["default_weights"]
+    if Path(default).exists():
+        return default
+    if spec["auto_download"]:
+        return ensure_msmt17_weights(default)
+    raise FileNotFoundError(
+        f"Re-ID model '{model_name}' needs its own weights ({spec['note']}). Download the checkpoint from "
+        f"{MODEL_ZOO_URL} and save it as '{default}' (or set reid.weights_path). Using another model's weights "
+        f"would silently produce meaningless embeddings."
+    )
+
+
+def verify_reid_weights(model_name: str, weights_path: str, min_ratio: float = 0.95) -> float:
+    """Build the backbone and check the checkpoint really fits it (raises ValueError otherwise)."""
+    model = torchreid.models.build_model(name=model_name, num_classes=1, pretrained=False)
+    try:
+        raw = torch.load(weights_path, map_location="cpu", weights_only=True)
+    except Exception:
+        # Older torchreid checkpoints pickle extra metadata; only use this fallback on files you trust.
+        logger.warning("Checkpoint %s needs full unpickling (weights_only=False).", weights_path)
+        raw = torch.load(weights_path, map_location="cpu", weights_only=False)
+    ratio = weights_match_ratio(model, raw)
+    if ratio < min_ratio:
+        raise ValueError(
+            f"Re-ID weights '{weights_path}' do not fit model '{model_name}': only {ratio:.0%} of the layers match. "
+            f"Use the checkpoint published for '{model_name}' ({MODEL_ZOO_URL})."
+        )
+    return ratio
 
 
 class PoseGuidedOSNetExtractor:
@@ -88,10 +174,10 @@ class PoseGuidedOSNetExtractor:
         self.color_w = float(color_branch_weight)
         self.body_w = max(0.30, 1.0 - self.head_w - self.color_w)
 
-        valid_weights_path = (
-            weights_path if (weights_path and Path(weights_path).exists()) else ensure_msmt17_weights()
-        )
-        logger.info(f"Loading true Person Re-ID MSMT17 weights from: {valid_weights_path}")
+        valid_weights_path = resolve_reid_weights(model_name, weights_path)
+        ratio = verify_reid_weights(model_name, valid_weights_path)
+        self.model_name = model_name
+        logger.info(f"Re-ID backbone {model_name}: weights {valid_weights_path} ({ratio:.0%} of layers matched)")
 
         self.extractor = torchreid.utils.FeatureExtractor(
             model_name=model_name,
@@ -389,6 +475,8 @@ class PoseGuidedOSNetExtractor:
                 visible_ratio=vis_ratio,
                 pose_view_bin=view_bin,
                 reject_reason=reason,
+                n_visible_kpts=n_visible,
+                crop_height_px=float(bh),
             ),
         }
 

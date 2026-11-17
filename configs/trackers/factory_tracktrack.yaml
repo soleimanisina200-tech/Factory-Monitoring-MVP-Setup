@@ -1,0 +1,26 @@
+# TrackTrack (CVPR 2025, "Focusing on Tracks for Online Multi-Object Tracking") tuned for this factory camera.
+# Associates from each TRACK's perspective and only starts new tracks that do not overlap existing ones
+# (track-aware initialisation) - aimed at detection noise, occlusion and overlapping people.
+# The Ultralytics defaults (high 0.6 / new 0.7) assume a strong detector on MOT benchmarks and would drop the
+# distant, low-confidence workers of this camera, so the thresholds are lowered. These are starting points:
+# compare on your own video against custom_bytetrack.yaml / factory_ocsort.yaml.
+# Use it: settings.yaml -> detection.tracker_config: configs/trackers/factory_tracktrack.yaml
+tracker_type: tracktrack
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.20
+track_buffer: 120
+match_thresh: 0.7
+lost_match_thr: 0.0
+iou_weight: 0.5
+reid_weight: 0.5          # unused while with_reid is False
+conf_weight: 0.1
+angle_weight: 0.05
+penalty_p: 0.2
+penalty_q: 0.4
+reduce_step: 0.05
+tai_thr: 0.55             # track-aware initialisation: max IoU of a new track with existing ones
+min_track_len: 3
+gmc_method: none          # static camera
+with_reid: False          # appearance handled by the identity manager
+model: auto

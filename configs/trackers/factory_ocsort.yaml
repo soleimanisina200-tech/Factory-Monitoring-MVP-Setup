@@ -1,0 +1,16 @@
+# OC-SORT tuned for this factory camera (static, 2560x1920, distant ~40 px workers, occlusion behind forklifts).
+# Why OC-SORT: when a worker disappears behind an obstacle, ByteTrack keeps extrapolating a straight Kalman
+# prediction; OC-SORT re-fits the motion from the last real observations when the person re-appears
+# ("observation-centric re-update") and uses the motion direction in matching - fewer ID switches after
+# occlusions and at crossings. No appearance model inside (our identity manager does Re-ID).
+# Use it: settings.yaml -> detection.tracker_config: configs/trackers/factory_ocsort.yaml
+tracker_type: ocsort
+track_high_thresh: 0.15   # same as custom_bytetrack.yaml: distant workers have low detector confidence
+track_low_thresh: 0.05
+new_track_thresh: 0.18    # = detector minimum for new (non-tracked) people
+track_buffer: 120         # PROCESSED frames (not seconds), see custom_bytetrack.yaml
+match_thresh: 0.82
+fuse_score: True
+delta_t: 3                # observations used to estimate the motion direction
+inertia: 0.2              # weight of the motion-direction consistency term
+use_byte: True            # also try low-confidence detections (partially occluded workers), as ByteTrack does

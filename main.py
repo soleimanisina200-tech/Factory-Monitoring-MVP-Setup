@@ -296,6 +296,8 @@ def main(
         track_state_ttl_sec=reid_cfg.get("track_state_ttl_sec", 10.0),
         identity_retention_sec=reid_cfg.get("identity_retention_sec", 3600.0),
         max_exited_identities=reid_cfg.get("max_exited_identities", 300),
+        pool_max_samples=reid_cfg.get("pool_max_samples", 8),
+        pool_window_sec=reid_cfg.get("pool_window_sec", 4.0),
         decision_log_path=reid_cfg.get("decision_log_path") or None,
     )
 

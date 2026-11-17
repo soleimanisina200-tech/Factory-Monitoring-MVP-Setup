@@ -193,6 +193,8 @@ class EnterpriseIdentityManager:
         max_exited_identities: int = 300,
         decision_log_path: Optional[str] = None,
         decision_log_max_mb: float = 50.0,
+        pool_max_samples: int = 8,
+        pool_window_sec: float = 4.0,
     ):
         self.reid = reid_extractor
         self.bev = bev_projector
@@ -231,8 +233,14 @@ class EnterpriseIdentityManager:
         self.max_exited_identities = max_exited_identities
         self._last_prune_ts = -1e18
 
+        # Tracklet-level appearance: every clean crop of a track is kept with a quality weight and matching
+        # uses the quality-weighted mean of the recent samples instead of a single (possibly bad) frame.
+        self.pool_max_samples = int(pool_max_samples)
+        self.pool_window_sec = float(pool_window_sec)
+
         self.track_last_seen_ts: Dict[int, float] = {}
-        self.track_emb_buffer: Dict[int, Deque[np.ndarray]] = {}
+        # tid -> deque of (embedding, weight, view_bin, gallery_valid, ts, sharpness)
+        self.track_emb_buffer: Dict[int, Deque[Tuple[np.ndarray, float, str, bool, float, float]]] = {}
         self._newly_exited: List[int] = []
         self._merged: List[Tuple[int, int]] = []  # (removed_gid, surviving_gid)
 
@@ -450,12 +458,67 @@ class EnterpriseIdentityManager:
             best = max(best, ident.compute_similarity(emb, view))
         return best
 
-    def _track_mean_embedding(self, tid: int) -> Tuple[Optional[np.ndarray], int]:
+    @staticmethod
+    def _sample_weight(report: CropQualityReport, det: PoseDetection) -> float:
+        """
+        Quality weight of one crop for tracklet pooling (0..1): large, sharp crops with many visible joints of an
+        isolated person count fully; tiny / blurry / half-hidden crops still count, but much less.
+        """
+        h = report.crop_height_px if report.crop_height_px > 0 else float(det.bbox_xyxy[3] - det.bbox_xyxy[1])
+        q_size = float(np.clip(h / 160.0, 0.15, 1.0))
+        q_sharp = float(np.clip(report.sharpness_score / 50.0, 0.2, 1.0))
+        q_kpts = 1.0 if report.n_visible_kpts < 0 else float(np.clip(report.n_visible_kpts / 17.0, 0.2, 1.0))
+        q_iso = 1.0 if det.is_isolated else 0.5
+        return q_size * q_sharp * q_kpts * q_iso
+
+    def _add_track_sample(
+        self,
+        det: PoseDetection,
+        emb: Optional[np.ndarray],
+        report: Optional[CropQualityReport],
+        frame_ts: float,
+    ) -> None:
+        """Remember one crop of this track. Crops overlapping another person are never pooled."""
+        if emb is None or report is None or det.is_intersecting:
+            return
+        buf = self.track_emb_buffer.setdefault(det.track_id, deque(maxlen=self.pool_max_samples))
+        buf.append(
+            (
+                emb.copy(),
+                self._sample_weight(report, det),
+                report.pose_view_bin,
+                bool(report.is_valid_for_gallery),
+                float(frame_ts),
+                float(report.sharpness_score),
+            )
+        )
+
+    def _track_pooled_embedding(
+        self, tid: int, frame_ts: float, valid_only: bool = False
+    ) -> Tuple[Optional[np.ndarray], Optional[str], int, float]:
+        """
+        Quality-weighted mean embedding of the track's recent clean crops.
+        Returns (embedding, view of the best crop, number of samples, sharpness of the best crop).
+        """
         buf = self.track_emb_buffer.get(tid)
         if not buf:
-            return None, 0
-        mean = np.mean(np.stack(list(buf)), axis=0)
-        return (mean / (np.linalg.norm(mean) + 1e-8)).astype(np.float32), len(buf)
+            return None, None, 0, 0.0
+        samples = [
+            smp for smp in buf
+            if (frame_ts - smp[4]) <= self.pool_window_sec and (smp[3] or not valid_only)
+        ]
+        if not samples:
+            return None, None, 0, 0.0
+        weights = np.array([smp[1] for smp in samples], dtype=np.float32)
+        pooled = (weights[:, None] * np.stack([smp[0] for smp in samples])).sum(axis=0)
+        pooled = (pooled / (np.linalg.norm(pooled) + 1e-8)).astype(np.float32)
+        best = max(samples, key=lambda smp: smp[1])
+        return pooled, best[2], len(samples), best[5]
+
+    def _track_mean_embedding(self, tid: int, frame_ts: float) -> Tuple[Optional[np.ndarray], int]:
+        """Pooled embedding over gallery-quality crops only (used by the strict re-entry gate)."""
+        emb, _, n, _ = self._track_pooled_embedding(tid, frame_ts, valid_only=True)
+        return emb, n
 
     def _is_spatially_continuous_with_identity(
         self, ident: WorkerIdentity, det: PoseDetection, current_ts: float
@@ -807,6 +870,7 @@ class EnterpriseIdentityManager:
             if need_reid:
                 emb, report = verified[tid]
                 self.track_last_reid_ts[tid] = frame_ts
+                self._add_track_sample(det, emb, report, frame_ts)
                 if emb is not None and report is not None and report.is_valid_for_gallery:
                     self.track_best_emb[tid] = (emb, report.pose_view_bin, report.sharpness_score)
                     # CRITICAL FIX: Compute similarity BEFORE updating recent_embeddings or gallery!
@@ -885,15 +949,19 @@ class EnterpriseIdentityManager:
                 det_reports.append(rep)
                 if emb is not None and rep is not None and rep.is_valid_for_gallery:
                     self.track_best_emb[det.track_id] = (emb, rep.pose_view_bin, rep.sharpness_score)
-                    # Multi-frame evidence for the strict re-entry gate (never a single lucky frame).
-                    self.track_emb_buffer.setdefault(det.track_id, deque(maxlen=6)).append(emb.copy())
+                # Multi-frame evidence: matching uses the quality-weighted tracklet embedding, never one frame.
+                self._add_track_sample(det, emb, rep, frame_ts)
 
-            # The embedding/view actually used for matching each row (fresh, or the track's last good one)
+            # The embedding/view actually used for matching each row: the tracklet's quality-weighted pooled
+            # embedding when it has clean crops; otherwise the fresh crop or the track's last good one.
             row_emb: List[Optional[np.ndarray]] = []
             row_view: List[str] = []
             for r, det in enumerate(unassigned_detections):
                 emb, rep = det_embeddings[r], det_reports[r]
-                if emb is None and det.track_id in self.track_best_emb:
+                pooled, pooled_view, _, _ = self._track_pooled_embedding(det.track_id, frame_ts)
+                if pooled is not None:
+                    emb, view = pooled, pooled_view
+                elif emb is None and det.track_id in self.track_best_emb:
                     emb, view, _ = self.track_best_emb[det.track_id]
                 else:
                     view = rep.pose_view_bin if rep is not None else "FRONT"
@@ -912,7 +980,7 @@ class EnterpriseIdentityManager:
                         continue
 
                     track_birth_ts = self.track_first_seen_ts.get(det.track_id, frame_ts)
-                    strict_emb, strict_n = self._track_mean_embedding(det.track_id)
+                    strict_emb, strict_n = self._track_mean_embedding(det.track_id, frame_ts)
                     det_near_border = self._is_near_frame_border(
                         det.bbox_xyxy, W_img, H_img, self.border_margin_ratio
                     )
@@ -1035,7 +1103,7 @@ class EnterpriseIdentityManager:
                         # ANY other identity, including workers who are currently visible on screen.
                         if stage in ("REENTRY_STRICT", "STITCH", "BORDER_REENTRY"):
                             if stage == "REENTRY_STRICT":
-                                m_emb, _ = self._track_mean_embedding(det.track_id)
+                                m_emb, _ = self._track_mean_embedding(det.track_id, frame_ts)
                                 margin_needed = self.reentry_margin
                             else:
                                 m_emb = row_emb[r]
@@ -1103,7 +1171,14 @@ class EnterpriseIdentityManager:
                 emb = row_emb[r]
                 view_bin = row_view[r]
                 rep = det_reports[r]
-                if det_embeddings[r] is not None and rep is not None:
+                # Seed the new identity from the pooled GALLERY-QUALITY crops when there are any; otherwise from
+                # whatever is available, but then only into short-term memory (never gallery / anchors).
+                valid_emb, valid_view, _, valid_sharp = self._track_pooled_embedding(
+                    det.track_id, frame_ts, valid_only=True
+                )
+                if valid_emb is not None:
+                    emb, view_bin, sharpness_val, gallery_ok = valid_emb, valid_view, valid_sharp, True
+                elif det_embeddings[r] is not None and rep is not None:
                     sharpness_val = rep.sharpness_score
                     gallery_ok = rep.is_valid_for_gallery
                 elif det.track_id in self.track_best_emb:
