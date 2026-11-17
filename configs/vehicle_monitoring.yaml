@@ -5,6 +5,7 @@ vehicle_monitoring:
   # Detection Settings
   vehicle_detector_weights: "yolo11m.pt"   # Can point to custom forklift weights (e.g., forklift_yolo11.pt)
   person_class_id: 0
+  vehicle_tracker_config: "bytetrack.yaml"   # vehicles get their own tracker (NOT the person tracker)
   # Standard COCO classes (e.g., 2: car, 7: truck) or custom model forklift class ID (e.g., 0 or 80)
   vehicle_class_ids: [7]
   vehicle_conf_threshold: 0.40
@@ -23,6 +24,18 @@ vehicle_monitoring:
     require_vehicle_activity_for_spawn: false  # Set true to only allow emergence on vehicles that moved in-stream
     unassigned_ghost_timeout_sec: 1.5          # Immediately clears disappearing unassigned vehicles (e.g. Forklift #9)
     assigned_ghost_timeout_sec: 15.0
+    # --- driver-identity robustness ---
+    allow_provisional_ids_for_spawn: false     # unverified 'T<id>' persons can never be auto-bound as driver
+    spawn_border_margin_px: 40                 # people first seen at the image border walked in from outside
+    driver_handover_iou: 0.5                   # same body, new track/global id -> keep the driver binding
+    driver_handover_max_gap_sec: 1.0
+    comotion_min_cosine: 0.6                   # moving vehicle: operator must travel WITH it (direction)
+    comotion_min_speed_ratio: 0.4              # ... and at a similar speed
+    comotion_max_speed_ratio: 2.0
+    person_history_ttl_sec: 60.0               # memory bound for per-person histories
+    # Seconds a driver may be invisible near a STATIONARY vehicle before an alarm fires. 0 = disabled.
+    # Policy decision: confirm the value with the site safety officer before enabling.
+    driver_lost_alarm_sec: 0.0
 
   # Real-World Distance Estimation & Safety Thresholds (in Meters)
   distance:
@@ -65,5 +78,5 @@ vehicle_monitoring:
 
   dashboard:
     enable_web_dashboard: true
-    host: "0.0.0.0"
+    host: "127.0.0.1"   # localhost only; set 0.0.0.0 deliberately (and put auth/HTTPS in front) to expose it
     port: 8050

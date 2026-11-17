@@ -1,11 +1,22 @@
 system: {device: 'cuda:0', half_precision: true, display_gui: true, output_video_path: output_industrial_reid.mp4}
-stream: {source: 'D:/AI/EsfahanMoghadam/Factory Monitoring MVP Setup/data/input/test_video.mp4',
+stream: {source: 'data/input/test_video.mp4',  # override with: python main.py --source <path|rtsp://...>
   reconnect_delay_sec: 3.0, drop_frames_on_lag: true}
 detection: {model_weights: yolo11m-pose.pt, tracker_config: configs/custom_bytetrack.yaml,
   conf_thres: 0.08, iou_thres: 0.6, imgsz: 1536}
 reid: {model_name: osnet_x1_0, weights_path: weights/osnet_x1_0_msmt17.pt, kpt_conf_thresh: 0.2,
   min_laplacian_var: 10.0, head_branch_weight: 0.35, color_branch_weight: 0.2, cos_sim_thresh: 0.6,
-  spatial_recovery_sim_thresh: 0.48, reentry_sim_thresh: 0.82, reid_interval_sec: 0.35}
+  spatial_recovery_sim_thresh: 0.48, reentry_sim_thresh: 0.82, reid_interval_sec: 0.35,
+  # --- identity safety (a wrong merge is worse than a fresh ID) ---
+  stitch_sim_thresh: 0.55,      # in-place tracklet stitching (was a hard-coded 0.42)
+  stitch_margin: 0.04,          # best-vs-runner-up gap (runner-up includes workers currently on screen)
+  reentry_min_gap_sec: 2.0,     # a worker who just left needs +0.08 extra similarity to return sooner
+  reentry_margin: 0.08,         # best-vs-runner-up gap required to give an EXITED identity back
+  reentry_min_samples: 3,       # clean multi-frame samples required before an EXITED identity is reused
+  exit_confirm_sec: 0.5,        # absence near the frame border before a worker counts as EXITED
+  occlusion_max_sec: 20.0,      # longest in-scene occlusion before the identity is treated as EXITED
+  border_margin_ratio: 0.06,
+  track_gap_reset_sec: 1.5,     # a track id missing this long and then reappearing is treated as brand new
+  decision_log_path: logs/identity_decisions.jsonl}   # one JSON line per identity decision (empty = off)
 physics_bev:
   max_worker_speed_mps: 3.5
   max_internal_occlusion_m: 5.5

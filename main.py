@@ -38,6 +38,7 @@ def build_pose_persons_for_vehicle_monitor(
     detections: List[PoseDetection],
     track_to_global: Dict[int, int],
     bev_projector: Optional[MetricBEVProjector] = None,
+    track_embeddings: Optional[Dict[int, np.ndarray]] = None,
 ) -> List[Dict]:
     """
     Packages IndustrialPoseDetector + EnterpriseIdentityManager outputs
@@ -77,11 +78,11 @@ def build_pose_persons_for_vehicle_monitor(
             kpts_conf[16] = max(kpts_conf[16], 0.75)
 
             ug, vg = int(seat_x), int(min(float(y2), seat_y + 12.0))
-            if bev_projector is not None and hasattr(bev_projector, "pixel_to_meters"):
+            if bev_projector is not None:
                 try:
-                    bev_xy = bev_projector.pixel_to_meters((float(ug), float(vg)))
+                    bev_xy = bev_projector.to_bev_meters(float(ug), float(vg))
                 except Exception:
-                    pass
+                    logger.exception("BEV projection of seated operator failed")
 
         kpts_17x3 = np.column_stack([kpts_xy, kpts_conf])
 
@@ -93,222 +94,11 @@ def build_pose_persons_for_vehicle_monitor(
                 "keypoints": kpts_17x3,
                 "foot_px": (ug, vg),
                 "bev_xy": bev_xy,
+                # Real OSNet embedding from the identity manager (same feature space as global IDs).
+                "embedding": (track_embeddings or {}).get(det.track_id),
             }
         )
     return pose_persons
-
-
-def _person_cab_containment_score(
-    person_bbox: List[float], veh_bbox: List[float]
-) -> float:
-    """
-    Computes how strongly a person's bounding box sits inside a vehicle's cab region.
-    Rejects workers standing on top of high open cargo beds (like ID:5 on the truck).
-    """
-    px1, py1, px2, py2 = person_bbox[:4]
-    vx1, vy1, vx2, vy2 = veh_bbox[:4]
-
-    vw = max(1.0, vx2 - vx1)
-    vh = max(1.0, vy2 - vy1)
-    pw = max(1.0, px2 - px1)
-    ph = max(1.0, py2 - py1)
-
-    # Intersection of person box with vehicle box
-    ix1, iy1 = max(px1, vx1), max(py1, vy1)
-    ix2, iy2 = min(px2, vx2), min(py2, vy2)
-    if ix2 <= ix1 or iy2 <= iy1:
-        return 0.0
-
-    inter_area = (ix2 - ix1) * (iy2 - iy1)
-    containment = inter_area / (pw * ph)
-    if containment < 0.55:
-        return 0.0
-
-    # Person center relative to vehicle box
-    pcx = 0.5 * (px1 + px2)
-    pcy = 0.5 * (py1 + py2)
-    rel_y = (pcy - vy1) / vh
-    rel_x = (pcx - vx1) / vw
-
-    # Exclude workers standing high up on top of open cargo beds (upper 35% of very large truck boxes)
-    if vh > 500 and rel_y < 0.42:
-        return 0.0
-
-    # Prefer person whose torso sits in the central/lower cab region (0.35 <= rel_y <= 0.85)
-    center_bonus = 1.0 - 0.5 * abs(rel_x - 0.5) - 0.5 * abs(rel_y - 0.58)
-    return float(containment * max(0.2, center_bonus))
-
-
-def sync_cab_driver_assignments(
-    vehicle_pipeline: VehicleMonitoringPipeline,
-    pose_persons: List[Dict[str, Any]],
-) -> None:
-    """
-    Inspects active vehicle states inside `vehicle_pipeline` (before/after frame processing).
-    If a person (such as ID:7 inside the forklift cab) is physically seated inside the
-    vehicle cab (>55% box containment), forces that vehicle's `driver_id` to lock onto
-    the seated operator instead of a distant pedestrian (like Driver #8).
-    """
-    # Locate the dictionary or list of tracked vehicle state objects inside vehicle_pipeline
-    veh_containers: List[Dict[Any, Any]] = []
-    for obj in (
-        vehicle_pipeline,
-        getattr(vehicle_pipeline, "state_machine", None),
-        getattr(vehicle_pipeline, "driver_manager", None),
-        getattr(vehicle_pipeline, "associator", None),
-        getattr(vehicle_pipeline, "tracker", None),
-        getattr(vehicle_pipeline, "estimator", None),
-    ):
-        if obj is None:
-            continue
-        for attr in (
-            "vehicles",
-            "vehicle_states",
-            "active_vehicles",
-            "tracked_vehicles",
-            "states",
-            "tracks",
-        ):
-            val = getattr(obj, attr, None)
-            if isinstance(val, dict) and val:
-                veh_containers.append(val)
-
-    for container in veh_containers:
-        for vid, vstate in container.items():
-            # Extract vehicle bbox
-            vbbox = None
-            for b_attr in ("bbox", "bbox_xyxy", "box", "last_bbox"):
-                if hasattr(vstate, b_attr):
-                    vbbox = getattr(vstate, b_attr)
-                    break
-                elif isinstance(vstate, dict) and b_attr in vstate:
-                    vbbox = vstate[b_attr]
-                    break
-            if vbbox is None or len(vbbox) < 4:
-                continue
-
-            # Find if any detected person is physically sitting inside this vehicle's cab
-            best_person = None
-            best_score = 0.0
-            for p in pose_persons:
-                if p["global_id"] == -1:
-                    continue
-                score = _person_cab_containment_score(p["bbox"], list(vbbox))
-                if score > best_score:
-                    best_score = score
-                    best_person = p
-
-            if best_person is not None and best_score >= 0.45:
-                true_driver_id = best_person["id"]
-                true_gid = best_person["global_id"]
-
-                # Override stale driver_id (e.g., #8 -> #7) on the vehicle state object
-                for d_attr in ("driver_id", "assigned_driver_id", "operator_id", "locked_driver_id"):
-                    if hasattr(vstate, d_attr):
-                        setattr(vstate, d_attr, true_driver_id)
-                    elif isinstance(vstate, dict) and d_attr in vstate:
-                        vstate[d_attr] = true_driver_id
-
-                # Update driver anchor / BEV distance so it doesn't trigger a false DISTANCE_VIOLATION_ALARM
-                for dist_attr in ("driver_distance", "distance_to_driver", "current_distance", "dist_m"):
-                    if hasattr(vstate, dist_attr):
-                        setattr(vstate, dist_attr, 0.0)
-                    elif isinstance(vstate, dict) and dist_attr in vstate:
-                        vstate[dist_attr] = 0.0
-
-                for status_attr in ("status", "alarm_state", "safety_status", "state"):
-                    if hasattr(vstate, status_attr):
-                        curr_st = str(getattr(vstate, status_attr))
-                        if "VIOLATION" in curr_st or "UNCERTAIN" in curr_st:
-                            setattr(vstate, status_attr, "DRIVER_IN_CAB")
-                    elif isinstance(vstate, dict) and status_attr in vstate:
-                        curr_st = str(vstate[status_attr])
-                        if "VIOLATION" in curr_st or "UNCERTAIN" in curr_st:
-                            vstate[status_attr] = "DRIVER_IN_CAB"
-
-
-def tune_vehicle_pipeline_for_yard(vehicle_pipeline: VehicleMonitoringPipeline) -> None:
-    """
-    Adjusts vehicle detection confidence and motion state thresholds in-memory
-    so forklifts/trucks are consistently detected and moving vehicles do not display 'STOP'.
-    """
-    for attr_name in ("conf_thres", "conf_threshold", "vehicle_conf_thres", "det_conf"):
-        if hasattr(vehicle_pipeline, attr_name):
-            setattr(vehicle_pipeline, attr_name, min(0.22, float(getattr(vehicle_pipeline, attr_name))))
-        if hasattr(vehicle_pipeline, "detector") and hasattr(vehicle_pipeline.detector, attr_name):
-            setattr(
-                vehicle_pipeline.detector,
-                attr_name,
-                min(0.22, float(getattr(vehicle_pipeline.detector, attr_name))),
-            )
-
-    target_objs = [vehicle_pipeline]
-    for sub in ("estimator", "motion_estimator", "state_estimator", "tracker", "driver_associator"):
-        if hasattr(vehicle_pipeline, sub):
-            target_objs.append(getattr(vehicle_pipeline, sub))
-
-    motion_keys = (
-        "stop_speed_thresh",
-        "moving_speed_thresh",
-        "speed_thresh_mps",
-        "min_moving_speed",
-        "motion_thresh_px",
-        "stationary_thresh",
-        "velocity_thresh",
-    )
-    for obj in target_objs:
-        for k in motion_keys:
-            if hasattr(obj, k):
-                curr_val = float(getattr(obj, k))
-                setattr(obj, k, max(0.06, curr_val * 0.30))
-        if hasattr(obj, "config") and isinstance(obj.config, dict):
-            for section in obj.config.values():
-                if isinstance(section, dict):
-                    for k in motion_keys:
-                        if k in section and isinstance(section[k], (int, float)):
-                            section[k] = max(0.06, float(section[k]) * 0.30)
-
-
-def handle_border_exits_and_occlusions(
-    identity_manager: EnterpriseIdentityManager,
-    dir_tracker: DirectionalTracker,
-    active_ground_points: Dict[Any, Tuple[float, float]],
-    prev_active_gids: set[Any],
-    frame_w: int,
-    frame_h: int,
-) -> set[Any]:
-    """
-    Distinguishes between:
-      A) A person hiding inside the yard (behind forklift, truck, or another worker):
-         -> DO NOT touch their BEV position so they recover their exact same ID when reappearing.
-      B) A person walking off the camera border:
-         -> Unbind their ByteTrack track_id and retire their doorway spatial bubble so a
-            new person walking in cannot steal their ID, while keeping their appearance gallery
-            intact so if the same person returns minutes later, they get their original ID back.
-    """
-    curr_active_gids = {k for k in active_ground_points.keys() if isinstance(k, int)}
-    disappeared_gids = prev_active_gids - curr_active_gids
-
-    for gid in disappeared_gids:
-        traj = dir_tracker.trajectories.get(gid)
-        if not traj:
-            continue
-        last_pt = traj[-1]
-
-        if dir_tracker.is_near_frame_border(last_pt, frame_w, frame_h):
-            dir_tracker.exited_camera_ids.add(gid)
-            for tid, mapped_gid in list(identity_manager.track_to_global.items()):
-                if mapped_gid == gid:
-                    del identity_manager.track_to_global[tid]
-
-            profile = identity_manager.identities.get(gid)
-            if profile is not None:
-                far_bev = np.array([999.0, 999.0], dtype=np.float32)
-                for attr in ("bev_xy", "last_bev_xy", "pos_bev", "last_pos_bev"):
-                    if hasattr(profile, attr) and getattr(profile, attr) is not None:
-                        setattr(profile, attr, far_bev)
-
-    return curr_active_gids
 
 
 def draw_industrial_hud(
@@ -386,8 +176,11 @@ def draw_industrial_hud(
 def main(
     config_path: str,
     vehicle_config_path: str = "configs/vehicle_monitoring.yaml",
+    source_override: Optional[str] = None,
 ) -> None:
     cfg = load_config(config_path)
+    if source_override:
+        cfg["stream"]["source"] = source_override
     sys_cfg = cfg["system"]
     stream_cfg = cfg["stream"]
     det_cfg = cfg["detection"]
@@ -448,6 +241,16 @@ def main(
         lag_diffusion_coeff=bev_cfg.get("lag_diffusion_coeff", 0.65),
         base_pose_jitter_m=bev_cfg.get("base_pose_jitter_m", 0.70),
         reid_interval_sec=reid_cfg.get("reid_interval_sec", 0.35),
+        stitch_sim_thresh=reid_cfg.get("stitch_sim_thresh", 0.55),
+        stitch_margin=reid_cfg.get("stitch_margin", 0.04),
+        reentry_min_gap_sec=reid_cfg.get("reentry_min_gap_sec", 2.0),
+        reentry_margin=reid_cfg.get("reentry_margin", 0.08),
+        reentry_min_samples=reid_cfg.get("reentry_min_samples", 3),
+        exit_confirm_sec=reid_cfg.get("exit_confirm_sec", 0.5),
+        occlusion_max_sec=reid_cfg.get("occlusion_max_sec", 20.0),
+        border_margin_ratio=reid_cfg.get("border_margin_ratio", 0.06),
+        track_gap_reset_sec=reid_cfg.get("track_gap_reset_sec", 1.5),
+        decision_log_path=reid_cfg.get("decision_log_path") or None,
     )
 
     zone_manager = MultiZoneManager(
@@ -467,20 +270,11 @@ def main(
             config_path=vehicle_config_path,
             reid_extractor=reid_extractor,
         )
-        tune_vehicle_pipeline_for_yard(vehicle_pipeline)
 
-        # Share the calibrated homography from settings.yaml if available
-        if bev_cfg.get("src_image_pts") and bev_cfg.get("dst_meter_pts"):
-            src_pts = np.array(bev_cfg["src_image_pts"], dtype=np.float32)
-            dst_pts = np.array(bev_cfg["dst_meter_pts"], dtype=np.float32)
-            if len(src_pts) >= 4 and len(dst_pts) >= 4:
-                H, _ = cv2.findHomography(src_pts, dst_pts, method=cv2.RANSAC)
-                if H is not None:
-                    vehicle_pipeline.estimator.homography_matrix = H
-                    try:
-                        vehicle_pipeline.estimator.inv_homography_matrix = np.linalg.inv(H)
-                    except np.linalg.LinAlgError:
-                        pass
+        # ONE homography for persons and vehicles: the projector's matrix is already scaled to the stream
+        # resolution. (The old code rebuilt it from the unscaled reference points -> two coordinate systems.)
+        if bev_projector.H is not None:
+            vehicle_pipeline.estimator.set_homography(bev_projector.H)
 
     writer = None
     out_path = sys_cfg.get("output_video_path")
@@ -495,7 +289,6 @@ def main(
 
     prev_ts = time.monotonic()
     fps_ema = reader.nominal_fps
-    prev_active_gids: set[Any] = set()
 
     logger.info("Pipeline initialized. Starting real-time inference loop...")
     try:
@@ -534,30 +327,30 @@ def main(
             for dev in dir_events:
                 logger.info(f"DIRECTION EVENT: {dev}")
 
-            # Distinguish between in-yard occlusion (keep BEV position) vs border exit (retire doorway bubble)
-            prev_active_gids = handle_border_exits_and_occlusions(
-                identity_manager=identity_manager,
-                dir_tracker=dir_tracker,
-                active_ground_points=active_ground_points,
-                prev_active_gids=prev_active_gids,
-                frame_w=reader.width,
-                frame_h=reader.height,
-            )
+            # Workers who just LEFT the camera (reported once by the identity manager, which also unbinds
+            # their tracks so a newcomer can never inherit the departed worker's ID).
+            for gid_left in identity_manager.pop_newly_exited():
+                dir_tracker.exited_camera_ids.add(gid_left)
+                logger.info(f"ID:{gid_left} left the camera view")
 
             # Run Vehicle & Driver Monitoring using YOLO-Pose detections (with seated-driver lock)
             if vehicle_pipeline is not None:
+                track_embeddings = {
+                    d.track_id: identity_manager.track_best_emb[d.track_id][0]
+                    for d in detections
+                    if d.track_id in identity_manager.track_best_emb
+                }
                 pose_persons = build_pose_persons_for_vehicle_monitor(
                     detections=detections,
                     track_to_global=track_to_global,
                     bev_projector=bev_projector,
+                    track_embeddings=track_embeddings,
                 )
-                sync_cab_driver_assignments(vehicle_pipeline, pose_persons)
                 frame = vehicle_pipeline.process_frame(
                     frame=frame,
                     external_persons=pose_persons,
-                    tracker_config=det_cfg["tracker_config"],
+                    frame_ts=frame_ts,
                 )
-                sync_cab_driver_assignments(vehicle_pipeline, pose_persons)
 
             if sys_cfg.get("display_gui", True) or writer is not None:
                 zone_manager.draw_zones(frame)
@@ -584,6 +377,9 @@ def main(
     except KeyboardInterrupt:
         logger.info("Interrupted by user. Shutting down...")
     finally:
+        identity_manager.close()
+        if vehicle_pipeline is not None:
+            vehicle_pipeline.logger.close()
         reader.release()
         if writer is not None:
             writer.release()
@@ -599,5 +395,6 @@ if __name__ == "__main__":
         default="configs/vehicle_monitoring.yaml",
         help="Path to vehicle_monitoring.yaml",
     )
+    parser.add_argument("--source", type=str, default=None, help="Video file / RTSP URL (overrides settings.yaml)")
     args = parser.parse_args()
-    main(args.config, args.vehicle_config)
+    main(args.config, args.vehicle_config, args.source)
