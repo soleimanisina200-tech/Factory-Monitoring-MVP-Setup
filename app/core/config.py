@@ -71,7 +71,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "reentry_min_gap_sec": 2.0,
         "reentry_margin": 0.08,
         "reentry_min_samples": 3,
-        "recover_strict_after_sec": 4.0,
+        "recover_strict_after_sec": 8.0,
         "exit_confirm_sec": 0.8,
         "exit_edges": ["left", "right", "top", "bottom"],
         "mismatch_min_span_sec": 1.0,

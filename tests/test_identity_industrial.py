@@ -147,6 +147,37 @@ def test_a_different_marker_is_never_given_the_id_even_with_identical_appearance
     assert got != gid_a and sc.mgr.identity_label(got) == "E-8"
 
 
+def test_worker_first_seen_next_to_others_keeps_his_id_after_they_leave():
+    """Regression: an identity created while NOT isolated had no gallery, its similarity was stuck at 0.07 and the
+    mismatch breaker gave the visible, unhidden worker a new ID as soon as he walked away from the others."""
+    sc = Multi()
+    me, other = unit(0), unit(3)
+    gid = None
+    for k in range(15):                                   # 0.8 m from a colleague: not isolated
+        out = sc.step([(1, 300.0 + 2 * k, me), (2, 400.0, other)])   # boxes apart, but < 1.35 m: not isolated
+        gid = out.get(1, gid)
+    assert gid is not None and sc.mgr.identities[gid].has_gallery()
+    assert sc.mgr.identities[gid].compute_similarity(me, "FRONT") > 0.9
+    ids = {sc.step([(1, 330.0 + 8 * k, me)]).get(1) for k in range(40)}   # walks away, alone, for 4 s
+    assert ids == {gid}
+
+
+def test_person_mostly_covered_by_a_forklift_is_not_used_for_appearance():
+    sc = Multi()
+    me = unit(0)
+    gid = None
+    for k in range(15):
+        gid = sc.step([(1, 100.0 + 2 * k, me)]).get(1, gid)
+    n_before = len(sc.mgr.identities[gid].recent_embeddings)
+    for k in range(20):    # half hidden behind a forklift: garbage crops must not break or pollute the binding
+        sc.ts += 1.0 / FPS
+        det = PoseDetection(track_id=1, bbox_xyxy=np.array([130.0, 200.0, 190.0, 360.0], np.float32), conf=0.9,
+                            keypoints_xy=np.zeros((17, 2), np.float32), keypoints_conf=np.zeros(17, np.float32))
+        sc.reid.by_x[130] = unit(7)
+        out = sc.mgr.process_frame(sc.frame, [det], sc.ts, obstacles=[[120.0, 150.0, 200.0, 365.0]])
+    assert out.get(1) == gid and len(sc.mgr.identities[gid].recent_embeddings) == n_before
+
+
 def test_real_aruco_marker_on_a_helmet_is_read_and_mapped_to_the_worker():
     import cv2
     import pytest

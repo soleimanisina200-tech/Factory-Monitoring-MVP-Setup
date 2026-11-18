@@ -76,16 +76,24 @@ class WorkerIdentity:
         diversity_cos_max: float = 0.90,
         crop_height_px: float = 0.0,
         anchor_min_height_px: float = 0.0,
+        seed_ok: bool = False,
     ) -> None:
         """
         Updates appearance memory ONLY after identity consistency has been verified.
         Anchors are permanent, so they additionally require a large enough crop.
+        `seed_ok`: the crop is gallery-quality; an identity with an EMPTY gallery may then be seeded even when the
+        worker is not isolated (otherwise someone who appears next to others never gets a gallery and can never
+        verify himself - see compute_similarity).
         """
         self.n_obs += 1
         self.recent_embeddings.append(embedding.copy())
 
-        # Only update permanent anchors and view gallery when worker is spatially isolated from others
+        # Only update permanent anchors and view gallery when worker is spatially isolated from others,
+        # except for seeding an empty gallery with one clean crop.
         if not is_isolated:
+            if not (seed_ok and not self.has_gallery()):
+                return
+            self.view_gallery.setdefault(view_bin, []).append(embedding.copy())
             return
 
         if (
@@ -114,6 +122,9 @@ class WorkerIdentity:
             updated = 0.70 * bank[0] + 0.30 * embedding
             bank[0] = updated / (np.linalg.norm(updated) + 1e-8)
 
+    def has_gallery(self) -> bool:
+        return bool(self.anchor_embeddings) or any(self.view_gallery.values())
+
     def compute_similarity(self, query_emb: np.ndarray, query_view: str) -> float:
         """
         Computes appearance similarity anchored by immutable prototypes so gallery drift cannot occur.
@@ -124,6 +135,11 @@ class WorkerIdentity:
 
         if not all_feats and not self.anchor_embeddings and not recent_list:
             return 0.0
+
+        if not all_feats and not self.anchor_embeddings:
+            # No gallery yet: the short-term samples are all there is. (The anti-drift cap below used to clamp the
+            # result to 0.9*0.08 = 0.072 here, so such an identity could never match itself.)
+            return max(float(np.dot(query_emb, r)) for r in recent_list)
 
         anchor_max = max((float(np.dot(query_emb, a)) for a in self.anchor_embeddings), default=0.0)
         global_max = max((float(np.dot(query_emb, f)) for f in all_feats), default=anchor_max)
@@ -787,7 +803,7 @@ class EnterpriseIdentityManager:
                     needs_margin = True
                 elif dt_gap > self.recover_strict_after_sec:
                     # long in-scene occlusion: same open-set rule as RECOVER_LONG
-                    req_sim = max(req_sim, self.reentry_threshold() - 0.06)
+                    req_sim = max(req_sim, self.reentry_threshold() - 0.12)
                     needs_margin = True
                 gal_sim = ident_old.compute_gallery_to_gallery_similarity(ident_new)
                 if gal_sim >= req_sim and gal_sim > best_merge_sim:
@@ -1004,9 +1020,24 @@ class EnterpriseIdentityManager:
             self._labeled.append((target, label))
         self._bind_track(tid, target, det, frame_ts, resolved, used, stage="MARKER")
 
+    @staticmethod
+    def _covered_by_obstacles(bbox: np.ndarray, obstacles: Sequence[Sequence[float]], min_frac: float = 0.25) -> bool:
+        """Is a large part of the person's box behind/inside a non-person obstacle (forklift)?"""
+        x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+        area = max(1.0, (x2 - x1) * (y2 - y1))
+        for o in obstacles:
+            iw = min(x2, o[2]) - max(x1, o[0])
+            ih = min(y2, o[3]) - max(y1, o[1])
+            if iw > 0 and ih > 0 and iw * ih / area >= min_frac:
+                return True
+        return False
+
     def process_frame(
-        self, frame: np.ndarray, detections: List[PoseDetection], frame_ts: float
+        self, frame: np.ndarray, detections: List[PoseDetection], frame_ts: float,
+        obstacles: Optional[Sequence[Sequence[float]]] = None,
     ) -> Dict[int, int]:
+        """`obstacles`: boxes of non-person occluders (forklifts). Crops of people largely covered by one are
+        treated like crops overlapping another person: never stored, never used to break a binding."""
         H_img, W_img = frame.shape[:2]
         if not detections:
             # Nobody visible: lifecycle must still advance (someone may have just left the camera).
@@ -1038,7 +1069,8 @@ class EnterpriseIdentityManager:
             if tid not in self.track_first_seen_ts:
                 self.track_first_seen_ts[tid] = frame_ts
 
-            det.is_intersecting = bool(contaminated_flags[i])
+            det.is_intersecting = bool(contaminated_flags[i]) or (
+                bool(obstacles) and self._covered_by_obstacles(det.bbox_xyxy, obstacles))
             det.apparent_height_px = self.bev.estimate_standing_height_px(
                 det.bbox_xyxy, det.keypoints_xy, det.keypoints_conf
             )
@@ -1123,9 +1155,19 @@ class EnterpriseIdentityManager:
                 if emb is not None and report is not None and report.is_valid_for_gallery:
                     self.track_best_emb[tid] = (emb, report.pose_view_bin, report.sharpness_score)
                     # CRITICAL FIX: Compute similarity BEFORE updating recent_embeddings or gallery!
+                    had_gallery = ident.has_gallery()
                     sim = ident.compute_similarity(emb, report.pose_view_bin)
 
-                    if sim >= self.spatial_recovery_sim_thresh:
+                    if not had_gallery:
+                        # Nothing to verify against yet: seed the gallery from this clean crop (no mismatch counting).
+                        ident.mismatch_streak = 0
+                        ident.add_clean_observation(
+                            emb, report.pose_view_bin, sharpness=report.sharpness_score,
+                            is_isolated=det.is_isolated, seed_ok=True,
+                            crop_height_px=float(det.bbox_xyxy[3] - det.bbox_xyxy[1]),
+                            anchor_min_height_px=self.anchor_min_height_px,
+                        )
+                    elif sim >= self.spatial_recovery_sim_thresh:
                         ident.mismatch_streak = 0
                         ident.add_clean_observation(
                             emb,
@@ -1333,7 +1375,8 @@ class EnterpriseIdentityManager:
                         if dt_lost > self.recover_strict_after_sec:
                             # After a long hide the newcomer may be someone else in the same uniform (mid-scene
                             # doors): the open-set threshold (slightly relaxed) and the margin test apply.
-                            required_sim = max(required_sim, self.reentry_threshold() - 0.06)
+                            # (relaxed: a worker coming out from behind a forklift is only partly visible)
+                            required_sim = max(required_sim, self.reentry_threshold() - 0.12)
                             stage = "RECOVER_LONG"
                         if app_sim >= required_sim:
                             spatial_score = max(0.0, 1.0 - (dist_m / max(max_dist_m, 1.0)))
@@ -1489,6 +1532,7 @@ class EnterpriseIdentityManager:
                         emb, view_bin, sharpness=sharpness_val, is_isolated=det.is_isolated and gallery_ok,
                         crop_height_px=float(det.bbox_xyxy[3] - det.bbox_xyxy[1]),
                         anchor_min_height_px=self.anchor_min_height_px,
+                        seed_ok=gallery_ok and not det.is_intersecting,
                     )
 
                     label = self.track_label.get(det.track_id)

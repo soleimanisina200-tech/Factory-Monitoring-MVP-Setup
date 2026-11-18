@@ -315,9 +315,9 @@ class FactoryMonitor:
         self._last_ts = ts
         active_tids = set(self.identity.track_to_global.keys())
         detections = self.detector.track_frame(frame, active_track_ids=active_tids)
-        t2g = self.identity.process_frame(frame, detections, ts)
-
         fsm = self.vehicles.fsm if self.vehicles is not None else None
+        obstacles = [r.bbox for r in fsm.vehicles.values() if r.is_visible_in_current_frame] if fsm else None
+        t2g = self.identity.process_frame(frame, detections, ts, obstacles=obstacles)
         # identity bookkeeping -> analytics state and event attribution
         for old, new in self.identity.pop_merged():
             self.zones.rename(old, new)
