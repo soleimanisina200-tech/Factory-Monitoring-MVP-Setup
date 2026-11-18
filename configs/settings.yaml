@@ -25,7 +25,8 @@ stream:
   recording_start_time: ""        # video FILES only: real start time of the clip, e.g. "2026-11-17 08:00:00"
 
 recording:
-  output_video_path: output_industrial_reid.mp4   # empty = no annotated video
+  output_video_path: auto         # auto = outputs/<video name>_annotated.mp4 (live: outputs/<camera>_live.mp4);
+                                  # or an explicit path; empty = no annotated video. --output overrides per run
   segment_minutes: 0              # 0 = one file (clips); e.g. 15 for a live camera (rotating files)
   max_segments: 96                # segments kept (15 min x 96 = 24 h)
 

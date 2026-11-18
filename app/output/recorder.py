@@ -20,6 +20,22 @@ import numpy as np
 logger = logging.getLogger("FactoryReID")
 
 
+def resolve_output_path(value, source, camera_id: str = "cam1") -> str:
+    """recording.output_video_path -> a real file path ('' = no video).
+
+    "auto": a processed video FILE is saved as outputs/<video name>_annotated.mp4, so every clip keeps its own result
+    (the old fixed name was overwritten by the next run); a live camera goes to outputs/<camera_id>_live.mp4.
+    """
+    value = "" if value is None else str(value).strip()
+    if value.lower() != "auto":
+        return value
+    src = str(source)
+    if src.isdigit() or "://" in src:
+        return str(Path("outputs") / f"{camera_id}_live.mp4")
+    stem = Path(src).stem or camera_id
+    return str(Path("outputs") / f"{stem}_annotated.mp4")
+
+
 class SegmentedVideoWriter:
     def __init__(self, output_path: str, fps: float, frame_wh: Tuple[int, int], segment_minutes: float = 0.0,
                  max_segments: int = 96, fourcc: str = "mp4v"):

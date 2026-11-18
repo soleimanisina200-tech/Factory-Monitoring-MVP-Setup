@@ -60,7 +60,7 @@ def camera_ids(path: str = DEFAULT_CAMERAS_PATH) -> List[str]:
 
 
 def _in_camera_folder(path: Optional[str], camera_id: str) -> Optional[str]:
-    if not path:
+    if not path or str(path).strip().lower() == "auto":   # "auto" is resolved later from the source / camera id
         return path
     p = Path(path)
     return str(p.parent / camera_id / p.name)

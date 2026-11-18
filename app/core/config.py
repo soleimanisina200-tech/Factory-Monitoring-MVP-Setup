@@ -44,7 +44,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "recording_start_time": "",
     },
     "recording": {
-        "output_video_path": "output_industrial_reid.mp4",
+        "output_video_path": "auto",   # auto = outputs/<video name>_annotated.mp4 | explicit path | "" = none
         "segment_minutes": 0.0,
         "max_segments": 96,
     },

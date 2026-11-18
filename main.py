@@ -41,7 +41,7 @@ from app.identity.open_set import OpenSetCalibrator
 from app.identity.reid_model import SKELETON_LIMBS, PoseGuidedOSNetExtractor
 from app.logic.calibration import DEFAULT_CALIBRATION_PATH, load_calibration
 from app.logic.geometry import MetricBEVProjector
-from app.output.recorder import SegmentedVideoWriter
+from app.output.recorder import SegmentedVideoWriter, resolve_output_path
 from app.service.web import TelemetryHub, start_web_service
 from app.streams.video_reader import VariableFPSVideoReader
 
@@ -272,9 +272,11 @@ class FactoryMonitor:
         # ---- outputs ------------------------------------------------------------------------------------------
         rec = cfg["recording"]
         self.recorder = None
-        if rec.get("output_video_path"):
-            self.recorder = SegmentedVideoWriter(rec["output_video_path"], self.reader.nominal_fps, (self.W, self.H),
+        out_path = resolve_output_path(rec.get("output_video_path"), cfg["stream"]["source"], self.camera_id)
+        if out_path:
+            self.recorder = SegmentedVideoWriter(out_path, self.reader.nominal_fps, (self.W, self.H),
                                                  rec.get("segment_minutes", 0.0), rec.get("max_segments", 96))
+            logger.info("Annotated video will be saved to %s", out_path)
         web = cfg["web"]
         self.hub = TelemetryHub(web.get("stream_max_fps", 10.0), web.get("stream_width", 1280),
                                 jpeg_enabled=bool(web.get("enabled")))
@@ -612,6 +614,8 @@ def resolve_run_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Option
         cfg["stream"]["source"] = args.source
     if args.no_gui:
         cfg["system"]["display_gui"] = False
+    if args.output:
+        cfg["recording"]["output_video_path"] = args.output
     for item in args.set or []:
         apply_override(cfg, item)
     return cfg, vehicle_config, calibration
@@ -663,6 +667,8 @@ def main() -> int:
     parser.add_argument("--vehicle-config", default="configs/vehicle_monitoring.yaml",
                         help="forklift module config (missing file or enabled:false = module off)")
     parser.add_argument("--source", default=None, help="video file / RTSP URL (overrides the settings)")
+    parser.add_argument("--output", default=None,
+                        help="where to save the annotated video (default: outputs/<video name>_annotated.mp4)")
     parser.add_argument("--calibration", default=DEFAULT_CALIBRATION_PATH)
     parser.add_argument("--cameras", default=None,
                         help="multi-camera list (configs/cameras.yaml); use with --camera-id")
