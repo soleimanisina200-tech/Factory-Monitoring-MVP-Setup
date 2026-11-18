@@ -552,7 +552,7 @@ python main.py --cameras configs/cameras.yaml --camera-id cam2      # فقط ی�
 | `logs/factory_monitor.log` | لاگ برنامه (چرخشی، ۲۰ مگابایت × ۱۰) |
 | `logs/heartbeat.json` | وضعیت سلامت، هر ۵ ثانیه |
 | `logs/identity_decisions.jsonl` | هر تصمیم هویتی (برای تنظیم؛ بخش ۱۸) |
-| `recording.output_video_path` | ویدیوی برچسب‌خورده (یک فایل، یا قطعه‌های N دقیقه‌ای) |
+| `outputs/<نام ویدیو>_annotated.mp4` | ویدیوی خروجی با برچسب‌ها؛ بعد از هر اجرا خودکار ذخیره می‌شود (`recording.output_video_path: auto`). مسیر دلخواه: `--output مسیر.mp4`؛ دوربین زنده: `outputs/<دوربین>_live.mp4` (یا قطعه‌های N دقیقه‌ای) |
 
 هر رویداد **دو زمان** دارد: `wall_time` (ساعت واقعی) و `stream_ts` (زمان داخل استریم). برای فایل ویدیو، ساعت واقعی = `stream.recording_start_time` + موقعیت در کلیپ؛ پس پردازش سریع‌تر یا کندتر از زمان واقعی، زمان رویدادها را خراب نمی‌کند.
 
