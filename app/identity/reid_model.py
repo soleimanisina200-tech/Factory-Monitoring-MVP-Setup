@@ -449,6 +449,18 @@ class PoseGuidedOSNetExtractor:
                 results[i] = self._compose(prep, feats[2 * k], feats[2 * k + 1])
         return results  # type: ignore[return-value]
 
+    def prepare_inputs(self, frame: np.ndarray, bbox_xyxy: np.ndarray, keypoints_xy: np.ndarray,
+                       keypoints_conf: np.ndarray, is_intersecting: bool = False):
+        """
+        The two RGB images (256x128) the backbone sees for this person - masked full body and upper body - plus
+        the quality report, or None for an unusable crop. Used to mine site data for fine-tuning
+        (scripts/mine_reid_data.py), so training sees exactly the production preprocessing.
+        """
+        prep = self._prepare_crop(frame, bbox_xyxy, keypoints_xy, keypoints_conf, is_intersecting)
+        if isinstance(prep, tuple):
+            return None
+        return prep["rgb_body"], prep["rgb_upper"], prep["report"]
+
     def _prepare_crop(
         self,
         frame: np.ndarray,

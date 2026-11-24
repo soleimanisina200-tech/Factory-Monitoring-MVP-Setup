@@ -34,6 +34,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import numpy as np
 
 from app.identity.open_set import OpenSetCalibrator
+from app.identity.stature import StatureEstimate, statures_conflict
 
 logger = logging.getLogger("FactoryReID")
 
@@ -63,6 +64,11 @@ CREATE TABLE IF NOT EXISTS tracklets (
 );
 CREATE INDEX IF NOT EXISTS idx_tracklets_updated ON tracklets(updated_wall);
 """
+# columns added later (older databases are migrated in place)
+_MIGRATIONS = {"stature": "REAL", "stature_se": "REAL", "entry_gate": "TEXT", "entry_wall": "REAL",
+               "exit_gate": "TEXT", "exit_wall": "REAL"}
+# heights of the same person in two cameras: each camera's model has its own error
+CROSS_CAMERA_STATURE_ERROR = 0.02
 
 
 def gallery_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -89,6 +95,39 @@ class CameraTopology:
             if t.get("bidirectional", True):
                 self.transitions.setdefault((b, a), rng)
         self.only_listed = bool(cfg.get("only_listed_transitions", False))
+        # Doors between cameras: (exit camera, exit gate, entry camera, entry gate, min_sec, max_sec)
+        self.doors: List[Tuple[str, str, str, str, float, float]] = []
+        for d in cfg.get("doors") or []:
+            a_cam, a_gate = self.parse_gate(d.get("from"), d.get("name", "?"))
+            b_cam, b_gate = self.parse_gate(d.get("to"), d.get("name", "?"))
+            lo, hi = float(d.get("min_sec", 0.0)), float(d.get("max_sec", 60.0))
+            if hi < lo:
+                raise ValueError(f"cross_camera door '{d.get('name')}': max_sec < min_sec")
+            self.doors.append((a_cam, a_gate, b_cam, b_gate, lo, hi))
+            if d.get("bidirectional", True):
+                self.doors.append((b_cam, b_gate, a_cam, a_gate, lo, hi))
+            # a door is also a camera-level connection (with only_listed_transitions)
+            for src, dst in ((a_cam, b_cam), (b_cam, a_cam)) if d.get("bidirectional", True) else ((a_cam, b_cam),):
+                old = self.transitions.get((src, dst))
+                self.transitions[(src, dst)] = (min(lo, old[0]), max(hi, old[1])) if old else (lo, hi)
+
+    @staticmethod
+    def parse_gate(spec: Any, door_name: str) -> Tuple[str, str]:
+        """{camera: cam1, region: hall_door} -> ("cam1", "door:hall_door"); {camera: cam1, edge: left} -> edge."""
+        if not isinstance(spec, dict) or not spec.get("camera"):
+            raise ValueError(f"cross_camera door '{door_name}': 'from'/'to' need a camera and a region or an edge")
+        if spec.get("region"):
+            return str(spec["camera"]), f"door:{spec['region']}"
+        if spec.get("edge") in ("left", "right", "top", "bottom"):
+            return str(spec["camera"]), f"edge:{spec['edge']}"
+        raise ValueError(f"cross_camera door '{door_name}': give `region: <exit door drawn in that camera>` or "
+                         "`edge: left|right|top|bottom`")
+
+    def doors_into(self, camera: str, gate: Optional[str]) -> List[Tuple[str, str, float, float]]:
+        """Where somebody appearing at (camera, gate) may come from: (exit camera, exit gate, min_sec, max_sec)."""
+        if not gate:
+            return []
+        return [(a, ag, lo, hi) for a, ag, b, bg, lo, hi in self.doors if b == camera and bg == gate]
 
     def overlap(self, a: str, b: str) -> bool:
         """True when the two cameras see a common area (a person may be visible in both at once)."""
@@ -114,6 +153,11 @@ class Tracklet:
     embs: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), np.float32))
     emb_version: float = 0.0
     link_method: Optional[str] = None
+    stature: Optional[StatureEstimate] = None
+    entry_gate: Optional[str] = None
+    entry_wall: Optional[float] = None
+    exit_gate: Optional[str] = None
+    exit_wall: Optional[float] = None
 
 
 def snapshot_from_manager(manager: Any, clock: Any, now_ts: float, max_embs: int = 16) -> List[Dict[str, Any]]:
@@ -125,9 +169,17 @@ def snapshot_from_manager(manager: Any, clock: Any, now_ts: float, max_embs: int
             feats = list(ident.recent_embeddings)
         if not feats:
             continue
+        est_fn = getattr(manager, "stature_estimate", None)
+        est = est_fn(gid) if est_fn is not None else None
+        exit_gate = ident.exit_gate() if hasattr(ident, "exit_gate") else None
         out.append({
             "local_id": int(gid),
             "label": ident.label,
+            "entry_gate": getattr(ident, "entry_gate", None),
+            "entry_wall": float(clock.wall(getattr(ident, "entry_ts", ident.created_ts) or ident.created_ts)),
+            "exit_gate": exit_gate,
+            "exit_wall": float(clock.wall(ident.last_seen_ts)) if exit_gate else None,
+            "stature": None if est is None else (float(est.ratio), float(est.se), int(est.n)),
             "embs": np.stack(feats[:max_embs]).astype(np.float32),
             "n_obs": int(ident.n_obs),
             "first_seen": float(clock.wall(ident.created_ts)),
@@ -153,7 +205,12 @@ class CrossCameraLinker:
         simultaneity_tolerance_sec: float = 1.0,
         open_set: Optional[OpenSetCalibrator] = None,
         background: bool = True,
+        stature_min_diff: float = 0.05,
+        door_min_sim: float = 0.50,
     ):
+        self.stature_min_diff = float(stature_min_diff)
+        # door handover: the appearance only has to "not contradict" (light differs a lot between hall and yard)
+        self.door_min_sim = float(door_min_sim)
         self.path = str(registry_path)
         self.camera_id = str(camera_id)
         self.topology = topology or CameraTopology()
@@ -238,6 +295,13 @@ class CrossCameraLinker:
             self._conn = sqlite3.connect(self.path, timeout=30.0, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(tracklets)").fetchall()}
+            for name, typ in _MIGRATIONS.items():
+                if name not in cols:
+                    try:
+                        self._conn.execute(f"ALTER TABLE tracklets ADD COLUMN {name} {typ}")
+                    except sqlite3.OperationalError:
+                        pass        # another camera process added it at the same moment
             self._conn.commit()
         return self._conn
 
@@ -293,6 +357,11 @@ class CrossCameraLinker:
                 conn.execute("UPDATE tracklets SET last_seen_wall=?, active=?, updated_wall=? "
                              "WHERE camera_id=? AND local_id=?",
                              (s["last_seen"], int(s["active"]), now_wall, self.camera_id, lid))
+            st = s.get("stature")
+            conn.execute("UPDATE tracklets SET stature=?, stature_se=?, entry_gate=?, entry_wall=?, exit_gate=?, "
+                         "exit_wall=? WHERE camera_id=? AND local_id=?",
+                         (None if st is None else st[0], None if st is None else st[1], s.get("entry_gate"),
+                          s.get("entry_wall"), s.get("exit_gate"), s.get("exit_wall"), self.camera_id, lid))
         for lid in [lid for lid in self._sent if lid not in mine]:   # purged locally
             conn.execute("UPDATE tracklets SET active=0 WHERE camera_id=? AND local_id=?", (self.camera_id, lid))
             del self._sent[lid]
@@ -345,10 +414,11 @@ class CrossCameraLinker:
     def _refresh_cache(self, conn: sqlite3.Connection, now_wall: float) -> None:
         rows = conn.execute(
             "SELECT camera_id, local_id, person_id, label, first_seen_wall, last_seen_wall, active, n_obs, dim, "
-            "emb_updated_wall, link_method FROM tracklets WHERE last_seen_wall >= ?",
+            "emb_updated_wall, link_method, stature, stature_se, entry_gate, entry_wall, exit_gate, exit_wall "
+            "FROM tracklets WHERE last_seen_wall >= ?",
             (now_wall - self.retention_sec,)).fetchall()
         alive = set()
-        for cam, lid, pid, label, fs, ls, active, n, dim, ev, method in rows:
+        for cam, lid, pid, label, fs, ls, active, n, dim, ev, method, st, st_se, eg, ew, xg, xw in rows:
             key = (cam, int(lid))
             alive.add(key)
             t = self._cache.get(key)
@@ -356,6 +426,8 @@ class CrossCameraLinker:
                 t = self._cache[key] = Tracklet(cam, int(lid))
             t.person_id, t.label, t.first_seen, t.last_seen = pid, label, fs, ls
             t.active, t.n_obs, t.link_method = bool(active), int(n or 0), method
+            t.stature = None if st is None else StatureEstimate(float(st), float(st_se or 0.01), 0)
+            t.entry_gate, t.entry_wall, t.exit_gate, t.exit_wall = eg, ew, xg, xw
             if ev is not None and ev > t.emb_version:
                 blob = conn.execute("SELECT emb FROM tracklets WHERE camera_id=? AND local_id=?", key).fetchone()
                 if blob and blob[0]:
@@ -403,6 +475,10 @@ class CrossCameraLinker:
             labels = {o.label for o in trs if o.label}
             if t.label and labels and t.label not in labels:
                 continue                      # different helmet marker
+            if t.stature is not None and any(
+                    statures_conflict(t.stature, o.stature, self.stature_min_diff, model_error=CROSS_CAMERA_STATURE_ERROR)
+                    for o in trs if o.stature is not None):
+                continue                      # clearly different height: a different person, whatever the uniform
             remote = [o for o in trs if o.camera_id != t.camera_id]
             if not remote:
                 continue                      # only seen in MY camera: re-entries are the local manager's job
@@ -421,6 +497,50 @@ class CrossCameraLinker:
                 continue
             out[pid] = trs
         return out
+
+    def _exit_taken(self, exit_tr: Tracklet, t: Tracklet) -> bool:
+        """The person who used that exit has already shown up again somewhere else (any camera)."""
+        for o in self._cache.values():
+            if o is t or o is exit_tr or o.person_id != exit_tr.person_id:
+                continue
+            if o.first_seen >= exit_tr.exit_wall - self.tol or (o.camera_id == exit_tr.camera_id and o.active):
+                return True
+        return False
+
+    def _door_handover(self, t: Tracklet) -> Optional[Tuple[int, float, int]]:
+        """
+        (person, appearance similarity, number of candidates) when `t` appeared at a door that is connected to a door
+        of another camera and the person who walked out of it can be named; None otherwise.
+        Timing and place carry the decision, appearance only has to agree (light differs between cameras):
+          * one person used the connected door in the time window -> that person, unless the look contradicts
+          * several -> appearance must pick one with a clear margin, otherwise no decision here
+        """
+        sources = self.topology.doors_into(t.camera_id, t.entry_gate)
+        if not sources or t.entry_wall is None:
+            return None
+        allowed = self._candidates(t)            # physics, markers, height, camera-level transit
+        exits: Dict[int, Tracklet] = {}
+        for o in self._cache.values():
+            if o.person_id is None or o.exit_gate is None or o.exit_wall is None or o.person_id not in allowed:
+                continue
+            for cam, gate, lo, hi in sources:
+                gap = t.entry_wall - o.exit_wall
+                if o.camera_id == cam and o.exit_gate == gate and lo - self.tol <= gap <= hi + self.tol:
+                    if not self._exit_taken(o, t):
+                        prev = exits.get(o.person_id)
+                        if prev is None or o.exit_wall > prev.exit_wall:
+                            exits[o.person_id] = o
+        if not exits:
+            return None
+        sims = sorted(
+            ((gallery_similarity(t.embs, o.embs) if o.embs.size and o.embs.shape[1] == t.embs.shape[1] else 0.0, pid)
+             for pid, o in exits.items()), reverse=True)
+        best, pid = sims[0]
+        if best < self.door_min_sim:
+            return None                          # the look contradicts (e.g. a visitor without uniform)
+        if len(sims) > 1 and best - sims[1][0] < self.margin:
+            return None                          # several came through and they look alike: no guess
+        return pid, best, len(sims)
 
     def _link_one(self, conn: sqlite3.Connection, t: Tracklet, snap: Dict[str, Any], now_wall: float) -> None:
         young_new = t.link_method == "NEW" and now_wall - t.first_seen <= self.late_merge_sec
@@ -443,7 +563,17 @@ class CrossCameraLinker:
             return
         if t.n_obs < self.min_obs or not t.embs.size:
             return
-        # 2./3. physics + appearance
+        # 2. door handover: who walked out of the connected door of the other camera a moment ago
+        door = self._door_handover(t)
+        if door is not None and not (young_new and door[0] == t.person_id):
+            pid, sim, n_cand = door
+            if young_new and t.person_id is not None:
+                pid = self._merge_persons(conn, pid, t.person_id)
+            self._set_link(conn, t, pid, "DOOR", sim)
+            logger.info("Cross-camera: %s local ID %d -> person P%d through door %s (sim %.3f, %d candidate(s))",
+                        self.camera_id, t.local_id, pid, t.entry_gate, sim, n_cand)
+            return
+        # 3./4. physics + appearance
         scores = []
         for pid, trs in self._candidates(t).items():
             if young_new and pid == t.person_id:

@@ -96,6 +96,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
             "max_threshold": 0.95,
             "sample_interval_sec": 1.0,
         },
+        "stature": {                          # relative body height: clearly different = different people
+            "enabled": True,
+            "min_diff": 0.05,                 # relative difference that can separate two people (~8-9 cm)
+            "min_samples": 8,                 # upright full-body measurements before a height is used
+            "model_min_samples": 150,         # measurements before the camera's height model is trusted
+            "sample_interval_sec": 0.25,
+        },
         "persistence": {
             "mode": "auto",            # auto = on for live cameras, off for video files
             "dir": "data/identity_store",
@@ -181,7 +188,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "decide_after_sec": 20.0,
         "late_merge_sec": 120.0,
         "retention_sec": 43200.0,
-        "topology": {"overlaps": [], "transitions": [], "only_listed_transitions": False},
+        "door_min_sim": 0.50,          # door handover: appearance must only not contradict (light differs)
+        "topology": {"overlaps": [], "transitions": [], "doors": [], "only_listed_transitions": False},
     },
     # legacy section (old draw_line.py output); read by app/core/scene.py
     "directional_tracking": {},

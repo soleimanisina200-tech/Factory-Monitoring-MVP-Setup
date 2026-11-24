@@ -26,6 +26,7 @@ import numpy as np
 
 from app.core.clock import StreamClock
 from app.identity.manager import STATUS_EXITED, EnterpriseIdentityManager, WorkerIdentity
+from app.identity.stature import StatureSamples
 
 logger = logging.getLogger("FactoryReID")
 
@@ -60,6 +61,7 @@ class IdentityStore:
                 "last_bev_xy": [float(v) for v in np.asarray(ident.last_bev_xy).ravel()[:2]],
                 "last_height_px": float(ident.last_height_px),
                 "last_bbox_xyxy": [float(v) for v in np.asarray(ident.last_bbox_xyxy).ravel()[:4]],
+                "stature": ident.stature.to_list(),
             })
             if ident.anchor_embeddings:
                 arrays[f"g{gid}_anchor"] = np.stack(ident.anchor_embeddings).astype(np.float32)
@@ -75,6 +77,7 @@ class IdentityStore:
             "next_global_id": int(mgr._next_global_id),
             "identities": idents,
             "open_set": mgr.open_set.state(),
+            "stature_model": mgr.stature_model.state(),
         }
         tmp_npz = self.dir / "galleries.tmp.npz"
         np.savez_compressed(tmp_npz, **arrays)
@@ -122,6 +125,7 @@ class IdentityStore:
                 label=rec.get("label"),
             )
             ident.n_obs = int(rec.get("n_obs", 0))
+            ident.stature = StatureSamples.from_list(rec.get("stature"))
             if f"g{gid}_anchor" in arrays:
                 ident.anchor_embeddings = [a.copy() for a in arrays[f"g{gid}_anchor"]]
             for vb in list(ident.view_gallery):
@@ -143,5 +147,6 @@ class IdentityStore:
         )
         if same_model:
             mgr.open_set.load_state(meta.get("open_set"))
+        mgr.stature_model.load_state(meta.get("stature_model"))   # geometry of this camera: model-independent
         logger.info("Identity store: %d identities restored, next ID %d", loaded, mgr._next_global_id)
         return loaded

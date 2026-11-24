@@ -14,6 +14,13 @@ from scipy.optimize import linear_sum_assignment
 from app.detection.detector import PoseDetection
 from app.identity.open_set import OpenSetCalibrator
 from app.identity.reid_model import CropQualityReport, PoseGuidedOSNetExtractor
+from app.identity.stature import (
+    StatureEstimate,
+    StatureModel,
+    StatureSamples,
+    measure_upright_height,
+    statures_conflict,
+)
 from app.logic.geometry import (
     MetricBEVProjector,
     compute_intersection_contamination,
@@ -64,6 +71,22 @@ class WorkerIdentity:
     exit_edge: str = ""    # border edge, or exit-region (door) name
     # Hard identity from a helmet marker (app/identity/markers.py): never matched/merged with another label.
     label: Optional[str] = None
+    # Upright height measurements (app/identity/stature.py): clearly different heights = different people.
+    stature: StatureSamples = field(default_factory=StatureSamples)
+    # Where this identity first appeared ("door:<region>" / "edge:<side>" / None = mid-scene) - used to hand a person
+    # over between cameras through a known door (app/multicam/registry.py)
+    entry_gate: Optional[str] = None
+    entry_ts: float = 0.0
+
+    def exit_gate(self) -> Optional[str]:
+        """How this identity LEFT the camera ("door:<region>" / "edge:<side>"), None while it is still here."""
+        if self.status != STATUS_EXITED:
+            return None
+        if self.exit_reason == "DOOR":
+            return f"door:{self.exit_edge}"
+        if self.exit_reason == "BORDER":
+            return f"edge:{self.exit_edge}"
+        return None
 
     def add_clean_observation(
         self,
@@ -224,6 +247,11 @@ class EnterpriseIdentityManager:
         marker_read_interval_sec: float = 0.5,
         marker_min_votes: int = 2,
         marker_vote_window_sec: float = 4.0,
+        stature_enabled: bool = True,
+        stature_min_diff: float = 0.05,
+        stature_min_samples: int = 8,
+        stature_model_min_samples: int = 150,
+        stature_sample_interval_sec: float = 0.25,
     ):
         self.reid = reid_extractor
         self.bev = bev_projector
@@ -291,7 +319,23 @@ class EnterpriseIdentityManager:
         self.track_last_marker_ts: Dict[int, float] = {}
         self.track_label: Dict[int, str] = {}
         self._labeled: List[Tuple[int, str]] = []
+        # Relative body height (uniform-independent soft biometric, used as a veto only)
+        self.stature_enabled = bool(stature_enabled)
+        self.stature_min_diff = float(stature_min_diff)
+        self.stature_min_samples = int(stature_min_samples)
+        self.stature_sample_interval_sec = float(stature_sample_interval_sec)
+        self.stature_model = StatureModel(min_samples=int(stature_model_min_samples))
+        self.track_stature: Dict[int, StatureSamples] = {}
+        self.track_last_stature_ts: Dict[int, float] = {}
+        self._stature_given: Dict[int, int] = {}          # track id -> identity that received its samples
+        self._stature_cache: Dict[Tuple[str, int], Optional[StatureEstimate]] = {}
+        self._stature_vetoes: Set[Tuple[int, int]] = set()
+        # Recovered bindings (after an occlusion / re-entry) stay provisional until the newcomer's height is known:
+        # track id -> (identity, binding time, identity state before the binding)
+        self._stature_pending: Dict[int, Tuple[int, float, Dict[str, Any]]] = {}
+        self.stature_confirm_max_sec = 10.0
 
+        self.track_birth_gate: Dict[int, Optional[str]] = {}
         self.track_last_seen_ts: Dict[int, float] = {}
         # tid -> deque of (embedding, weight, view_bin, gallery_valid, ts, sharpness)
         self.track_emb_buffer: Dict[int, Deque[Tuple[np.ndarray, float, str, bool, float, float]]] = {}
@@ -400,6 +444,18 @@ class EnterpriseIdentityManager:
                 return name
         return None
 
+    def _gate_of(self, det: PoseDetection, frame_w: int, frame_h: int) -> Optional[str]:
+        """Where a track appears: a door region, an image edge, or None (inside the scene)."""
+        door = self._in_exit_region(det.ground_uv) if self.exit_regions else None
+        if door is not None:
+            return f"door:{door}"
+        x1, y1, x2, y2 = (float(v) for v in det.bbox_xyxy[:4])
+        mx, my = frame_w * self.border_margin_ratio, frame_h * self.border_margin_ratio
+        gaps = {"left": x1 / max(mx, 1.0), "right": (frame_w - x2) / max(mx, 1.0),
+                "top": y1 / max(my, 1.0), "bottom": (frame_h - y2) / max(my, 1.0)}
+        side = min(gaps, key=gaps.get)
+        return f"edge:{side}" if gaps[side] <= 1.0 else None
+
     @staticmethod
     def _labels_conflict(a: Optional[str], b: Optional[str]) -> bool:
         return a is not None and b is not None and a != b
@@ -424,6 +480,11 @@ class EnterpriseIdentityManager:
             self.track_last_marker_ts.pop(tid, None)
             self.track_label.pop(tid, None)
             self._deferred_tracks.discard(tid)
+            self.track_stature.pop(tid, None)
+            self.track_last_stature_ts.pop(tid, None)
+            self._stature_given.pop(tid, None)
+            self._stature_pending.pop(tid, None)
+            self.track_birth_gate.pop(tid, None)
             if forget_last_seen:
                 self.track_last_seen_ts.pop(tid, None)
         self.track_separated_coexisted_tracks = {
@@ -656,7 +717,7 @@ class EnterpriseIdentityManager:
         in_door = self._in_exit_region(det.ground_uv) if self.exit_regions else None
         best = 0.0
         for gid, other in self.identities.items():
-            if gid == exclude_gid or gid in used:
+            if gid == exclude_gid or gid in used or self._stature_conflict_track(det.track_id, other):
                 continue
             if other.status == STATUS_EXITED:
                 if other.exit_reason in ("BORDER", "DOOR") and not (near_border or in_door):
@@ -676,9 +737,117 @@ class EnterpriseIdentityManager:
                 continue
             if self._are_tracks_verified_distinct(det.track_id, ident.last_track_id, min_sep_frames=2):
                 continue
+            if self._stature_conflict_track(det.track_id, ident):
+                continue
             if self._is_spatially_continuous_with_identity(ident, det, frame_ts)[0]:
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # Relative body height (soft biometric, veto only)
+    # ------------------------------------------------------------------
+    def _measure_statures(self, detections: List[PoseDetection], frame_ts: float, frame_w: int, frame_h: int) -> Dict[int, Tuple[float, float, float]]:
+        """Upright heights measured in this frame (track id -> (u, v, h)); also teaches the camera's height model."""
+        out: Dict[int, Tuple[float, float, float]] = {}
+        if not self.stature_enabled:
+            return out
+        for det in detections:
+            tid = det.track_id
+            if det.is_intersecting or frame_ts - self.track_last_stature_ts.get(tid, -1e18) < self.stature_sample_interval_sec:
+                continue
+            m = measure_upright_height(det.bbox_xyxy, det.keypoints_xy, det.keypoints_conf, frame_w, frame_h)
+            if m is None:
+                continue
+            self.track_last_stature_ts[tid] = frame_ts
+            self.stature_model.add(m[0], m[1], m[2], tid)
+            self.track_stature.setdefault(tid, StatureSamples()).add(*m)
+            out[tid] = m
+        return out
+
+    _KINEMATIC_FIELDS = ("status", "exit_ts", "exit_reason", "exit_edge", "last_seen_ts", "last_bev_xy",
+                         "last_ground_uv", "last_height_px", "last_bbox_xyxy", "last_track_id", "bev_velocity",
+                         "px_velocity")
+
+    def _snapshot_identity(self, ident: WorkerIdentity) -> Dict[str, Any]:
+        return {k: (getattr(ident, k).copy() if isinstance(getattr(ident, k), np.ndarray) else getattr(ident, k))
+                for k in self._KINEMATIC_FIELDS}
+
+    def _mark_stature_pending(self, tid: int, gid: int, snapshot: Dict[str, Any], frame_ts: float) -> None:
+        """A recovered binding is provisional while the identity has a known height and the track does not yet."""
+        if self.stature_enabled and self.stature_estimate(gid) is not None:
+            self._stature_pending[tid] = (gid, frame_ts, snapshot)
+
+    def _confirm_pending_statures(self, frame_ts: float, resolved: Dict[int, int], used: Set[int]) -> None:
+        for tid, (gid, t0, snap) in list(self._stature_pending.items()):
+            if resolved.get(tid) != gid or gid not in self.identities:
+                self._stature_pending.pop(tid, None)
+                continue
+            ident = self.identities[gid]
+            t_est, g_est = self._track_stature_estimate(tid), self.stature_estimate(gid)
+            if t_est is None or g_est is None:
+                if frame_ts - t0 > self.stature_confirm_max_sec:
+                    self._stature_pending.pop(tid, None)      # never measurable: appearance decision stands
+                continue
+            self._stature_pending.pop(tid, None)
+            if not statures_conflict(t_est, g_est, self.stature_min_diff):
+                continue                                       # confirmed
+            # Same uniform, same place, but a clearly different height: somebody else came out. Undo the binding.
+            for k, v in snap.items():
+                setattr(ident, k, v)
+            ident.mismatch_streak = 0
+            del self.track_to_global[tid]
+            resolved.pop(tid, None)
+            used.discard(gid)
+            self._stature_vetoes.add((tid, gid))
+            self._log_decision("BINDING_BROKEN", frame_ts, tid=tid, gid=gid, reason="STATURE",
+                               track_ratio=t_est.ratio, ident_ratio=g_est.ratio)
+
+    def _give_statures(self, measured: Dict[int, Tuple[float, float, float]], detections: List[PoseDetection],
+                       resolved: Dict[int, int]) -> None:
+        """Height samples of a track belong to the identity it is (still) bound to."""
+        if not self.stature_enabled:
+            return
+        for det in detections:
+            tid = det.track_id
+            if tid in self._stature_pending:
+                continue            # provisional binding: its samples must not decide their own confirmation
+            gid = resolved.get(tid)
+            ident = self.identities.get(gid) if gid is not None else None
+            if ident is None or ident.mismatch_streak > 0:
+                continue
+            if self._stature_given.get(tid) != gid:
+                # first frame of this binding: the whole track history is the same person
+                if tid in self.track_stature:
+                    ident.stature.extend(self.track_stature[tid])
+                self._stature_given[tid] = gid
+            elif tid in measured:
+                ident.stature.add(*measured[tid])
+
+    def stature_estimate(self, gid: int) -> Optional[StatureEstimate]:
+        key = ("g", int(gid))
+        if key not in self._stature_cache:
+            ident = self.identities.get(int(gid))
+            self._stature_cache[key] = (
+                None if ident is None or not self.stature_enabled
+                else ident.stature.estimate(self.stature_model, self.stature_min_samples))
+        return self._stature_cache[key]
+
+    def _track_stature_estimate(self, tid: int) -> Optional[StatureEstimate]:
+        key = ("t", int(tid))
+        if key not in self._stature_cache:
+            s = self.track_stature.get(tid)
+            self._stature_cache[key] = (
+                None if s is None or not self.stature_enabled
+                else s.estimate(self.stature_model, self.stature_min_samples))
+        return self._stature_cache[key]
+
+    def _stature_conflict_track(self, tid: int, ident: WorkerIdentity) -> bool:
+        return statures_conflict(self._track_stature_estimate(tid), self.stature_estimate(ident.global_id),
+                                 self.stature_min_diff)
+
+    def _stature_conflict_idents(self, a: WorkerIdentity, b: WorkerIdentity) -> bool:
+        return statures_conflict(self.stature_estimate(a.global_id), self.stature_estimate(b.global_id),
+                                 self.stature_min_diff)
 
     def _update_identity_kinematics(self, ident: WorkerIdentity, det: PoseDetection, frame_ts: float) -> None:
         dt = max(1e-3, frame_ts - ident.last_seen_ts)
@@ -816,6 +985,11 @@ class EnterpriseIdentityManager:
                 # Two different helmet markers = two different people, whatever the appearance says.
                 if self._labels_conflict(ident_old.label, ident_new.label):
                     continue
+                if self._stature_conflict_idents(ident_old, ident_new):
+                    continue
+                if (self.stature_enabled and self.stature_estimate(gid_old) is not None
+                        and self.stature_estimate(gid_new) is None and frame_ts - ident_new.created_ts < 6.0):
+                    continue        # wait a few seconds for the new person's height before merging
                 # Cannot merge if they ever co-existed as two separate people!
                 if (
                     gid_old in ident_new.verified_coexisted_gids
@@ -904,6 +1078,11 @@ class EnterpriseIdentityManager:
         for a in ident_new.anchor_embeddings:
             if len(ident_old.anchor_embeddings) < 3:
                 ident_old.anchor_embeddings.append(a.copy())
+        ident_old.stature.extend(ident_new.stature)
+        for t, g in list(self._stature_given.items()):
+            if g == gid_src:
+                self._stature_given[t] = gid_dst
+        self._stature_cache.clear()
         ident_old.verified_coexisted_gids.update(ident_new.verified_coexisted_gids - {gid_dst})
         ident_old.coexisted_track_ids.update(ident_new.coexisted_track_ids)
         ident_old.last_seen_ts = ident_new.last_seen_ts
@@ -1008,6 +1187,8 @@ class EnterpriseIdentityManager:
             last_height_px=det.apparent_height_px,
             last_bbox_xyxy=det.bbox_xyxy.copy(),
             label=label,
+            entry_gate=self.track_birth_gate.get(det.track_id),
+            entry_ts=self.track_first_seen_ts.get(det.track_id, frame_ts),
         )
         emb, view, _, sharp = self._track_pooled_embedding(det.track_id, frame_ts, valid_only=True)
         if emb is not None:
@@ -1095,6 +1276,7 @@ class EnterpriseIdentityManager:
         """`obstacles`: boxes of non-person occluders (forklifts). Crops of people largely covered by one are
         treated like crops overlapping another person: never stored, never used to break a binding."""
         H_img, W_img = frame.shape[:2]
+        self._stature_cache.clear()
         if not detections:
             # Nobody visible: lifecycle must still advance (someone may have just left the camera).
             self._update_lifecycle(set(), frame_ts, W_img, H_img)
@@ -1136,6 +1318,8 @@ class EnterpriseIdentityManager:
             det.ground_uv = (u_g, v_g)
             det.ground_extrapolated = bool(extrapolated)
             det.bev_xy = self.bev.to_bev_meters(u_g, v_g)
+            if tid not in self.track_birth_gate:
+                self.track_birth_gate[tid] = self._gate_of(det, W_img, H_img)
 
         # Determine spatial isolation & record pairwise track separation co-existence
         for i, det_a in enumerate(detections):
@@ -1158,6 +1342,8 @@ class EnterpriseIdentityManager:
                     )
 
             det_a.is_isolated = (not det_a.is_intersecting) and (min_peer_dist > 1.35)
+
+        measured_statures = self._measure_statures(detections, frame_ts, W_img, H_img)
 
         used_global_ids: Set[int] = set()
         resolved_assignments: Dict[int, int] = {}
@@ -1223,6 +1409,8 @@ class EnterpriseIdentityManager:
                             crop_height_px=float(det.bbox_xyxy[3] - det.bbox_xyxy[1]),
                             anchor_min_height_px=self.anchor_min_height_px,
                         )
+                    elif sim >= self.spatial_recovery_sim_thresh and tid in self._stature_pending:
+                        ident.mismatch_streak = 0     # provisional (height not confirmed yet): do not learn
                     elif sim >= self.spatial_recovery_sim_thresh:
                         ident.mismatch_streak = 0
                         ident.add_clean_observation(
@@ -1368,6 +1556,16 @@ class EnterpriseIdentityManager:
                         ):
                             continue
 
+                        # HARD VETO 1b: clearly different body height (independent of the uniform)
+                        if self._stature_conflict_track(det.track_id, ident):
+                            if (det.track_id, gid) not in self._stature_vetoes:
+                                self._stature_vetoes.add((det.track_id, gid))
+                                t_est = self._track_stature_estimate(det.track_id)
+                                g_est = self.stature_estimate(gid)
+                                self._log_decision("STATURE_VETO", frame_ts, tid=det.track_id, gid=gid,
+                                                   track_ratio=t_est.ratio, ident_ratio=g_est.ratio)
+                            continue
+
                         # HARD VETO 2: Temporal Overlap
                         # If `det` started being tracked > 0.6s BEFORE `ident` disappeared, they were visible together!
                         dt_lost = frame_ts - ident.last_seen_ts
@@ -1497,6 +1695,7 @@ class EnterpriseIdentityManager:
                                 )
                                 continue
 
+                        snapshot = self._snapshot_identity(ident)
                         self._log_decision(
                             "MATCHED", frame_ts, tid=det.track_id, gid=gid, stage=stage,
                             sim=float(sim_matrix[r, c]), dt_lost=frame_ts - ident.last_seen_ts,
@@ -1515,7 +1714,11 @@ class EnterpriseIdentityManager:
 
                         ident.mismatch_streak = 0
                         self._update_identity_kinematics(ident, det, frame_ts)
-                        if emb is not None and rep is not None and rep.is_valid_for_gallery:
+                        if stage != "STITCH":
+                            # after a real gap the newcomer could be a lookalike: confirm by height when possible
+                            self._mark_stature_pending(det.track_id, gid, snapshot, frame_ts)
+                        if (emb is not None and rep is not None and rep.is_valid_for_gallery
+                                and det.track_id not in self._stature_pending):
                             ident.add_clean_observation(
                                 emb,
                                 rep.pose_view_bin,
@@ -1588,6 +1791,8 @@ class EnterpriseIdentityManager:
                         last_ground_uv=det.ground_uv,
                         last_height_px=det.apparent_height_px,
                         last_bbox_xyxy=det.bbox_xyxy.copy(),
+                        entry_gate=self.track_birth_gate.get(det.track_id),
+                        entry_ts=self.track_first_seen_ts.get(det.track_id, frame_ts),
                     )
                     # A poor crop may seed the short-term memory, but never the gallery or the anchors.
                     new_ident.add_clean_observation(
@@ -1643,6 +1848,12 @@ class EnterpriseIdentityManager:
                     if cnt >= 5:
                         ident_a.verified_coexisted_gids.add(gid_b)
                         ident_b.verified_coexisted_gids.add(gid_a)
+
+        # Height: confirm / undo provisional recoveries, then samples go to the identity of their track (before the
+        # merger, which compares heights too)
+        self._confirm_pending_statures(frame_ts, resolved_assignments, used_global_ids)
+        self._give_statures(measured_statures, detections, resolved_assignments)
+        self._stature_cache.clear()
 
         # Consolidate any fragmented temporary IDs back into their original lost Global IDs
         self._consolidate_fragmented_identities(resolved_assignments, used_global_ids, frame_ts)

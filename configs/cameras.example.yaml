@@ -18,10 +18,22 @@ cross_camera:                                  # same worker = same person id (P
   decide_after_sec: 20                         # no confident match after this long -> new person
   late_merge_sec: 120                          # a new person can still be merged into a known one this long
   retention_sec: 43200
+  door_min_sim: 0.50                           # door handover: the look must only NOT contradict (light differs)
   topology:
     overlaps: []                               # camera pairs that see a common area, e.g. [[cam1, cam2]]
     transitions: []                            # walking times, e.g. [{from: cam1, to: cam2, min_sec: 5, max_sec: 900}]
     only_listed_transitions: false             # true: only the listed camera pairs are connected
+    # Doors between cameras (strongest cross-camera rule after helmet markers). Whoever walks out of `from` and
+    # appears at `to` within [min_sec, max_sec] is the same person when he is the only one who used the door in that
+    # window (appearance only has to agree); several people -> appearance must pick one clearly, otherwise no guess.
+    # region = an exit door drawn in THAT camera's scene (scripts/draw_zone.py, type exit_door); or edge: left|right|top|bottom
+    doors: []
+    #  - name: hall_main_door
+    #    from: {camera: cam1, region: hall_door}      # cam1 = inside the hall
+    #    to:   {camera: cam2, region: yard_entrance}  # cam2 = yard; where people first appear after that door
+    #    min_sec: 2
+    #    max_sec: 15
+    #    bidirectional: true                         # yard -> hall through the same door too
 
 cameras:
   cam1:

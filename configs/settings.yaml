@@ -79,6 +79,12 @@ reid:
     min_samples: 60
     max_threshold: 0.95
     sample_interval_sec: 1.0
+  stature:                        # relative body height (learned per camera, no calibration): clearly different
+    enabled: true                 # height = different people, whatever the uniform. Similar height proves nothing.
+    min_diff: 0.05                # relative difference needed (~8-9 cm)
+    min_samples: 8                # upright full-body measurements before a person's height is used
+    model_min_samples: 150        # measurements before the camera's height model is trusted
+    sample_interval_sec: 0.25
   persistence:                    # identities survive restarts (IDs do not restart at 1)
     mode: auto                    # auto = live cameras only | on | off
     dir: data/identity_store

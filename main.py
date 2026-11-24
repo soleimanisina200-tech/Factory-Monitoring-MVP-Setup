@@ -167,6 +167,7 @@ class FactoryMonitor:
             logger.info("Helmet markers enabled: %d registered workers", len(self.registry.by_marker))
 
         osc = reid_cfg["open_set"]
+        st = reid_cfg["stature"]
         self.identity = EnterpriseIdentityManager(
             reid_extractor=self.reid, bev_projector=self.projector,
             cos_sim_thresh=reid_cfg["cos_sim_thresh"],
@@ -197,6 +198,9 @@ class FactoryMonitor:
             marker_reader=marker_reader,
             marker_read_interval_sec=mk.get("read_interval_sec", 0.5),
             marker_min_votes=mk.get("min_votes", 2), marker_vote_window_sec=mk.get("vote_window_sec", 4.0),
+            stature_enabled=st["enabled"], stature_min_diff=st["min_diff"], stature_min_samples=st["min_samples"],
+            stature_model_min_samples=st["model_min_samples"],
+            stature_sample_interval_sec=st["sample_interval_sec"],
         )
 
         # identity persistence (auto = only for live cameras: re-running a clip must not "remember" it)
@@ -227,8 +231,16 @@ class FactoryMonitor:
                 link_threshold=cc["link_threshold"], margin=cc["margin"], min_obs=cc["min_obs"],
                 decide_after_sec=cc["decide_after_sec"], late_merge_sec=cc["late_merge_sec"],
                 retention_sec=cc["retention_sec"], sync_interval_sec=cc["sync_interval_sec"],
+                stature_min_diff=st["min_diff"], door_min_sim=cc["door_min_sim"],
             )
             logger.info("Cross-camera identity enabled (registry %s)", cc["registry_path"])
+            for a_cam, a_gate, b_cam, b_gate, _, _ in self.linker.topology.doors:
+                for cam, gate in ((a_cam, a_gate), (b_cam, b_gate)):
+                    if cam == self.camera_id and gate.startswith("door:") \
+                            and gate[5:] not in self.scene.exit_regions:
+                        logger.warning("Cross-camera door: region '%s' is not an exit door of camera %s (draw it "
+                                       "with scripts/draw_zone.py as a door) - this door handover cannot work",
+                                       gate[5:], cam)
             if not self.reader.is_live and not stream_cfg.get("recording_start_time"):
                 logger.warning("Cross-camera identity with video FILES needs stream.recording_start_time for every "
                                "camera, otherwise the clips are not aligned in time.")

@@ -61,28 +61,51 @@ def make_manager(reid, **over):
     return EnterpriseIdentityManager(reid_extractor=reid, bev_projector=MetricBEVProjector(), **kw)
 
 
+FOOT_V = 756.0
+
+
+def upright_pose(x1, height_px):
+    """Box + COCO keypoints of a person standing upright, ankles at FOOT_V, `height_px` from ankle to box top."""
+    top = FOOT_V - height_px
+    cx, h = x1 + BOX_W / 2.0, height_px
+    k = np.zeros((17, 2), np.float32)
+    rows = {0: (0, 0.07), 1: (-4, 0.06), 2: (4, 0.06), 3: (-8, 0.07), 4: (8, 0.07), 5: (-14, 0.19), 6: (14, 0.19),
+            7: (-16, 0.35), 8: (16, 0.35), 9: (-16, 0.48), 10: (16, 0.48), 11: (-9, 0.53), 12: (9, 0.53),
+            13: (-9, 0.76), 14: (9, 0.76), 15: (-9, 1.0), 16: (9, 1.0)}
+    for i, (dx, fy) in rows.items():
+        k[i] = (cx + dx, top + fy * h)
+    box = np.array([x1, top, x1 + BOX_W, FOOT_V + 0.03 * h], np.float32)
+    return box, k, np.full(17, 0.9, np.float32)
+
+
 class Site:
-    def __init__(self, **over):
+    def __init__(self, pose=False, **over):
         self.reid = MapReid()
         self.mgr = make_manager(self.reid, **over)
         self.frame = np.zeros((H, W, 3), np.uint8)
         self.ts = 100.0
         self.next_tid = 1
+        self.pose = pose
 
     def tid(self):
         self.next_tid += 1
         return self.next_tid
 
     def step(self, people, obstacles=None):
-        """people: list of (track_id, x1, embedding)."""
+        """people: list of (track_id, x1, embedding[, height scale]). With pose=True people have a full skeleton."""
         self.ts += 1.0 / FPS
         dets = []
-        for tid, x, emb in people:
+        for person in people:
+            tid, x, emb = person[:3]
+            scale = person[3] if len(person) > 3 else 1.0
             self.reid.by_x[int(round(x))] = emb
-            dets.append(PoseDetection(track_id=tid, bbox_xyxy=np.array([x, 600.0, x + BOX_W, 600.0 + BOX_H],
-                                                                       np.float32),
-                                      conf=0.9, keypoints_xy=np.zeros((17, 2), np.float32),
-                                      keypoints_conf=np.zeros(17, np.float32)))
+            if self.pose:
+                jitter = 1.0 + 0.008 * np.sin(self.ts * 7.3 + tid)        # walking bob / keypoint noise
+                box, kxy, kconf = upright_pose(x, 0.97 * BOX_H * scale * jitter)
+            else:
+                box = np.array([x, 600.0, x + BOX_W, 600.0 + BOX_H], np.float32)
+                kxy, kconf = np.zeros((17, 2), np.float32), np.zeros(17, np.float32)
+            dets.append(PoseDetection(track_id=tid, bbox_xyxy=box, conf=0.9, keypoints_xy=kxy, keypoints_conf=kconf))
         return self.mgr.process_frame(self.frame, dets, self.ts, obstacles=obstacles)
 
     def run(self, sec, people_fn):
