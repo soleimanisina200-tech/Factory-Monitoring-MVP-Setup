@@ -24,19 +24,36 @@ vehicle_monitoring:
   pairing:
     cab_shrink: 0.08                 # cab region = vehicle box shrunk by this fraction left/right
     cab_score_threshold: 0.5
-    board_confirm_sec: 1.5           # parked vehicle: person in the cab this long -> driver
-    seated_board_confirm_sec: 0.6    # ... clearly seated pose (legs visible and folded)
+    # WHO IS IN THE CAB. Overlapping boxes are not enough (the box of a forklift also covers people standing metres
+    # behind or in front of it), so the floor decides: feet visible in a standing pose = on the floor, not an
+    # operator; feet hidden = seated in the cab OR standing right behind it - told apart by the seated pose (thighs
+    # level with the hips) and by where the body stands relative to the forklift's floor footprint.
+    operator_stands: false           # true for stand-up trucks (the operator stands on a platform: no seated pose)
+    seated_knee_drop: 0.45           # knee below hip / torso length under this = seated
+    cab_outside_gap_m: 0.45          # body this far beyond the footprint = standing behind the forklift
+    cab_inside_gap_m: 0.10           # body this far inside the footprint = proof of being in the cab
+    board_confirm_sec: 1.5           # parked vehicle: PROVEN in the cab this long -> driver
+    seated_board_confirm_sec: 0.6    # ... clearly seated pose
+    ambiguous_board_confirm_sec: 0   # legs hidden and NO proof of being inside: never the driver of a parked
+                                     # forklift (0). He is bound, back-dated, as soon as he travels with it.
+                                     # Set e.g. 8 to accept him after that many seconds anyway.
     moving_board_confirm_sec: 0.4    # moving vehicle: person travelling WITH it this long -> driver
     dismount_confirm_sec: 0.6        # driver out of the cab this long -> DRIVER_EXITED
     max_boarding_walk_speed_mps: 0.6 # faster people are passing by, not boarding
     vehicle_motion_threshold_m: 0.40 # displacement within motion_window_sec that means "moving"
     motion_window_sec: 1.0
     stop_confirm_sec: 1.5
-    comotion_min_cosine: 0.6
-    comotion_min_speed_ratio: 0.4
-    comotion_max_speed_ratio: 2.0
+    # "Travels with the forklift" = while it travels, his floor point stays inside its footprint (a forklift pivots:
+    # comparing the two movements would see a seated driver "left behind" on every turn).
+    comotion_min_travel_m: 0.6       # the forklift must have travelled this far before it is judged
+    comotion_inside_gap_m: 0.15      # still inside the footprint (small tolerance) = travelling with it
+    comotion_outside_gap_m: 1.0      # this far outside = left behind
+    moved_without_driver_m: 1.0      # forklift travelled this far after its driver got out -> somebody else drives
     # roofed cabs (driver hidden): see README section "roofed forklifts"
     board_vanish_radius_m: 1.2       # a person vanishing this close to a forklift may have climbed in
+    board_side_radius_m: 0.75        # ... and certainly did when he stood this close, in front of / beside it
+                                     # (not behind it, where he may simply be hidden) just before
+    vanish_min_sec: 0.8              # unseen this long = vanished (a missed detection is not)
     vanish_board_window_sec: 30.0    # ... if the forklift starts moving within this time
     hidden_board_confirm_sec: 2.0    # vanished INSIDE the cab region and stayed hidden this long -> onboard
     dismount_spawn_radius_m: 1.5     # a NEW person appearing this close to a parked occupied forklift = its driver
@@ -64,7 +81,11 @@ vehicle_monitoring:
     alarm_clear_sec: 2.0             # back within (threshold - hysteresis) this long -> alarm cleared
     clear_hysteresis_m: 0.3
     uncertain_margin_m: 1.5          # feet hidden: alarm only beyond threshold + this margin; never cleared
-    vehicle_depth_m: 2.5             # ground footprint depth behind the visible bottom edge (forklift + forks)
+    # REAL SIZE of the site's forklifts: the floor footprint is a rectangle of this size fitted to the lower outline
+    # of the segmentation mask. Measure one forklift (length WITH forks).
+    vehicle_length_m: 3.4
+    vehicle_width_m: 1.25
+    vehicle_depth_m: 2.5             # only without calibration: footprint depth behind the visible bottom edge
     min_ankle_confidence: 0.30
     ema_smoothing_alpha: 0.35
     max_step_jump_m: 1.8

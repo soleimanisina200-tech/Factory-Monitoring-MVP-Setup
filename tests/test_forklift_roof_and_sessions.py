@@ -109,7 +109,7 @@ def test_seat_time_is_reported_when_the_session_ends():
     assert end["details"]["reason"] == "VEHICLE_LEFT_VIEW"
 
 
-def test_person_standing_behind_a_parked_forklift_is_unbound_when_it_drives_away():
+def test_person_standing_behind_a_parked_forklift_is_never_made_its_driver():
     fsm = make_fsm()
     import numpy as np
 
@@ -117,13 +117,15 @@ def test_person_standing_behind_a_parked_forklift_is_unbound_when_it_drives_away
     for i, (x, y) in {5: (330, 190), 6: (370, 190), 11: (335, 240), 12: (365, 240)}.items():
         k[i] = (x, y, 0.9)                         # torso visible, legs hidden by the forklift
     behind = person(8, 320, 170, 380, 260, keypoints=k)
-    _, _, t = hold(fsm, [vehicle(1, 300, 150, 400, 300)], [behind], 0.0, 2.0)
-    assert fsm.vehicles["1"].associated_driver_id == "8"            # cannot be told apart while parked
-    recs, events, _ = drive(fsm, t, 300, 600, 25, persons_fn=lambda x: [behind])
+    _, ev1, t = hold(fsm, [vehicle(1, 300, 150, 400, 300)], [behind], 0.0, 20.0)
+    # legs hidden and no proof of being INSIDE (no seated pose, body not within the footprint): only a candidate.
+    # (The old logic bound him after 1.5 s and had to undo it when the forklift drove away.)
+    assert fsm.vehicles["1"].associated_driver_id is None
+    recs, ev2, _ = drive(fsm, t, 300, 600, 25, persons_fn=lambda x: [behind])
     assert recs["1"].associated_driver_id is None                   # he did not move with it
     assert recs["1"].state == VehicleSafetyState.OCCUPIED_UNKNOWN_DRIVER   # the real (hidden) driver drives
-    assert any(e["type"] == "DRIVER_SESSION_END" and e["details"]["reason"] in
-               ("NOT_MOVING_WITH_VEHICLE", "VEHICLE_MOVED_WITHOUT_DRIVER") for e in events)
+    events = ev1 + ev2
+    assert not any(e["type"] == "DRIVER_BOARDED" for e in events)
     assert not any(e["severity"] == "alarm" for e in events)        # and no false distance alarm
 
 

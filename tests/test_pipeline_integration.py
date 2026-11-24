@@ -69,9 +69,14 @@ class FakeDetector:
 
         def person(tid, x1, y1, x2, y2, feet_visible=True):
             kxy, kconf = np.zeros((17, 2), np.float32), np.zeros(17, np.float32)
-            if feet_visible:                            # ankles seen by the pose model -> certain ground point
-                kxy[15], kxy[16] = (0.5 * (x1 + x2) - 5, y2), (0.5 * (x1 + x2) + 5, y2)
-                kconf[15] = kconf[16] = 0.9
+            cx = 0.5 * (x1 + x2)
+            if feet_visible:                            # standing: full skeleton, ankles on the floor
+                rows = {5: 0.18, 6: 0.18, 11: 0.50, 12: 0.50, 13: 0.75, 14: 0.75, 15: 1.0, 16: 1.0}
+            else:                                       # seated in the cab: thighs level with the hips, no ankles
+                rows = {5: 0.25, 6: 0.25, 11: 0.75, 12: 0.75, 13: 0.80, 14: 0.80}
+            for i, fy in rows.items():
+                kxy[i] = (cx + (-8 if i % 2 else 8), y1 + fy * (y2 - y1))
+                kconf[i] = 0.9
             dets.append(PoseDetection(track_id=tid, bbox_xyxy=np.array([x1, y1, x2, y2], np.float32), conf=0.9,
                                       keypoints_xy=kxy, keypoints_conf=kconf))
 

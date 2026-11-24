@@ -7,11 +7,13 @@ Only points that lie on the floor may go through the ground homography. The old 
 the vehicle, so the "footprint" was distorted and distances were wrong.
 
 Footprint model:
-  * near edge = the vehicle's lowest image points (bbox bottom edge, or the lower band of the segmentation mask when
-    the vehicle model is a -seg model) -> these touch the floor and are projected exactly;
-  * the footprint extends `vehicle_depth_m` away from the camera (direction obtained from the homography itself).
-The result is a slightly generous polygon (bbox corners are not always on the vehicle), i.e. distances err on the
-small side by a fraction of a metre; with a segmentation model the near edge follows the real chassis.
+  * with a segmentation mask (recommended, -seg vehicle model): the LOWER BOUNDARY of the mask is where the chassis
+    touches the floor - the two bottom edges that face the camera. Projected to the floor they form an "L"; its
+    bounding rectangle is the real footprint in true size (no assumed depth). Seen exactly from the side only one edge
+    is visible: then the rectangle is completed away from the camera with the vehicle's width / length;
+  * with a box only: near edge = bbox bottom edge (projected exactly), extended away from the camera by a depth
+    chosen from the visible edge length and the vehicle size (a long visible side means the short dimension is the
+    depth, and vice versa) - a generous polygon, distances err on the small side by a fraction of a metre.
 
 Driver ground point: visible ankle keypoints (certain) -> pose-based foot point from app/logic/geometry.py
 (uncertain when it was extrapolated from the torso) -> bbox bottom (uncertain when the box looks truncated).
@@ -36,24 +38,45 @@ class DistanceMeasurement:
     uncertainty_reason: str = ""
 
 
+def _inside_polygon(p: np.ndarray, poly: np.ndarray) -> bool:
+    """Even-odd rule (pure numpy: this runs for every person x vehicle x frame)."""
+    x, y = float(p[0]), float(p[1])
+    x1, y1 = poly[:, 0], poly[:, 1]
+    x2, y2 = np.roll(x1, -1), np.roll(y1, -1)
+    crosses = (y1 > y) != (y2 > y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xi = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+    return bool(np.count_nonzero(crosses & (x < xi)) % 2)
+
+
+def _nearest_on_boundary(p: np.ndarray, poly: np.ndarray) -> Tuple[float, Tuple[float, float]]:
+    a = poly
+    ab = np.roll(poly, -1, axis=0) - a
+    denom = np.maximum((ab * ab).sum(axis=1), 1e-12)
+    t = np.clip(((p - a) * ab).sum(axis=1) / denom, 0.0, 1.0)
+    c = a + t[:, None] * ab
+    d = np.hypot(p[0] - c[:, 0], p[1] - c[:, 1])
+    i = int(np.argmin(d))
+    return float(d[i]), (float(c[i, 0]), float(c[i, 1]))
+
+
+def signed_gap(pt: Sequence[float], poly: np.ndarray) -> float:
+    """Metres from `pt` to the polygon boundary: positive outside, negative inside."""
+    poly = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
+    if len(poly) < 3:
+        return float("inf")
+    p = np.asarray(pt, dtype=np.float64)[:2]
+    d, _ = _nearest_on_boundary(p, poly)
+    return -d if _inside_polygon(p, poly) else d
+
+
 def point_polygon_distance(pt: Sequence[float], poly: np.ndarray) -> Tuple[float, Tuple[float, float]]:
     """Distance from `pt` to polygon `poly` (Kx2); 0 inside. Returns (distance, nearest point)."""
-    p = np.asarray(pt, dtype=np.float64)
+    p = np.asarray(pt, dtype=np.float64)[:2]
     poly = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
-    if len(poly) >= 3 and cv2.pointPolygonTest(poly.astype(np.float32), (float(p[0]), float(p[1])), False) >= 0:
+    if len(poly) >= 3 and _inside_polygon(p, poly):
         return 0.0, (float(p[0]), float(p[1]))
-    best, best_pt = float("inf"), (float(poly[0][0]), float(poly[0][1]))
-    n = len(poly)
-    for i in range(n):
-        a, b = poly[i], poly[(i + 1) % n]
-        ab = b - a
-        denom = float(np.dot(ab, ab))
-        t = 0.0 if denom <= 1e-12 else float(np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0))
-        c = a + t * ab
-        d = float(np.hypot(*(p - c)))
-        if d < best:
-            best, best_pt = d, (float(c[0]), float(c[1]))
-    return best, best_pt
+    return _nearest_on_boundary(p, poly)
 
 
 class RealWorldDistanceEstimator:
@@ -67,11 +90,17 @@ class RealWorldDistanceEstimator:
         self.min_ankle_conf = float(dist_cfg.get("min_ankle_confidence", 0.35))
         self.border_margin_px = int(dist_cfg.get("border_margin_px", 12))
         self.vehicle_depth_m = float(dist_cfg.get("vehicle_depth_m", 2.5))
+        # real size of the site's forklifts (forks included in the length): completes the footprint when only one
+        # side is visible, and bounds implausible mask outlines
+        self.vehicle_length_m = float(dist_cfg.get("vehicle_length_m", 3.4))
+        self.vehicle_width_m = float(dist_cfg.get("vehicle_width_m", 1.25))
         self.fallback_scale = float(cal_cfg.get("fallback_meters_per_pixel", 0.012))
 
         self.homography_matrix: Optional[np.ndarray] = None
         self.inv_homography_matrix: Optional[np.ndarray] = None
         self._smoothed: Dict[str, Tuple[float, float]] = {}
+        self._fp_fit: Dict[str, Tuple[int, float]] = {}      # vehicle key -> (orientation deg, cost) of the last fit
+        self._fp_last: Dict[str, Tuple[np.ndarray, Tuple[float, float], int]] = {}   # last fitted rectangle
         img_pts = np.array(cal_cfg.get("image_points_px", []) or [], dtype=np.float32)
         world_pts = np.array(cal_cfg.get("world_points_m", []) or [], dtype=np.float32)
         if len(img_pts) >= 4 and len(img_pts) == len(world_pts):
@@ -97,12 +126,19 @@ class RealWorldDistanceEstimator:
     def forget(self, key_prefix: str) -> None:
         for k in [k for k in self._smoothed if k.startswith(key_prefix)]:
             del self._smoothed[k]
+        for k in [k for k in self._fp_fit if k.startswith(key_prefix)]:
+            del self._fp_fit[k]
+        for k in [k for k in self._fp_last if k.startswith(key_prefix)]:
+            del self._fp_last[k]
 
     def pixel_to_world(self, pt_px: Sequence[float]) -> Tuple[float, float]:
-        if self.homography_matrix is not None:
-            pts = np.array([[[float(pt_px[0]), float(pt_px[1])]]], dtype=np.float64)
-            w = cv2.perspectiveTransform(pts, self.homography_matrix)[0][0]
-            return float(w[0]), float(w[1])
+        H = self.homography_matrix
+        if H is not None:
+            x, y = float(pt_px[0]), float(pt_px[1])
+            w = H[2, 0] * x + H[2, 1] * y + H[2, 2]
+            w = w if abs(w) > 1e-12 else 1e-12
+            return (float((H[0, 0] * x + H[0, 1] * y + H[0, 2]) / w),
+                    float((H[1, 0] * x + H[1, 1] * y + H[1, 2]) / w))
         return float(pt_px[0]) * self.fallback_scale, float(pt_px[1]) * self.fallback_scale
 
     def world_to_pixel(self, xy: Sequence[float]) -> Optional[Tuple[int, int]]:
@@ -110,9 +146,11 @@ class RealWorldDistanceEstimator:
             if self.homography_matrix is None:
                 return int(xy[0] / self.fallback_scale), int(xy[1] / self.fallback_scale)
             return None
-        p = cv2.perspectiveTransform(np.array([[[float(xy[0]), float(xy[1])]]], np.float64),
-                                     self.inv_homography_matrix)[0][0]
-        return int(p[0]), int(p[1])
+        G = self.inv_homography_matrix
+        x, y = float(xy[0]), float(xy[1])
+        w = G[2, 0] * x + G[2, 1] * y + G[2, 2]
+        w = w if abs(w) > 1e-12 else 1e-12
+        return int((G[0, 0] * x + G[0, 1] * y + G[0, 2]) / w), int((G[1, 0] * x + G[1, 1] * y + G[1, 2]) / w)
 
     def _stabilize(self, key: str, raw: Tuple[float, float]) -> Tuple[float, float]:
         prev = self._smoothed.get(key)
@@ -129,33 +167,157 @@ class RealWorldDistanceEstimator:
         return out
 
     # ------------------------------------------------------------------
-    def vehicle_footprint(
-        self, bbox: Sequence[float], frame_shape: Sequence[int], contour: Optional[np.ndarray] = None
-    ) -> Tuple[np.ndarray, bool]:
-        """(ground footprint polygon in meters, near edge clipped by the frame border)."""
-        x1, y1, x2, y2 = (float(v) for v in bbox[:4])
-        h_frame = int(frame_shape[0])
-        h = max(1.0, y2 - y1)
-        near_px: List[Tuple[float, float]] = []
-        if contour is not None and len(contour) >= 3:
-            c = np.asarray(contour, dtype=np.float64).reshape(-1, 2)
-            band = c[c[:, 1] >= y2 - 0.12 * h]
-            if len(band) >= 2:
-                near_px = [tuple(p) for p in band]
-        if not near_px:
-            near_px = [(x1, y2), (0.5 * (x1 + x2), y2), (x2, y2)]
-        near_w = np.array([self.pixel_to_world(p) for p in near_px], dtype=np.float64)
+    @staticmethod
+    def _lower_boundary(contour: np.ndarray, max_bins: int = 48) -> np.ndarray:
+        """
+        Lowest outline point per image column band = the chassis / floor contact line. The outline is densified
+        first and the bands are wide enough that EVERY band contains points of the lower side (otherwise a band
+        with only top-edge points would put the "floor contact" on the roof).
+        """
+        c = np.asarray(contour, dtype=np.float64).reshape(-1, 2)
+        nxt = np.roll(c, -1, axis=0)
+        parts = [c]
+        for a, b in zip(c, nxt):
+            n = int(np.hypot(*(b - a)) // 1.5)
+            if n > 0:
+                t = np.linspace(0.0, 1.0, n + 2)[1:-1, None]
+                parts.append(a + t * (b - a))
+        d = np.vstack(parts)
+        x0, x1 = float(d[:, 0].min()), float(d[:, 0].max())
+        if x1 - x0 < 12.0:
+            return np.zeros((0, 2))
+        n_bins = int(np.clip((x1 - x0) / 5.0, 6, max_bins))
+        bins = np.clip(((d[:, 0] - x0) / (x1 - x0) * n_bins).astype(int), 0, n_bins - 1)
+        low = []
+        for b in range(n_bins):
+            idx = np.flatnonzero(bins == b)
+            if len(idx):
+                low.append(d[idx[np.argmax(d[idx, 1])]])
+        return np.asarray(low) if len(low) >= 5 else np.zeros((0, 2))
 
-        cx = 0.5 * (x1 + x2)
+    def _away_direction(self, bbox: Sequence[float]) -> np.ndarray:
+        """Unit vector on the floor pointing away from the camera at the vehicle."""
+        x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+        cx, h = 0.5 * (x1 + x2), max(1.0, y2 - y1)
         c0 = np.array(self.pixel_to_world((cx, y2)))
         c1 = np.array(self.pixel_to_world((cx, y2 - max(4.0, 0.05 * h))))
         away = c1 - c0
         n = float(np.hypot(*away))
-        away = away / n if n > 1e-9 else np.array([0.0, -1.0])
-        far_w = near_w + self.vehicle_depth_m * away
-        pts = np.vstack([near_w, far_w]).astype(np.float32)
-        hull = cv2.convexHull(pts).reshape(-1, 2).astype(np.float64)
+        return away / n if n > 1e-9 else np.array([0.0, -1.0])
+
+    def _footprint_from_contour(self, contour: np.ndarray, away: np.ndarray, key: Optional[str] = None,
+                                expected_centre: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        """
+        Rectangle of the REAL vehicle size (vehicle_length_m x vehicle_width_m) fitted to the floor-contact line of
+        the mask; None when the outline is unusable.
+
+        The lower outline shows the bottom edges that face the camera (one or two sides of the rectangle). Its two
+        ends run up the vertical edges of the body, and those points project metres away from the camera - so the
+        fit is robust: for every orientation the rectangle is anchored at the points NEAREST to the camera (which are
+        never such outliers) and scored by how many outline points lie on its two camera-facing sides.
+        """
+        low = self._lower_boundary(contour)
+        if len(low) < 5:
+            return None
+        pts = np.array([self.pixel_to_world(p) for p in low], dtype=np.float64)
+        L, W = self.vehicle_length_m, self.vehicle_width_m
+        tau = 0.25
+        best = None
+        # a tracked vehicle turns a few degrees per frame: search around the previous orientation first
+        prev = self._fp_fit.get(key) if key else None
+        rounds = ([[(prev[0] + d) % 180 for d in range(-12, 13, 3)]] if prev else []) + [list(range(0, 180, 3))]
+        for degs in rounds:
+            best = self._fit_rectangle(pts, away, degs, L, W, tau, expected_centre)
+            if best is not None and (prev is None or degs is rounds[-1]
+                                     or best[0] <= max(0.2 * len(pts), 1.5 * prev[1] + 1.0)):
+                break
+        if best is None or best[0] > 0.6 * len(pts):
+            if key:
+                self._fp_fit.pop(key, None)
+            return None                               # the outline does not look like this vehicle: box model
+        cost, u, n, u0, n0, len_u, len_n, deg = best
+        if key:
+            self._fp_fit[key] = (deg, cost)
+        o = u0 * u + n0 * n
+        return np.array([o, o + len_u * u, o + len_u * u + len_n * n, o + len_n * n], dtype=np.float64)
+
+    @staticmethod
+    def _fit_rectangle(pts: np.ndarray, away: np.ndarray, degs, L: float, W: float, tau: float,
+                       expected_centre: Optional[np.ndarray] = None):
+        """Best (cost, u, n, u0, n0, len_u, len_n, deg). `expected_centre` (where the rectangle of the previous frame
+        would be now) breaks ties between equally good rectangles: seen end-on, the outline does not say whether the
+        vehicle extends this way or that, and a fit that flips between the two looks like a vehicle jumping."""
+        best = None
+        for deg in degs:
+            t = np.radians(deg)
+            u = np.array([np.cos(t), np.sin(t)])
+            n = np.array([-u[1], u[0]])
+            if u[0] * away[0] + u[1] * away[1] < 0:
+                u = -u
+            if n[0] * away[0] + n[1] * away[1] < 0:
+                n = -n
+            # (explicit 2-D products: this runs ~100 times per vehicle and frame)
+            su = pts[:, 0] * u[0] + pts[:, 1] * u[1]
+            sn = pts[:, 0] * n[0] + pts[:, 1] * n[1]
+            u0, n0 = float(np.partition(su, 1)[1]), float(np.partition(sn, 1)[1])   # nearest (robust minimum)
+            ru, rn = su - u0, sn - n0
+            for len_u, len_n in ((L, W), (W, L)):
+                d_a = np.hypot(rn, np.maximum(0.0, np.maximum(-ru, ru - len_u)))   # side along u (at n = n0)
+                d_b = np.hypot(ru, np.maximum(0.0, np.maximum(-rn, rn - len_n)))   # side along n (at u = u0)
+                on_a, on_b = d_a <= tau, d_b <= tau
+                cost = float(np.minimum(np.minimum(d_a, d_b), tau).sum()) / tau
+                # A visible side is seen along its WHOLE length: a short side must not be explained as a long one.
+                # (A side counts as visible when points lie on it that are not just the shared corner.)
+                if (on_a & ~on_b).sum() >= 2:
+                    cost += 0.35 * len(pts) * max(0.0, 1.0 - float(ru[on_a].max()) / len_u)
+                if (on_b & ~on_a).sum() >= 2:
+                    cost += 0.35 * len(pts) * max(0.0, 1.0 - float(rn[on_b].max()) / len_n)
+                if expected_centre is not None:
+                    cu, cn = u0 + 0.5 * len_u, n0 + 0.5 * len_n
+                    cx, cy = cu * u[0] + cn * n[0], cu * u[1] + cn * n[1]
+                    jump = float(np.hypot(cx - expected_centre[0], cy - expected_centre[1]))
+                    cost += 0.12 * len(pts) * min(1.5, max(0.0, jump - 0.15))
+                if best is None or cost < best[0]:
+                    best = (cost, u, n, u0, n0, len_u, len_n, int(deg))
+        return best
+
+    def vehicle_footprint(
+        self, bbox: Sequence[float], frame_shape: Sequence[int], contour: Optional[np.ndarray] = None,
+        key: Optional[str] = None,
+    ) -> Tuple[np.ndarray, bool]:
+        """(ground footprint polygon in meters, near edge clipped by the frame border). `key` = vehicle id (lets
+        the fit start from the orientation found in the previous frame)."""
+        x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+        h_frame = int(frame_shape[0])
         clipped = y2 >= h_frame - self.border_margin_px
+        away = self._away_direction(bbox)
+        if contour is not None and len(contour) >= 3 and self.homography_matrix is not None:
+            base = self.pixel_to_world((0.5 * (x1 + x2), y2))
+            last = self._fp_last.get(key) if key else None
+            expected = None
+            if last is not None:      # the previous rectangle, carried along with the box
+                expected = last[0].mean(axis=0) + np.array([base[0] - last[1][0], base[1] - last[1][1]])
+            fp = self._footprint_from_contour(contour, away, key, expected)
+            if fp is not None:
+                if key:
+                    self._fp_last[key] = (fp, base, 0)
+                return fp, bool(clipped)
+            if last is not None and last[2] < 5:
+                # one unusable outline (occluded / noisy mask): keep the rectangle of the previous frames, moved
+                # with the box, instead of jumping to the coarser box model and back
+                shift = np.array([base[0] - last[1][0], base[1] - last[1][1]])
+                self._fp_last[key] = (last[0], last[1], last[2] + 1)
+                return last[0] + shift, bool(clipped)
+        near_px = [(x1, y2), (0.5 * (x1 + x2), y2), (x2, y2)]
+        near_w = np.array([self.pixel_to_world(p) for p in near_px], dtype=np.float64)
+        depth = self.vehicle_depth_m
+        if self.homography_matrix is not None:
+            near_len = float(np.hypot(*(near_w[-1] - near_w[0])))
+            if near_len > 0.2:   # long visible side -> the depth is the short dimension, and vice versa
+                depth = float(np.clip(self.vehicle_length_m * self.vehicle_width_m / near_len,
+                                      self.vehicle_width_m, self.vehicle_length_m))
+        far_w = near_w + depth * away
+        hull = np.array([near_w[0], near_w[-1], far_w[-1], far_w[0]], dtype=np.float64)
         return hull, bool(clipped)
 
     def driver_ground_point(

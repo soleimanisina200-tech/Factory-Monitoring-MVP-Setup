@@ -4,18 +4,37 @@ Forklift <-> driver monitoring.
 
 Everything is time based (seconds on the stream clock), so behaviour does not change with the processing FPS.
 
+WHO IS IN THE CAB (cab_score)
+  Overlapping boxes are not enough: seen from an oblique camera the box of a forklift also covers people who stand
+  metres behind or in front of it. The FLOOR decides:
+    feet visible, standing pose              -> he stands on the floor: not an operator
+    feet hidden + seated pose                -> proof (thighs level with the hips)
+    feet hidden + body inside the footprint  -> proof (hips + a standing leg length, projected on the floor, against
+                                                the vehicle's floor footprint = a rectangle of the real vehicle size
+                                                fitted to the lower outline of its mask)
+    upper body hidden, hips + knees visible  -> seated under the overhead guard (steep camera): proof
+    feet hidden + body beyond the footprint  -> standing behind the vehicle: no
+    feet hidden, no proof                    -> candidate only
+
 WHO DRIVES (driver binding)
-  1. Visible in the cab   : a person whose skeleton/box sits in the cab region for board_confirm_sec (parked
-                            vehicle, slow person), seated_board_confirm_sec (seated pose), or moving_board_confirm_sec
-                            while travelling WITH a moving vehicle (co-motion). One person -> one vehicle.
-  2. Vanished into the cab: ROOFED cabs often hide the driver completely. A person last seen at/inside the cab
-                            who disappears, followed by the vehicle starting to move (or staying hidden inside the
-                            cab region for hidden_board_confirm_sec), becomes the driver ("hidden onboard").
-  3. Emerged from the cab : a NEW person appearing right next to a parked vehicle whose driver was hidden (or whose
+  1. Proven in the cab    : proof adds up for board_confirm_sec (seated pose: seated_board_confirm_sec) on a parked
+                            vehicle. A candidate WITHOUT proof is never bound to a parked vehicle
+                            (ambiguous_board_confirm_sec = 0), but:
+  2. Travels with it      : on a moving vehicle, whoever stays inside its footprint while it travels (and is not
+                            standing still) for moving_board_confirm_sec is the driver - back-dated to the moment he
+                            became the candidate. Turning on the spot is not travelling: a pivoting forklift does not
+                            lose its driver. One person -> one vehicle.
+  3. Vanished into the cab: ROOFED / CLOSED cabs often hide the driver completely. A person who disappears (really:
+                            vanish_min_sec, not one missed frame) while standing AT the cab in front of / beside the
+                            vehicle - where nothing else can hide him - is inside after hidden_board_confirm_sec. A
+                            person who disappears BEHIND it (or just near it) is the driver only if the vehicle then
+                            starts to move and he is the only candidate.
+  4. Emerged from the cab : a NEW person appearing right next to a parked vehicle whose driver was hidden (or whose
                             occupant was unknown) is the driver climbing out.
-  4. Moving, nobody known : OCCUPIED_UNKNOWN_DRIVER (someone must be driving - hidden by the roof).
-  A different person confirmed in the cab while the bound driver is out -> driver change (old session closed).
+  5. Moving, nobody known : OCCUPIED_UNKNOWN_DRIVER (someone must be driving - hidden by the roof).
+  A different person proven in the cab (or vanished into it) while the bound driver is out -> driver change.
   Driver boarding another vehicle -> his old session closes.
+  Measured against simulated ground truth: scripts/benchmark_driver.py (app/vehicle_monitoring/simulator.py).
 
 WHERE IS THE DRIVER
   in cab (visible, or hidden under the roof)        -> DRIVER_ONBOARD (onboard time accumulates)
@@ -34,7 +53,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Deque, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 import numpy as np
 
@@ -43,7 +62,18 @@ from app.vehicle_monitoring.distance_estimator import (
     DistanceMeasurement,
     RealWorldDistanceEstimator,
     point_polygon_distance,
+    signed_gap,
 )
+
+
+class CabEvidence(NamedTuple):
+    """Is this person IN the cab of this vehicle? (indexable like the old (score, seated) pair)"""
+    score: float            # 0..1 after the floor checks; >= cab_score_threshold = "in the cab"
+    seated: bool            # clearly seated pose (folded legs, or thighs level with the hips)
+    raw: float = 0.0        # image evidence alone (before the floor checks)
+    on_floor: bool = False  # feet visibly on the floor in a standing pose: NOT an operator
+    strong: bool = False    # positive proof of being inside: seated pose or body well inside the footprint
+    gap: Optional[float] = None   # metres from the body's floor point to the footprint (negative = inside)
 
 
 class VehicleSafetyState(str, Enum):
@@ -94,7 +124,25 @@ class PersonTrackHistory:
     vanish_ts: Optional[float] = None
     vanish_near: Dict[str, float] = field(default_factory=dict)      # vehicle -> metres to footprint
     vanish_cab: Dict[str, float] = field(default_factory=dict)       # vehicle -> cab score when last seen
+    # vehicle -> he can only have gone INTO it: last seen with proof of being in the cab, or standing at it on
+    # the camera's side (nothing else there to hide behind). Somebody vanishing on the FAR side may stand behind it.
+    vanish_into: Dict[str, bool] = field(default_factory=dict)
     last_cab: Dict[str, float] = field(default_factory=dict)
+    last_strong: Dict[str, bool] = field(default_factory=dict)
+    last_ground_certain: bool = False
+    # last time he was seen STANDING ON THE FLOOR (feet visible, standing pose): where he really was. The frames
+    # while he climbs in / is half hidden give floor points that are off by a metre.
+    floor_history: Deque[Tuple[float, float, float]] = field(default_factory=lambda: deque(maxlen=40))
+    # vehicle -> recent (time, metres from his floor point to that vehicle's footprint; negative = inside)
+    gap_history: Dict[str, Deque[Tuple[float, float]]] = field(default_factory=dict)
+    has_pose: bool = False             # the last detection carried keypoints
+
+    def floor_before(self, ts: float, lead_sec: float, memory_sec: float) -> Optional[Tuple[float, float]]:
+        """Where he stood on the floor shortly BEFORE `ts` (at least lead_sec earlier: not the climb itself)."""
+        for x, y, t in reversed(self.floor_history):
+            if t <= ts - lead_sec:
+                return (x, y) if ts - t <= memory_sec else None
+        return None
 
     def update_position(self, world_xy: Tuple[float, float], ts: float,
                         ground_px: Optional[Tuple[float, float]] = None) -> None:
@@ -105,16 +153,24 @@ class PersonTrackHistory:
         self.total_frames_seen += 1
         self.last_seen_ts = ts
 
-    def get_speed_mps(self, window_sec: float = 1.0) -> float:
-        if len(self.world_history) < 3:
+    def get_speed_mps(self, window_sec: float = 1.2) -> float:
+        """
+        Walking speed on the floor, robust against jitter: the floor point of somebody whose legs are hidden (a
+        seated driver!) jumps by decimetres from frame to frame, which a plain first-to-last difference reads as
+        "walking". Here the median position of the first half of the window is compared with that of the second.
+        """
+        if len(self.world_history) < 4:
             return 0.0
         t_end = self.world_history[-1][2]
-        old = next((h for h in self.world_history if t_end - h[2] <= window_sec), self.world_history[0])
-        dt = t_end - old[2]
-        if dt < 0.2:
+        pts = [h for h in self.world_history if t_end - h[2] <= window_sec]
+        if len(pts) < 4 or pts[-1][2] - pts[0][2] < 0.3:
             return 0.0
-        last = self.world_history[-1]
-        return float(np.hypot(last[0] - old[0], last[1] - old[1]) / dt)
+        half = len(pts) // 2
+        a, b = np.asarray(pts[:half]), np.asarray(pts[half:])
+        dt = float(np.median(b[:, 2]) - np.median(a[:, 2]))
+        if dt < 0.1:
+            return 0.0
+        return float(np.hypot(np.median(b[:, 0]) - np.median(a[:, 0]), np.median(b[:, 1]) - np.median(a[:, 1])) / dt)
 
     def max_distance_from_spawn_m(self) -> float:
         return float(np.hypot(self.current_world_xy[0] - self.spawn_world_xy[0],
@@ -152,6 +208,7 @@ class VehicleSessionRecord:
     driver_last_seen_in_cab: bool = False
     driver_last_world_xy: Optional[Tuple[float, float]] = None
     exit_timestamp: Optional[float] = None
+    exit_vehicle_xy: Optional[Tuple[float, float]] = None      # where the vehicle stood when the driver got out
     lost_since: Optional[float] = None
     # session / seat time
     session_start_ts: Optional[float] = None
@@ -161,7 +218,10 @@ class VehicleSessionRecord:
     unknown_since: Optional[float] = None
     # boarding candidate
     cand_pid: Optional[str] = None
-    cand_time: float = 0.0
+    cand_time: float = 0.0             # how long he has been the candidate (session start is back-dated by it)
+    cand_proof: float = 0.0            # seconds of STRONG in-cab evidence (leaks away on frames without it)
+    cand_move: float = 0.0             # seconds travelling with the moving vehicle
+    cand_last_ts: float = -1e18
     comotion_fail_since: Optional[float] = None
     reboard_since: Optional[float] = None
     # distance & alarms
@@ -192,18 +252,28 @@ class DriverVehicleMonitorFSM:
         self.dismount_confirm_sec = float(p.get("dismount_confirm_sec", 0.6))
         self.max_boarding_walk_speed_mps = float(p.get("max_boarding_walk_speed_mps", 0.6))
         self.min_kpt_conf = float(p.get("min_keypoint_confidence", 0.30))
+        # floor evidence (see cab_score)
+        self.operator_stands = bool(p.get("operator_stands", False))          # stand-up trucks: no seated pose
+        self.cab_outside_gap_m = float(p.get("cab_outside_gap_m", 0.45))      # body this far beyond the footprint
+        self.cab_inside_gap_m = float(p.get("cab_inside_gap_m", 0.10))        # body this far inside = strong proof
+        self.seated_knee_drop = float(p.get("seated_knee_drop", 0.45))        # knee below hip / torso length
+        self.ambiguous_board_confirm_sec = float(p.get("ambiguous_board_confirm_sec", 0.0))   # 0 = never (parked)
 
         self.vehicle_motion_thresh_m = float(p.get("vehicle_motion_threshold_m", 0.40))
         self.motion_window_sec = float(p.get("motion_window_sec", 1.0))
         self.stop_confirm_sec = float(p.get("stop_confirm_sec", 1.5))
-        self.min_comotion_cos = float(p.get("comotion_min_cosine", 0.6))
-        self.comotion_speed_ratio = (float(p.get("comotion_min_speed_ratio", 0.4)),
-                                     float(p.get("comotion_max_speed_ratio", 2.0)))
+        self.comotion_min_travel_m = float(p.get("comotion_min_travel_m", 0.6))   # vehicle travel needed to judge
+        self.comotion_inside_gap_m = float(p.get("comotion_inside_gap_m", 0.15))   # still inside the footprint
+        self.comotion_outside_gap_m = float(p.get("comotion_outside_gap_m", 1.0))  # left behind
+        self.moved_without_driver_m = float(p.get("moved_without_driver_m", 1.0))  # travel since the driver got out
 
         # roofed cabs / hidden drivers
         self.board_vanish_radius_m = float(p.get("board_vanish_radius_m", 1.2))
         self.vanish_board_window_sec = float(p.get("vanish_board_window_sec", 30.0))
         self.hidden_board_confirm_sec = float(p.get("hidden_board_confirm_sec", 2.0))
+        self.vanish_min_sec = float(p.get("vanish_min_sec", 0.8))   # unseen this long = vanished (not a missed frame)
+        self.vanish_floor_memory_sec = float(p.get("vanish_floor_memory_sec", 3.0))
+        self.board_side_radius_m = float(p.get("board_side_radius_m", 0.75))
         self.dismount_spawn_radius_m = float(p.get("dismount_spawn_radius_m", 1.5))
         self.emergence_window_sec = float(p.get("emergence_window_sec", 1.5))
         self.recent_activity_sec = float(p.get("recent_activity_sec", 120.0))
@@ -253,13 +323,22 @@ class DriverVehicleMonitorFSM:
         s = self.cab_shrink
         return vb[0] + s * vw, vb[1] + 0.04 * vh, vb[2] - s * vw, vb[3] - 0.04 * vh
 
-    def cab_score(self, person: Dict[str, Any], vbbox: List[float]) -> Tuple[float, bool]:
+    def cab_score(self, person: Dict[str, Any], vbbox: List[float],
+                  footprint: Optional[np.ndarray] = None) -> CabEvidence:
         """
-        0..1 evidence that `person` sits in the cab of the vehicle, and whether the pose is CLEARLY seated
-        (legs visible and folded). Works with partial visibility (roof / mast / side panels hide part of the body).
-        Hidden legs raise the score a little but do not count as seated: someone standing BEHIND a parked forklift
-        also has hidden legs, so that case needs the full board_confirm_sec (and is undone if he does not travel
-        with the vehicle once it moves).
+        Evidence that `person` is IN the cab of the vehicle.
+
+        Image overlap alone is not enough: from an oblique camera the vehicle's box also covers people who stand
+        metres BEHIND it or in front of it. So the floor decides:
+          * feet visible in a standing pose  -> he stands on the floor (in front of / behind / beside the
+            vehicle): not an operator, however much the boxes overlap;
+          * feet hidden -> seated in the cab, or standing right behind the vehicle. Told apart by
+              - the pose: a seated person's thighs are level with the hips (knees visible near hip height); a
+                standing person's knees hang a thigh-length below the hips;
+              - the floor point of the body (hips + standing leg length, projected on the floor) against the
+                vehicle's footprint: an operator is inside it, somebody behind the vehicle is beyond its far edge.
+        `strong` = positive proof (seated pose, or well inside the footprint). Without it a person at a PARKED
+        vehicle is not made its driver (see _visible_boarding); travelling with the moving vehicle still binds him.
         """
         pb = person["bbox"]
         cx1, cy1, cx2, cy2 = self._cab_rect(vbbox)
@@ -268,43 +347,154 @@ class DriverVehicleMonitorFSM:
         area = max(1.0, (pb[2] - pb[0]) * (pb[3] - pb[1]))
         containment = inter / area
         if containment < 0.30:
-            return 0.0, False
+            return CabEvidence(0.0, False)
         vh = vbbox[3] - vbbox[1]
         kp = person.get("keypoints")
         k = np.asarray(kp) if kp is not None else None
         if k is None or k.ndim != 2 or len(k) < 17:
+            # box-only detections (standalone runner): the legacy image rule
             foot = person.get("foot_px")
             if foot is not None and not person.get("ground_uncertain", False) and foot[1] > vbbox[3] - 0.03 * vh:
-                return 0.15 * containment, False  # feet on the floor in front of the vehicle
-            return float(containment), False
+                return CabEvidence(0.15 * containment, False, float(containment), True)
+            return CabEvidence(float(containment), False, float(containment), False, True)
 
         conf = k[:, 2] if k.shape[1] >= 3 else np.ones(len(k))
         vis = (conf >= self.min_kpt_conf) & (k[:, 0] > 1) & (k[:, 1] > 1)
-        ankles = [i for i in (15, 16) if vis[i]]
-        if ankles:
-            ankle_y = float(np.mean([k[i][1] for i in ankles]))
-            if ankle_y > vbbox[3] - 0.04 * vh:
-                return 0.15 * containment, False  # standing on the floor in front of / beside the vehicle
         inside = vis & (k[:, 0] >= cx1) & (k[:, 0] <= cx2) & (k[:, 1] >= cy1) & (k[:, 1] <= cy2)
         n_vis = int(vis.sum())
         inside_frac = float(inside.sum()) / n_vis if n_vis >= 3 else containment
-        seated = legs_hidden = False
-        sh = [k[i][1] for i in (5, 6) if vis[i]]
-        hp = [k[i][1] for i in (11, 12) if vis[i]]
+        ankles = [i for i in (15, 16) if vis[i]]
+        knees = [i for i in (13, 14) if vis[i]]
+        sh = [i for i in (5, 6) if vis[i]]
+        hp = [i for i in (11, 12) if vis[i]]
+        seated = legs_hidden = under_roof = False
+        gap: Optional[float] = None
+        if hp and knees and not sh and not ankles:
+            # Hips and knees are seen but shoulders and head are not: the upper body is hidden while the lower body
+            # is visible. Nothing does that to a person standing on the floor - it is the overhead guard / roof of
+            # the cab seen from a steep camera. He sits under it.
+            head_seen = bool(vis[:5].any())
+            hip_mid, knee_mid = k[hp, :2].mean(axis=0), k[knees, :2].mean(axis=0)
+            thigh_px = max(1.0, float(np.hypot(*(knee_mid - hip_mid))))
+            legs_hidden = True
+            # thighs roughly level (not hanging down like a standing person's) = seated
+            level = (float(knee_mid[1] - hip_mid[1]) / thigh_px) < 0.6
+            # both hips and both knees really seen (one stray joint of a half-hidden bystander is not enough)
+            under_roof = (not head_seen and len(hp) == 2 and len(knees) == 2 and bool(inside[hp].all()) and level)
+            seated = under_roof
         if sh and hp:
-            torso_h = max(1.0, float(np.mean(hp) - np.mean(sh)))
-            if not ankles:
-                legs_hidden = True  # torso in the cab, legs hidden by the chassis / door (or by the vehicle)
-            else:
-                leg_h = max(0.0, float(np.mean([k[i][1] for i in ankles])) - float(np.mean(hp)))
+            sh_mid, hip_mid = k[sh, :2].mean(axis=0), k[hp, :2].mean(axis=0)
+            torso_px = max(1.0, float(np.hypot(*(hip_mid - sh_mid))))
+            torso_h = max(1.0, float(hip_mid[1] - sh_mid[1]))
+            if ankles:
+                leg_h = max(0.0, float(np.mean([k[i][1] for i in ankles])) - float(hip_mid[1]))
                 seated = (leg_h / torso_h) < 1.25
-        score = 0.5 * containment + 0.5 * inside_frac + (0.15 if seated else (0.05 if legs_hidden else 0.0))
-        return float(min(1.0, score)), seated
+            else:
+                legs_hidden = True
+                if knees:   # thighs level with the hips = sitting (a standing person's knees hang ~0.85 torso lower)
+                    drop = (float(np.mean([k[i][1] for i in knees])) - float(hip_mid[1])) / torso_px
+                    seated = drop < self.seated_knee_drop
+            if footprint is not None and self.estimator.is_metric:
+                # where this body would stand: hips + a standing leg length (1.86 x torso), on the floor
+                body_floor = self.estimator.pixel_to_world((float(hip_mid[0]), float(hip_mid[1]) + 1.86 * torso_px))
+                gap = signed_gap(body_floor, footprint)
+        raw = float(min(1.0, 0.5 * containment + 0.5 * inside_frac + (0.15 if seated else
+                                                                       (0.05 if legs_hidden else 0.0))))
+        on_floor = bool(ankles) and not seated and not self.operator_stands
+        if on_floor:
+            # feet on the floor in a standing pose: beside / in front of / behind the vehicle
+            return CabEvidence(0.15 * containment, False, raw, True, False, gap)
+        if not seated and gap is not None and gap > self.cab_outside_gap_m:
+            # the body is beyond the footprint: standing behind the vehicle (legs hidden by the chassis)
+            return CabEvidence(min(raw, 0.8 * self.cab_thresh), False, raw, False, False, gap)
+        strong = (seated or under_roof or (gap is not None and gap <= -self.cab_inside_gap_m)
+                  or self.operator_stands)
+        if gap is None and not seated and not under_roof:
+            strong = not self.estimator.is_metric     # no calibration / no torso: nothing better than the image
+        return CabEvidence(raw, seated, raw, False, bool(strong), gap)
 
     def _footprint(self, rec: VehicleSessionRecord) -> np.ndarray:
         if rec.footprint_world is None:
-            rec.footprint_world, _ = self.estimator.vehicle_footprint(rec.bbox, self._frame_shape, rec.contour)
+            rec.footprint_world, _ = self.estimator.vehicle_footprint(
+                rec.bbox, self._frame_shape, rec.contour, key=f"veh_{rec.vehicle_id}_fp")
         return rec.footprint_world
+
+    @staticmethod
+    def _vehicle_xy(rec: VehicleSessionRecord) -> Optional[Tuple[float, float]]:
+        if not rec.world_pos_history:
+            return None
+        return rec.world_pos_history[-1][0], rec.world_pos_history[-1][1]
+
+    def _moved_since_exit(self, rec: VehicleSessionRecord) -> bool:
+        """Has the vehicle really TRAVELLED since its driver got out? (not: is it still rolling to a stop /
+        being nudged - the 'moving' flag lingers for a moment after every stop)"""
+        now_xy = self._vehicle_xy(rec)
+        if rec.exit_vehicle_xy is None or now_xy is None:
+            return False
+        return float(np.hypot(now_xy[0] - rec.exit_vehicle_xy[0], now_xy[1] - rec.exit_vehicle_xy[1])) \
+            >= self.moved_without_driver_m
+
+    def _torso_floor_point(self, person: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        """Floor position (metres) under a body whose feet are not visible: hips + 1.86 x torso length downwards."""
+        if not self.estimator.is_metric:
+            return None
+        kp = person.get("keypoints")
+        k = np.asarray(kp) if kp is not None else None
+        if k is None or k.ndim != 2 or len(k) < 17:
+            return None
+        conf = k[:, 2] if k.shape[1] >= 3 else np.ones(len(k))
+        sh = [i for i in (5, 6) if conf[i] >= self.min_kpt_conf]
+        hp = [i for i in (11, 12) if conf[i] >= self.min_kpt_conf]
+        if not (sh and hp):
+            return None
+        sh_mid, hip_mid = k[sh, :2].mean(axis=0), k[hp, :2].mean(axis=0)
+        torso_px = max(1.0, float(np.hypot(hip_mid[0] - sh_mid[0], hip_mid[1] - sh_mid[1])))
+        return self.estimator.pixel_to_world((float(hip_mid[0]), float(hip_mid[1]) + 1.86 * torso_px))
+
+    def _stands_on_floor(self, person: Dict[str, Any]) -> bool:
+        """Feet visible and the proportions of a standing body (not climbing / sitting): his floor point is real."""
+        kp = person.get("keypoints")
+        k = np.asarray(kp) if kp is not None else None
+        if k is None or k.ndim != 2 or len(k) < 17:
+            return person.get("ground_uncertain") is False
+        conf = k[:, 2] if k.shape[1] >= 3 else np.ones(len(k))
+        vis = conf >= self.min_kpt_conf
+        ankles = [i for i in (15, 16) if vis[i]]
+        sh = [i for i in (5, 6) if vis[i]]
+        hp = [i for i in (11, 12) if vis[i]]
+        if not (ankles and sh and hp):
+            return False
+        torso_h = max(1.0, float(k[hp, 1].mean() - k[sh, 1].mean()))
+        return (float(k[ankles, 1].mean()) - float(k[hp, 1].mean())) / torso_h >= 1.45
+
+    def _behind_vehicle(self, rec: VehicleSessionRecord, world_xy: Tuple[float, float],
+                        margin: float = 0.15) -> bool:
+        """
+        Is this floor point in the "shadow" of the vehicle as seen from the camera (the line of sight to it passes
+        over the footprint)? Only there a person can be hidden BEHIND the vehicle. Somebody who vanishes while
+        standing in front of it or beside it has nowhere else to go than into the cab.
+        """
+        fp = self._footprint(rec)
+        away = self.estimator._away_direction(rec.bbox)
+        perp = np.array([-away[1], away[0]])
+        pt = np.asarray(world_xy, dtype=np.float64)
+        if signed_gap(pt, fp) <= 0:
+            return True
+        n = len(fp)
+        for off in (-margin, 0.0, margin):
+            o = pt + off * perp
+            for i in range(n):                       # ray from the point TOWARDS the camera against every edge
+                a, b = fp[i], fp[(i + 1) % n]
+                e = b - a
+                den = (-away[0]) * e[1] - (-away[1]) * e[0]
+                if abs(den) < 1e-9:
+                    continue
+                w = a - o
+                t = (w[0] * e[1] - w[1] * e[0]) / den
+                u = (w[0] * (-away[1]) - w[1] * (-away[0])) / den
+                if t >= 0.0 and 0.0 <= u <= 1.0:
+                    return True
+        return False
 
     def _dist_to_vehicle(self, rec: VehicleSessionRecord, world_xy: Tuple[float, float]) -> float:
         return point_polygon_distance(world_xy, self._footprint(rec))[0]
@@ -312,14 +502,22 @@ class DriverVehicleMonitorFSM:
     def _update_vehicle_motion(self, rec: VehicleSessionRecord, now: float) -> None:
         x1, y1, x2, y2 = rec.bbox
         base = (0.5 * (x1 + x2), float(y2))
-        wx, wy = self.estimator.pixel_to_world(base)
+        # Position = centre of the floor footprint. (The bottom centre of the BOX moves when the vehicle merely
+        # turns on the spot: the old code then saw "motion" the seated driver did not share and unbound him.)
+        centre = self._footprint(rec).mean(axis=0)
+        wx, wy = self.estimator._stabilize(f"veh_{rec.vehicle_id}_c", (float(centre[0]), float(centre[1])))
         rec.world_pos_history.append((wx, wy, now))
         rec.px_history.append((base[0], base[1], now))
-        old = next((h for h in rec.world_pos_history if now - h[2] <= self.motion_window_sec),
-                   rec.world_pos_history[0])
-        if now - old[2] < 0.5 * self.motion_window_sec:
+        # displacement over motion_window_sec between the MEDIAN position now and then: a fitted footprint jitters
+        # by a decimetre or two, and a parked vehicle must not look as if it had started to drive
+        span = 0.6
+        recent = [h for h in rec.world_pos_history if now - h[2] <= span]
+        past = [h for h in rec.world_pos_history
+                if self.motion_window_sec <= now - h[2] <= self.motion_window_sec + span]
+        if len(recent) < 2 or len(past) < 2:
             return
-        disp = float(np.hypot(wx - old[0], wy - old[1]))
+        r, q = np.asarray(recent), np.asarray(past)
+        disp = float(np.hypot(np.median(r[:, 0]) - np.median(q[:, 0]), np.median(r[:, 1]) - np.median(q[:, 1])))
         if disp >= self.vehicle_motion_thresh_m:
             if not rec.is_currently_moving:
                 rec.moving_since = now
@@ -334,27 +532,50 @@ class DriverVehicleMonitorFSM:
                 rec.is_currently_moving = False
                 rec.moving_since = None
 
-    def _co_motion(self, rec: VehicleSessionRecord, hist: PersonTrackHistory, window: float = 1.0) -> Optional[bool]:
-        """Does the person travel WITH the vehicle (same direction, similar speed)? None = cannot judge yet."""
-        if len(rec.px_history) < 3 or len(hist.px_history) < 3:
-            return None
-        t_end = min(rec.px_history[-1][2], hist.px_history[-1][2])
+    def _co_motion(self, rec: VehicleSessionRecord, hist: PersonTrackHistory, window: float = 1.5) -> Optional[bool]:
+        """
+        Does the person travel WITH the vehicle?  True / False / None (cannot judge: the vehicle hardly travelled,
+        or too little data).
 
-        def disp(h):
-            pts = [x for x in h if t_end - window <= x[2] <= t_end]
-            if len(pts) < 3 or pts[-1][2] - pts[0][2] < 0.3:
+        With a skeleton: riding = while the vehicle travels, his floor point STAYS INSIDE its footprint and he is
+        not standing still; left behind = the footprint moved away from him, or the vehicle travelled far while he
+        stayed where he was. (Comparing the two displacements alone does not work: a forklift pivots, its centre
+        and its seat then move along different arcs, and a seated driver looked "left behind" on every turn.)
+        Without keypoints (box-only detections of the standalone runner) the floor point of a seated person is not
+        known, and only the displacements are compared, as before.
+        """
+        vh = rec.world_pos_history
+        if len(vh) < 3:
+            return None
+        t_end = vh[-1][2]
+        past = [x for x in vh if t_end - window <= x[2]]
+        if len(past) < 3:
+            return None
+        v = np.array([past[-1][0] - past[0][0], past[-1][1] - past[0][1]], dtype=np.float64)
+        v_len = float(np.hypot(v[0], v[1]))
+        if v_len < self.comotion_min_travel_m:
+            return None
+        if not hist.has_pose:
+            pts = [x for x in hist.world_history if past[0][2] - 1e-6 <= x[2] <= t_end + 1e-6]
+            if len(pts) < 3:
                 return None
-            return np.array([pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]], dtype=np.float64)
-
-        v, p = disp(rec.px_history), disp(hist.px_history)
-        if v is None or p is None:
+            residual = float(np.hypot(pts[-1][0] - pts[0][0] - v[0], pts[-1][1] - pts[0][1] - v[1]))
+            if residual <= max(0.45 * v_len, 0.5):
+                return True
+            return False if residual >= max(0.70 * v_len, 0.8) else None
+        gaps = [g for t, g in hist.gap_history.get(rec.vehicle_id, ()) if t_end - t <= 0.8]
+        pts = np.asarray([x for x in hist.world_history if past[0][2] - 1e-6 <= x[2] <= t_end + 1e-6])
+        if len(gaps) < 3 or len(pts) < 6:
             return None
-        v_len, p_len = float(np.linalg.norm(v)), float(np.linalg.norm(p))
-        if v_len < 3.0:
-            return None
-        cos = float(np.dot(v, p) / (v_len * p_len + 1e-8)) if p_len > 1e-6 else 0.0
-        lo, hi = self.comotion_speed_ratio
-        return bool(cos >= self.min_comotion_cos and lo <= p_len / v_len <= hi)
+        gap = float(np.median(gaps))        # medians: single frames with a wrong floor point do not decide
+        k = max(2, len(pts) // 3)
+        moved = float(np.hypot(np.median(pts[-k:, 0]) - np.median(pts[:k, 0]),
+                               np.median(pts[-k:, 1]) - np.median(pts[:k, 1])))
+        if gap >= self.comotion_outside_gap_m or (v_len >= 1.2 and moved <= 0.25 * v_len):
+            return False                    # left behind / stood still while the vehicle drove on
+        if gap <= self.comotion_inside_gap_m and moved >= 0.3 * v_len:
+            return True
+        return None
 
     def _deduplicate_vehicle_tracks(self, detected_vehicles: List[Dict], now: float) -> None:
         """A tracker id switch on the same vehicle keeps the session (IoU with a just-lost record)."""
@@ -453,6 +674,7 @@ class DriverVehicleMonitorFSM:
         rec.stint_start_ts = None
         rec.driver_hidden_onboard = False
         rec.exit_timestamp = ts
+        rec.exit_vehicle_xy = self._vehicle_xy(rec)
         rec.out_of_cab_since = None
         rec.state = VehicleSafetyState.DRIVER_EXITED_SAFE
         events.append(self._event("DRIVER_EXITED", ts, rec, rec.associated_driver_id, INFO, value=round(stint, 1),
@@ -557,6 +779,12 @@ class DriverVehicleMonitorFSM:
             ground = p.get("foot_px") or (0.5 * (x1 + x2), float(y2))
             bev = p.get("bev_xy")
             world = (float(bev[0]), float(bev[1])) if bev is not None else self.estimator.pixel_to_world(ground)
+            if p.get("ground_uncertain"):
+                # Legs hidden (seated in a cab, behind a pallet ...): the bottom of the visible box is not on the
+                # floor and projects metres away. The torso gives the place (hips + a standing leg length).
+                torso = self._torso_floor_point(p)
+                if torso is not None:
+                    world = torso
             hist = self.person_histories.get(pid)
             if hist is None:
                 hist = self.person_histories[pid] = PersonTrackHistory(
@@ -569,6 +797,9 @@ class DriverVehicleMonitorFSM:
             hist.vanish_ts = None
             hist.vanish_near.clear()
             hist.vanish_cab.clear()
+            hist.vanish_into.clear()
+            hist.last_ground_certain = p.get("ground_uncertain") is False
+            hist.has_pose = p.get("keypoints") is not None
         for pid in left_view_ids or ():
             h = self.person_histories.get(str(pid))
             if h is not None:
@@ -594,28 +825,50 @@ class DriverVehicleMonitorFSM:
             visible.append(rec)
 
         # ---- 3. cab evidence (person x vehicle) --------------------------------------------------------------
-        scores: Dict[Tuple[str, str], Tuple[float, bool]] = {}
+        scores: Dict[Tuple[str, str], CabEvidence] = {}
         for rec in visible:
             for pid, p in person_map.items():
                 if self._bbox_iou(p["bbox"], rec.bbox) <= 0.0 and not _box_inside(p["bbox"], rec.bbox):
                     continue
-                s = self.cab_score(p, rec.bbox)
-                if s[0] > 0:
+                fp = self._footprint(rec)
+                s = self.cab_score(p, rec.bbox, fp)
+                if s[0] > 0 or s.raw > 0:
                     scores[(rec.vehicle_id, pid)] = s
+                h = self.person_histories[pid]
+                h.gap_history.setdefault(rec.vehicle_id, deque(maxlen=30)).append(
+                    (now, signed_gap(h.current_world_xy, fp)))
         for pid in person_map:
             self.person_histories[pid].last_cab = {vid: s[0] for (vid, q), s in scores.items() if q == pid}
+            h = self.person_histories[pid]
+            h.last_strong = {
+                vid: bool(s.strong and s[0] >= self.cab_thresh) for (vid, q), s in scores.items() if q == pid}
+            if h.last_ground_certain and self._stands_on_floor(person_map[pid]):
+                h.floor_history.append((h.current_world_xy[0], h.current_world_xy[1], now))
 
         # ---- 4. who just vanished, and next to which vehicle? -------------------------------------------------
         for pid, h in self.person_histories.items():
             if pid in person_map or h.vanish_ts is not None:
                 continue
             h.vanish_ts = h.last_seen_ts
+            # where did he stand just before? (the last frames of a climb give floor points that are a metre off)
+            stood = h.floor_before(h.vanish_ts, 0.8, self.vanish_floor_memory_sec)
             for rec in visible:
                 dist = self._dist_to_vehicle(rec, h.current_world_xy)
+                dist_stood = self._dist_to_vehicle(rec, stood) if stood is not None else float("inf")
                 cab = h.last_cab.get(rec.vehicle_id, 0.0)
-                if dist <= self.board_vanish_radius_m or cab >= 0.3:
-                    h.vanish_near[rec.vehicle_id] = dist
+                if min(dist, dist_stood) <= self.board_vanish_radius_m or cab >= 0.3:
+                    h.vanish_near[rec.vehicle_id] = min(dist, dist_stood)
                     h.vanish_cab[rec.vehicle_id] = cab
+                    # ... right AT the vehicle (a boarding driver stands within arm's reach of the cab)
+                    in_sight = (dist_stood <= self.board_side_radius_m
+                                and not self._behind_vehicle(rec, stood))
+                    if in_sight and h.floor_history:
+                        # ... unless his LAST step on the floor was already behind the vehicle and clear of it:
+                        # he walked round it (a climbing driver's last floor point stays at / inside the footprint)
+                        last = (h.floor_history[-1][0], h.floor_history[-1][1])
+                        if signed_gap(last, self._footprint(rec)) > 0.3 and self._behind_vehicle(rec, last):
+                            in_sight = False
+                    h.vanish_into[rec.vehicle_id] = bool(h.last_strong.get(rec.vehicle_id, False) or in_sight)
 
         # ---- 5. vehicles that have a driver -------------------------------------------------------------------
         for rec in visible:
@@ -704,8 +957,15 @@ class DriverVehicleMonitorFSM:
             rec.lost_since = None
             if p.get("embedding") is not None:
                 rec.driver_reid_embedding = np.asarray(p["embedding"])
-            score, seated = scores.get((rec.vehicle_id, pid), (0.0, False))
+            ev = scores.get((rec.vehicle_id, pid), CabEvidence(0.0, False))
+            score, seated = ev.score, ev.seated
             in_cab = score >= self.cab_thresh
+            if rec.onboard and not in_cab and ev.raw >= self.cab_thresh and not ev.on_floor:
+                # An ONBOARD driver is only taken out of the cab by clear evidence (feet on the floor, or the body
+                # well beyond the footprint): one noisy floor estimate must not "dismount" a seated operator.
+                in_cab = ev.gap is None or ev.gap <= self.cab_outside_gap_m + 0.30
+            if rec.is_currently_moving and not rec.onboard and ev.raw >= self.cab_thresh and not ev.on_floor:
+                in_cab = True      # travelling in the cab region of the moving vehicle: co-motion decides below
             rec.driver_last_seen_in_cab = in_cab
             if in_cab and not rec.onboard:
                 # The DISMOUNTED driver overlaps the cab again: climbing back in - or only walking past the
@@ -714,8 +974,11 @@ class DriverVehicleMonitorFSM:
                 if rec.is_currently_moving:
                     ok, required = self._co_motion(rec, hist) is True, self.moving_board_confirm_sec
                 else:
-                    ok = hist.get_speed_mps() <= self.max_boarding_walk_speed_mps
+                    ok = seated or hist.get_speed_mps() <= self.max_boarding_walk_speed_mps
                     required = self.seated_board_confirm_sec if seated else self.board_confirm_sec
+                    if not ev.strong:                # legs hidden, no proof of being inside (may stand behind it)
+                        ok = ok and self.ambiguous_board_confirm_sec > 0
+                        required = self.ambiguous_board_confirm_sec
                 rec.reboard_since = (rec.reboard_since or now) if ok else None
                 if rec.reboard_since is not None and now - rec.reboard_since >= required:
                     start, rec.reboard_since = rec.reboard_since, None
@@ -751,7 +1014,7 @@ class DriverVehicleMonitorFSM:
                     return
                 self._dismount(rec, rec.out_of_cab_since, events, "VISIBLE")
             # dismounted: is somebody else driving the vehicle away?
-            if rec.is_currently_moving and rec.moving_since is not None and now - rec.moving_since >= 1.0:
+            if rec.is_currently_moving and self._moved_since_exit(rec):
                 self._end_session(rec, now, events, "VEHICLE_MOVED_WITHOUT_DRIVER")
                 self._set_unknown_occupied(rec, now, events, reason="moved while the bound driver was outside")
                 return
@@ -773,7 +1036,7 @@ class DriverVehicleMonitorFSM:
         hist = self.person_histories.get(pid)
         last_xy = rec.driver_last_world_xy or (hist.current_world_xy if hist else None)
         near_cab = last_xy is not None and self._dist_to_vehicle(rec, last_xy) <= self.board_vanish_radius_m
-        if rec.is_currently_moving:
+        if rec.is_currently_moving and self._moved_since_exit(rec):
             if near_cab:  # he climbed back in and drove off under the roof
                 self._board(rec, pid, rec.moving_since or now, events, "VEHICLE_MOVED")
             else:
@@ -793,7 +1056,7 @@ class DriverVehicleMonitorFSM:
             rec.lost_since = rec.driver_last_seen_ts
         rec.state = VehicleSafetyState.DRIVER_NOT_VISIBLE
         if (near_cab and rec.driver_last_seen_in_cab is False and hist is not None
-                and hist.vanish_cab.get(rec.vehicle_id, 0.0) >= 0.3
+                and hist.vanish_into.get(rec.vehicle_id, False)
                 and now - rec.driver_last_seen_ts >= self.hidden_board_confirm_sec):
             self._board(rec, pid, rec.driver_last_seen_ts, events, "VANISHED_INTO_CAB")
             return
@@ -840,45 +1103,64 @@ class DriverVehicleMonitorFSM:
         for rec in visible:
             if rec.associated_driver_id is not None and rec.onboard and not rec.driver_hidden_onboard:
                 continue  # the bound driver is visibly in the cab
-            for (vid, pid), (score, seated) in scores.items():
-                if vid != rec.vehicle_id or score < self.cab_thresh or pid == rec.associated_driver_id:
+            for (vid, pid), ev in scores.items():
+                if vid != rec.vehicle_id or pid == rec.associated_driver_id:
+                    continue
+                # parked: the floor-checked score; moving: the image score (travelling with it decides), but
+                # never somebody whose feet are on the floor
+                score = ev.raw if (rec.is_currently_moving and not ev.on_floor) else ev.score
+                if score < self.cab_thresh:
                     continue
                 other = self.driver_of.get(pid)
                 if other is not None and other in self.vehicles and self.vehicles[other].onboard:
                     continue  # onboard another vehicle
-                pairs.append((score, rec.vehicle_id, pid, seated))
+                pairs.append((score + (0.5 if ev.strong else 0.0), rec.vehicle_id, pid, ev))
         pairs.sort(key=lambda t: t[0], reverse=True)
-        chosen: Dict[str, Tuple[str, bool]] = {}
+        chosen: Dict[str, Tuple[str, CabEvidence]] = {}
         taken: Set[str] = set()
-        for score, vid, pid, seated in pairs:
+        for _, vid, pid, ev in pairs:
             if vid not in chosen and pid not in taken:
-                chosen[vid] = (pid, seated)
+                chosen[vid] = (pid, ev)
                 taken.add(pid)
+
+        def reset(rec: VehicleSessionRecord, pid: Optional[str] = None) -> None:
+            rec.cand_pid, rec.cand_time, rec.cand_proof, rec.cand_move = pid, 0.0, 0.0, 0.0
 
         for rec in visible:
             pick = chosen.get(rec.vehicle_id)
             if pick is None:
-                rec.cand_pid, rec.cand_time = None, 0.0
+                if rec.cand_pid is not None and now - rec.cand_last_ts > 0.6:   # not just one missed detection
+                    reset(rec)
                 continue
-            pid, seated = pick
+            pid, ev = pick
             if pid != rec.cand_pid:
-                rec.cand_pid, rec.cand_time = pid, 0.0
+                reset(rec, pid)
+            rec.cand_last_ts = now
             hist = self.person_histories[pid]
+            rec.cand_time += dt
             if rec.is_currently_moving:
                 cm = self._co_motion(rec, hist)
-                if cm is None:
-                    continue
                 if cm is False:
-                    rec.cand_time = 0.0
+                    reset(rec, pid)                  # the vehicle went somewhere he did not
                     continue
-                required = self.moving_board_confirm_sec
-            elif hist.get_speed_mps() <= self.max_boarding_walk_speed_mps:
-                required = self.seated_board_confirm_sec if seated else self.board_confirm_sec
+                if cm is True:
+                    rec.cand_move += dt
+                confirmed = rec.cand_move + 1e-9 >= self.moving_board_confirm_sec
             else:
-                rec.cand_time = 0.0
-                continue
-            rec.cand_time += dt
-            if rec.cand_time + 1e-9 < required:
+                rec.cand_move = 0.0
+                if not (ev.seated or hist.get_speed_mps() <= self.max_boarding_walk_speed_mps):
+                    reset(rec, pid)                  # walking past
+                    continue
+                # Proof of being INSIDE (seated pose / body within the footprint) must add up; single noisy frames
+                # in either direction do not decide. Somebody with hidden legs and no such proof may be standing
+                # behind the parked vehicle: he stays a candidate (and is bound, back-dated, the moment he travels
+                # with the vehicle), but a parked vehicle does not get him as its driver.
+                rec.cand_proof = rec.cand_proof + dt if ev.strong else max(0.0, rec.cand_proof - dt)
+                required = self.seated_board_confirm_sec if ev.seated else self.board_confirm_sec
+                confirmed = ev.strong and rec.cand_proof + 1e-9 >= required
+                if not confirmed and self.ambiguous_board_confirm_sec > 0:
+                    confirmed = rec.cand_time + 1e-9 >= self.ambiguous_board_confirm_sec
+            if not confirmed:
                 continue
             start = now - rec.cand_time
             if rec.associated_driver_id is not None and rec.onboard and rec.driver_hidden_onboard:
@@ -893,15 +1175,17 @@ class DriverVehicleMonitorFSM:
                     rec.driver_hidden_onboard = False
                     rec.driver_inferred = "VISIBLE_IN_CAB"
                     events.append(self._event("DRIVER_REBOUND", now, rec, pid, INFO, previous_driver=old))
-                    rec.cand_pid, rec.cand_time = None, 0.0
+                    reset(rec)
                     continue
             self._board(rec, pid, start, events, "VISIBLE_IN_CAB", person_map[pid])
-            rec.cand_pid, rec.cand_time = None, 0.0
+            reset(rec)
 
     def _hidden_inference(self, rec: VehicleSessionRecord, person_map: Dict[str, Dict], now: float,
                           events: List[Dict]) -> None:
         """Roofed cabs: the driver vanished INTO the cab (seen last at/inside it) -> hidden onboard."""
-        if rec.associated_driver_id is not None:
+        # also when the bound driver is OUT of the cab: somebody else who disappears into it is taking over
+        bound_out = rec.associated_driver_id is not None and not rec.onboard
+        if rec.associated_driver_id is not None and not bound_out:
             return
         window = self.vanish_board_window_sec
         cands = []
@@ -910,10 +1194,14 @@ class DriverVehicleMonitorFSM:
                 continue
             if now - h.vanish_ts > window or pid in self.driver_of:
                 continue
+            if now - h.vanish_ts < self.vanish_min_sec:
+                continue        # one missed detection is not "disappeared into the cab"
+            if bound_out and (rec.exit_timestamp is None or h.vanish_ts <= rec.exit_timestamp):
+                continue        # he vanished before the current driver got out: not somebody taking over now
             cands.append(h)
         if rec.is_currently_moving:
-            if rec.cand_pid is not None:
-                return  # a visible person in the cab is being confirmed right now
+            if bound_out or rec.cand_pid is not None:
+                return  # (moving without its driver is handled there) / a visible person is being confirmed
             # moving and nobody known aboard: whoever vanished at this vehicle shortly before is driving it
             if len(cands) == 1:
                 self._board(rec, cands[0].person_id, cands[0].vanish_ts, events, "VANISHED_INTO_CAB")
@@ -927,7 +1215,7 @@ class DriverVehicleMonitorFSM:
             else:
                 self._set_unknown_occupied(rec, now, events, reason="moving, driver hidden")
             return
-        inside = [h for h in cands if h.vanish_cab.get(rec.vehicle_id, 0.0) >= self.cab_thresh
+        inside = [h for h in cands if h.vanish_into.get(rec.vehicle_id, False)
                   and now - h.vanish_ts >= self.hidden_board_confirm_sec]
         if len(inside) == 1:
             self._board(rec, inside[0].person_id, inside[0].vanish_ts, events, "VANISHED_INTO_CAB")
@@ -968,6 +1256,10 @@ class DriverVehicleMonitorFSM:
             if best.associated_driver_id is not None:
                 old = best.associated_driver_id
                 self.driver_of.pop(old, None)
+                old_hist = self.person_histories.get(old)
+                if old_hist is not None:           # the same person under his previous id: no longer "hidden in the cab"
+                    old_hist.vanish_near.pop(best.vehicle_id, None)
+                    old_hist.vanish_into.pop(best.vehicle_id, None)
                 best.associated_driver_id = pid
                 self.driver_of[pid] = best.vehicle_id
                 events.append(self._event("DRIVER_REBOUND", now, best, pid, INFO, previous_driver=old,
