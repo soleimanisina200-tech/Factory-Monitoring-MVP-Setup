@@ -188,6 +188,7 @@ class FactoryMonitor:
             pool_max_samples=reid_cfg["pool_max_samples"], pool_window_sec=reid_cfg["pool_window_sec"],
             decision_log_path=reid_cfg.get("decision_log_path") or None,
             recover_strict_after_sec=reid_cfg["recover_strict_after_sec"],
+            emerge_wait_sec=reid_cfg["emerge_wait_sec"],
             exit_regions={n: s["polygon"] for n, s in self.scene.exit_regions.items()},
             open_set=OpenSetCalibrator(
                 base_threshold=reid_cfg["reentry_sim_thresh"], quantile=osc["quantile"], margin=osc["margin"],

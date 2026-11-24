@@ -216,6 +216,7 @@ class EnterpriseIdentityManager:
         pool_max_samples: int = 8,
         pool_window_sec: float = 4.0,
         recover_strict_after_sec: float = 4.0,
+        emerge_wait_sec: float = 2.0,
         exit_regions: Optional[Dict[str, Sequence[Sequence[float]]]] = None,
         open_set: Optional[OpenSetCalibrator] = None,
         impostor_sample_interval_sec: float = 1.0,
@@ -269,6 +270,10 @@ class EnterpriseIdentityManager:
         # Long in-scene occlusions are as risky as re-entries (a newcomer from a mid-scene door may be "recovered"
         # as the hidden worker): after this many seconds the open-set threshold and margin apply there too.
         self.recover_strict_after_sec = float(recover_strict_after_sec)
+        # A new track that may be a hidden worker coming out from behind an occluder waits this long for clean crops
+        # before it gets a NEW ID.
+        self.emerge_wait_sec = float(emerge_wait_sec)
+        self._deferred_tracks: Set[int] = set()
         # Doors INSIDE the image (polygons in stream pixels): vanishing there = leaving the camera.
         self.exit_regions: Dict[str, np.ndarray] = {
             name: np.asarray(poly, dtype=np.float32).reshape(-1, 2) for name, poly in (exit_regions or {}).items()
@@ -418,6 +423,7 @@ class EnterpriseIdentityManager:
             self.track_marker_votes.pop(tid, None)
             self.track_last_marker_ts.pop(tid, None)
             self.track_label.pop(tid, None)
+            self._deferred_tracks.discard(tid)
             if forget_last_seen:
                 self.track_last_seen_ts.pop(tid, None)
         self.track_separated_coexisted_tracks = {
@@ -632,8 +638,47 @@ class EnterpriseIdentityManager:
             max_dist_m = (self.v_max * dt) + (self.sigma_lag * np.sqrt(dt)) + self.eps_pose
             return dist_m <= max_dist_m, dist_m, max_dist_m
 
-        max_dist_m = min(self.max_internal_occ_m + 0.5 * dt, (self.v_max * dt) + self.eps_pose)
+        # Hidden longer: walking speed bounds the distance, and a person comes out of the SAME occluder, so the
+        # reach is capped by the size of the largest occluder (a truck: walk in at one end, out at the other).
+        max_dist_m = min(self.max_internal_occ_m, (self.v_max * dt) + self.eps_pose)
         return dist_m <= max_dist_m, dist_m, max_dist_m
+
+    def _plausible_runner_up(
+        self, emb: np.ndarray, view: str, exclude_gid: int, det: PoseDetection, used: Set[int], frame_ts: float,
+        frame_w: int, frame_h: int,
+    ) -> float:
+        """
+        Best similarity of `emb` among the identities that could PHYSICALLY be this person: not visible elsewhere
+        right now, able to reach this spot while hidden, and - for people who left through an image edge / door -
+        appearing at an edge / door. With uniforms, lookalikes who cannot be here used to veto the right answer.
+        """
+        near_border = self._is_near_frame_border(det.bbox_xyxy, frame_w, frame_h, self.border_margin_ratio)
+        in_door = self._in_exit_region(det.ground_uv) if self.exit_regions else None
+        best = 0.0
+        for gid, other in self.identities.items():
+            if gid == exclude_gid or gid in used:
+                continue
+            if other.status == STATUS_EXITED:
+                if other.exit_reason in ("BORDER", "DOOR") and not (near_border or in_door):
+                    continue
+            elif not self._is_spatially_continuous_with_identity(other, det, frame_ts)[0]:
+                continue
+            best = max(best, other.compute_similarity(emb, view))
+        return best
+
+    def _hidden_candidate_could_be(self, det: PoseDetection, used: Set[int], frame_ts: float) -> bool:
+        """Is somebody hidden in the scene (not left) who could be coming out right here?"""
+        label = self.track_label.get(det.track_id)
+        for gid, ident in self.identities.items():
+            if gid in used or ident.status == STATUS_EXITED or frame_ts - ident.last_seen_ts < 0.3:
+                continue
+            if self._labels_conflict(label, ident.label) or det.track_id in ident.coexisted_track_ids:
+                continue
+            if self._are_tracks_verified_distinct(det.track_id, ident.last_track_id, min_sep_frames=2):
+                continue
+            if self._is_spatially_continuous_with_identity(ident, det, frame_ts)[0]:
+                return True
+        return False
 
     def _update_identity_kinematics(self, ident: WorkerIdentity, det: PoseDetection, frame_ts: float) -> None:
         dt = max(1e-3, frame_ts - ident.last_seen_ts)
@@ -764,6 +809,7 @@ class EnterpriseIdentityManager:
             best_merge_sim: float = 0.0
 
             best_needs_margin = False
+            eligible_sims: List[float] = []   # every identity this one could physically be (any similarity)
             for gid_old, ident_old in list(self.identities.items()):
                 if gid_old >= gid_new or gid_old in used_global_ids:
                     continue
@@ -806,6 +852,7 @@ class EnterpriseIdentityManager:
                     req_sim = max(req_sim, self.reentry_threshold() - 0.12)
                     needs_margin = True
                 gal_sim = ident_old.compute_gallery_to_gallery_similarity(ident_new)
+                eligible_sims.append(gal_sim)
                 if gal_sim >= req_sim and gal_sim > best_merge_sim:
                     best_merge_sim = gal_sim
                     best_old_gid = gid_old
@@ -828,6 +875,15 @@ class EnterpriseIdentityManager:
                     self._log_decision(
                         "MERGE_REJECTED_AMBIGUOUS", frame_ts, tid=tid, gid_new=gid_new,
                         gid_old=best_old_gid, gallery_sim=best_merge_sim, runner_up=runner_up,
+                    )
+                    best_old_gid = None
+            elif best_old_gid is not None:
+                # Two hidden workers who both could be this one: merging into the wrong one is worse than a new ID.
+                second = sorted(eligible_sims, reverse=True)[1] if len(eligible_sims) > 1 else 0.0
+                if best_merge_sim - second < self.stitch_margin:
+                    self._log_decision(
+                        "MERGE_REJECTED_AMBIGUOUS", frame_ts, tid=tid, gid_new=gid_new,
+                        gid_old=best_old_gid, gallery_sim=best_merge_sim, runner_up=second,
                     )
                     best_old_gid = None
 
@@ -1407,16 +1463,13 @@ class EnterpriseIdentityManager:
 
                         # Negative evidence: the newcomer must be clearly closer to this identity than to
                         # ANY other identity, including workers who are currently visible on screen.
-                        if stage in ("REENTRY_STRICT", "STITCH", "BORDER_REENTRY", "RECOVER_LONG"):
+                        if stage in ("REENTRY_STRICT", "STITCH", "BORDER_REENTRY"):
                             if stage == "REENTRY_STRICT":
                                 m_emb, _ = self._track_mean_embedding(det.track_id, frame_ts)
                                 margin_needed = self.reentry_margin
                             else:
                                 m_emb = row_emb[r]
-                                margin_needed = (
-                                    self.stitch_margin if stage == "STITCH"
-                                    else (0.5 * self.reentry_margin if stage == "RECOVER_LONG" else self.reentry_margin)
-                                )
+                                margin_needed = self.stitch_margin if stage == "STITCH" else self.reentry_margin
                             m_view = row_view[r]
                             if m_emb is not None:
                                 own_sim = ident.compute_similarity(m_emb, m_view)
@@ -1428,21 +1481,19 @@ class EnterpriseIdentityManager:
                                         margin_needed=margin_needed,
                                     )
                                     continue
-                        elif stage == "RECOVER" and row_emb[r] is not None:
-                            # Occlusion recovery must also beat every identity that is NOT visible elsewhere right
-                            # now (people who LEFT included): a returning worker used to be "recovered" as a
-                            # similar-looking colleague who was merely hidden, because nobody compared with him.
+                        elif stage in ("RECOVER", "RECOVER_LONG") and row_emb[r] is not None:
+                            # Occlusion recovery must beat every OTHER identity that could physically be this
+                            # person (hidden colleagues nearby, people who left without an edge/door exit). A
+                            # returning worker used to be "recovered" as a similar-looking hidden colleague because
+                            # nobody compared with him - and lookalikes who cannot be here must not veto him.
+                            margin_needed = self.stitch_margin if stage == "RECOVER" else 0.5 * self.reentry_margin
                             own_sim = ident.compute_similarity(row_emb[r], row_view[r])
-                            runner_up = max(
-                                (other.compute_similarity(row_emb[r], row_view[r])
-                                 for g_o, other in self.identities.items()
-                                 if g_o != gid and g_o not in used_global_ids),
-                                default=0.0,
-                            )
-                            if own_sim - runner_up < self.stitch_margin:
+                            runner_up = self._plausible_runner_up(
+                                row_emb[r], row_view[r], gid, det, used_global_ids, frame_ts, W_img, H_img)
+                            if own_sim - runner_up < margin_needed:
                                 self._log_decision(
                                     "MATCH_REJECTED_AMBIGUOUS", frame_ts, tid=det.track_id, gid=gid, stage=stage,
-                                    sim=own_sim, runner_up=runner_up, margin_needed=self.stitch_margin,
+                                    sim=own_sim, runner_up=runner_up, margin_needed=margin_needed,
                                 )
                                 continue
 
@@ -1484,6 +1535,17 @@ class EnterpriseIdentityManager:
                 seen_count = self.track_seen_counts.get(det.track_id, 0)
                 req_frames = 2 if len(self.identities) == 0 else self.probation_frames
                 if seen_count < req_frames:
+                    continue
+
+                # Someone coming out from behind a truck / machine is first seen half hidden: a new ID minted from
+                # those crops is never given back. While a hidden worker could be this person, wait a little for
+                # clean crops (the person is shown as provisional meanwhile; analytics attribute it later).
+                track_age = frame_ts - self.track_first_seen_ts.get(det.track_id, frame_ts)
+                if track_age < self.emerge_wait_sec and self._hidden_candidate_could_be(det, used_global_ids, frame_ts):
+                    if det.track_id not in self._deferred_tracks:
+                        self._deferred_tracks.add(det.track_id)
+                        self._log_decision("NEW_ID_DEFERRED", frame_ts, tid=det.track_id,
+                                           wait_sec=self.emerge_wait_sec)
                     continue
 
                 overlaps_active = any(

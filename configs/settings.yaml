@@ -55,7 +55,8 @@ reid:
   reentry_min_gap_sec: 2.0
   reentry_margin: 0.08
   reentry_min_samples: 3
-  recover_strict_after_sec: 8.0  # hidden longer than this inside the scene -> re-entry rules apply too
+  recover_strict_after_sec: 8.0  # hidden longer than this inside the scene -> open-set threshold applies too
+  emerge_wait_sec: 2.0            # new track where a hidden worker could come out: wait for clean crops before a NEW ID
   exit_confirm_sec: 0.8
   exit_edges: [left, right, top, bottom]   # image edges that are real ways out
   mismatch_min_span_sec: 1.0
@@ -65,7 +66,7 @@ reid:
   track_state_ttl_sec: 10.0
   identity_retention_sec: 43200   # remember workers who left for 12 h (lunch, shift breaks)
   max_exited_identities: 500
-  occlusion_max_sec: 20.0
+  occlusion_max_sec: 300.0        # hidden inside the scene (behind a truck, loading) this long before "left"
   border_margin_ratio: 0.06
   pool_max_samples: 8
   pool_window_sec: 4.0
@@ -96,7 +97,7 @@ markers:                          # optional helmet ArUco markers = hard identit
 # Ground calibration: configs/calibration.yaml (scripts/calibrate_ground_plane.py) is used when present.
 physics_bev:
   max_worker_speed_mps: 3.5
-  max_internal_occlusion_m: 5.5
+  max_internal_occlusion_m: 15.0  # length of the largest occluder: walk behind a truck at one end, out at the other
   lag_diffusion_coeff: 0.65
   base_pose_jitter_m: 0.7
   default_px_per_meter: 110.0

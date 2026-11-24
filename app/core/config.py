@@ -72,6 +72,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "reentry_margin": 0.08,
         "reentry_min_samples": 3,
         "recover_strict_after_sec": 8.0,
+        "emerge_wait_sec": 2.0,
         "exit_confirm_sec": 0.8,
         "exit_edges": ["left", "right", "top", "bottom"],
         "mismatch_min_span_sec": 1.0,
@@ -81,7 +82,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "track_state_ttl_sec": 10.0,
         "identity_retention_sec": 43200.0,   # 12 h: lunch and shift breaks
         "max_exited_identities": 500,
-        "occlusion_max_sec": 20.0,
+        "occlusion_max_sec": 300.0,          # hidden in the scene (behind a truck, loading) before "left"
         "border_margin_ratio": 0.06,
         "pool_max_samples": 8,
         "pool_window_sec": 4.0,
@@ -113,7 +114,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     },
     "physics_bev": {
         "max_worker_speed_mps": 3.5,
-        "max_internal_occlusion_m": 5.5,
+        "max_internal_occlusion_m": 15.0,    # size of the largest occluder (a truck is 8-14 m long)
         "lag_diffusion_coeff": 0.65,
         "base_pose_jitter_m": 0.7,
         "default_px_per_meter": 110.0,

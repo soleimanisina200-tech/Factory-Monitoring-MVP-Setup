@@ -111,7 +111,9 @@ def test_identities_survive_a_restart(tmp_path):
     n = IdentityStore(str(tmp_path), clock, model_tag="m").load_into(sc2.mgr, sc2.ts)
     assert n == 1 and sc2.mgr.identities[gid_a].status == STATUS_EXITED
     assert sc2.enter_right(9, unit(0), frames=12) == gid_a           # recognised after the restart
-    assert sc2.enter_right(10, unit(3), frames=12) > gid_a           # a newcomer never re-uses an old number
+    # a newcomer never re-uses an old number (he appears where worker A was just hidden: his new ID waits for
+    # emerge_wait_sec in case he is A coming out from behind something)
+    assert sc2.enter_right(10, unit(3), frames=25) > gid_a
 
 
 def test_model_change_discards_galleries_but_keeps_numbering(tmp_path):
