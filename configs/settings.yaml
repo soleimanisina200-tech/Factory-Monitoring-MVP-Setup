@@ -90,7 +90,7 @@ reid:
     dir: data/identity_store
     save_interval_sec: 60
 
-markers:                          # optional helmet ArUco markers = hard identity (configs/workers.yaml)
+markers:                          # optional ArUco markers on helmet / vest = hard identity (configs/workers.yaml)
   enabled: false
   registry_path: configs/workers.yaml
   dictionary: DICT_4X4_50
@@ -99,6 +99,7 @@ markers:                          # optional helmet ArUco markers = hard identit
   min_votes: 2
   vote_window_sec: 4.0
   min_person_height_px: 120
+  regions: [head, torso]          # where markers are searched: head = helmet, torso = vest chest / back
 
 # Ground calibration: configs/calibration.yaml (scripts/calibrate_ground_plane.py) is used when present.
 physics_bev:

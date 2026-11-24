@@ -333,6 +333,12 @@ class EnterpriseIdentityManager:
         # Recovered bindings (after an occlusion / re-entry) stay provisional until the newcomer's height is known:
         # track id -> (identity, binding time, identity state before the binding)
         self._stature_pending: Dict[int, Tuple[int, float, Dict[str, Any]]] = {}
+        # Tracks bound to an EXISTING identity after a real gap (recovery behind an occluder, re-entry, merge):
+        # track id -> (identity, its state before the binding). A marker read on such a track belongs to the track,
+        # not to the identity's earlier (unlabelled) history - it may be a lookalike who came out instead.
+        self._track_recovered: Dict[int, Tuple[int, Dict[str, Any]]] = {}
+        self._no_merge_pairs: Set[frozenset] = set()     # split apart by a marker: never re-merged by appearance
+        self.marker_trust_gap_sec = 2.0
         self.stature_confirm_max_sec = 10.0
 
         self.track_birth_gate: Dict[int, Optional[str]] = {}
@@ -484,6 +490,7 @@ class EnterpriseIdentityManager:
             self.track_last_stature_ts.pop(tid, None)
             self._stature_given.pop(tid, None)
             self._stature_pending.pop(tid, None)
+            self._track_recovered.pop(tid, None)
             self.track_birth_gate.pop(tid, None)
             if forget_last_seen:
                 self.track_last_seen_ts.pop(tid, None)
@@ -987,6 +994,8 @@ class EnterpriseIdentityManager:
                     continue
                 if self._stature_conflict_idents(ident_old, ident_new):
                     continue
+                if frozenset((gid_old, gid_new)) in self._no_merge_pairs:
+                    continue
                 if (self.stature_enabled and self.stature_estimate(gid_old) is not None
                         and self.stature_estimate(gid_new) is None and frame_ts - ident_new.created_ts < 6.0):
                     continue        # wait a few seconds for the new person's height before merging
@@ -1062,8 +1071,13 @@ class EnterpriseIdentityManager:
                     best_old_gid = None
 
             if best_old_gid is not None:
+                old = self.identities[best_old_gid]
+                snapshot = self._snapshot_identity(old)
+                gap = ident_new.created_ts - old.last_seen_ts
                 self._merge_into(gid_new, best_old_gid, tid, frame_ts, resolved_assignments, used_global_ids,
                                  gallery_sim=best_merge_sim, reason="APPEARANCE")
+                if gap > self.marker_trust_gap_sec and ident_new.label is None:
+                    self._track_recovered[tid] = (best_old_gid, snapshot)
 
     def _merge_into(
         self, gid_src: int, gid_dst: int, tid: int, frame_ts: float, resolved_assignments: Dict[int, int],
@@ -1224,6 +1238,7 @@ class EnterpriseIdentityManager:
             gid = resolved.get(tid)
             if gid is not None and self.identities[gid].label == label:
                 self.track_label[tid] = label
+                self._track_recovered.pop(tid, None)      # the marker confirms the recovered binding
                 continue
             self.track_label[tid] = label
             self._apply_label(tid, label, det, resolved, used, frame_ts)
@@ -1236,26 +1251,38 @@ class EnterpriseIdentityManager:
             # the labelled worker is ALSO visible elsewhere right now: one of the two readings is wrong
             self._log_decision("MARKER_CONFLICT", frame_ts, tid=tid, label=label, owner=owner, gid=gid)
             return
+        rec = self._track_recovered.pop(tid, None)
+        recovered = rec is not None and gid is not None and rec[0] == gid
         if gid is not None:
             ident = self.identities[gid]
-            if ident.label is None and owner is None:
-                ident.label = label
-                self._labeled.append((gid, label))
-                self._log_decision("LABELED", frame_ts, tid=tid, gid=gid, label=label)
-                return
-            if ident.label is None and owner is not None:
-                if owner < gid:
+            if ident.label is None and not recovered:
+                # the identity was founded / continuously followed by this track: the marker names it
+                if owner is None:
+                    ident.label = label
+                    self._labeled.append((gid, label))
+                    self._log_decision("LABELED", frame_ts, tid=tid, gid=gid, label=label)
+                elif owner < gid:
                     self._merge_into(gid, owner, tid, frame_ts, resolved, used, reason="MARKER")
                 else:
                     self._merge_into(owner, gid, tid, frame_ts, resolved, used, reason="MARKER")
                 return
-            # bound to an identity with ANOTHER marker: the tracker jumped to a different person
-            self._log_decision("MARKER_REBIND", frame_ts, tid=tid, gid=gid, label=label, owner=owner,
-                               previous_label=ident.label)
+            if recovered:
+                # This track was given an existing identity after a gap (e.g. out from behind a truck). Either that
+                # identity carries ANOTHER marker, or its own marker was never read: then nobody can tell whether
+                # this is the same worker or a lookalike who came out instead. The reading belongs to THIS track:
+                # the earlier history keeps its identity, which is put back exactly as it was before the binding.
+                for k, v in rec[1].items():
+                    setattr(ident, k, v)
+                ident.mismatch_streak = 0
+                self._stature_pending.pop(tid, None)
+            self._log_decision("MARKER_SPLIT" if ident.label is None else "MARKER_REBIND", frame_ts, tid=tid,
+                               gid=gid, label=label, owner=owner, previous_label=ident.label, recovered=recovered)
         target = owner if owner is not None else self._new_labeled_identity(det, label, frame_ts)
         if owner is None:
             self._labeled.append((target, label))
         self._bind_track(tid, target, det, frame_ts, resolved, used, stage="MARKER")
+        if recovered:
+            self._no_merge_pairs.add(frozenset((gid, target)))
 
     @staticmethod
     def _covered_by_obstacles(bbox: np.ndarray, obstacles: Sequence[Sequence[float]], min_frac: float = 0.25) -> bool:
@@ -1717,6 +1744,8 @@ class EnterpriseIdentityManager:
                         if stage != "STITCH":
                             # after a real gap the newcomer could be a lookalike: confirm by height when possible
                             self._mark_stature_pending(det.track_id, gid, snapshot, frame_ts)
+                            if stage != "RECOVER" or frame_ts - snapshot["last_seen_ts"] > self.marker_trust_gap_sec:
+                                self._track_recovered[det.track_id] = (gid, snapshot)
                         if (emb is not None and rep is not None and rep.is_valid_for_gallery
                                 and det.track_id not in self._stature_pending):
                             ident.add_clean_observation(

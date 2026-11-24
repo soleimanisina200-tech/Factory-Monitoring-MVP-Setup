@@ -118,6 +118,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "min_votes": 2,
         "vote_window_sec": 4.0,
         "min_person_height_px": 120,
+        "regions": ["head", "torso"],          # helmet and/or vest (chest + back)
     },
     "physics_bev": {
         "max_worker_speed_mps": 3.5,

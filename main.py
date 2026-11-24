@@ -163,8 +163,10 @@ class FactoryMonitor:
 
             self.registry = WorkerRegistry(mk.get("registry_path"), mk.get("accept_unregistered", False))
             marker_reader = HelmetMarkerReader(self.registry, mk.get("dictionary"),
-                                               int(mk.get("min_person_height_px", 120)))
-            logger.info("Helmet markers enabled: %d registered workers", len(self.registry.by_marker))
+                                               int(mk.get("min_person_height_px", 120)),
+                                               regions=mk.get("regions") or ["head", "torso"])
+            logger.info("Worker markers enabled (%s): %d registered workers", "+".join(marker_reader.regions),
+                        len(self.registry.by_marker))
 
         osc = reid_cfg["open_set"]
         st = reid_cfg["stature"]
